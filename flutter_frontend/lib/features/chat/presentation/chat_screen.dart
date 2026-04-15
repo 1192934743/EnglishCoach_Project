@@ -55,9 +55,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     ref.listen<SettingsState>(settingsProvider, (prev, next) {
       if (next.autoMode && (prev?.autoMode != true)) {
-        if (ref.read(chatProvider).status == ChatStatus.idle) {
+        if (ref.read(chatProvider).status == ChatStatus.idle)
           notifier.startListening();
-        }
       }
     });
 
@@ -184,7 +183,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             ),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withValues(alpha: 0.04),
+                                color: Colors.black.withOpacity(0.04),
                                 blurRadius: 15,
                                 offset: const Offset(0, -5),
                               ),
@@ -246,7 +245,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           boxShadow: [
                             BoxShadow(
                               color: (isListening ? Colors.pink : Colors.blue)
-                                  .withValues(alpha: 0.2),
+                                  .withOpacity(0.2),
                               blurRadius: 10,
                               offset: const Offset(0, 4),
                             ),
@@ -361,7 +360,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         child: ColorFiltered(
                           colorFilter: ColorFilter.mode(
                             (isLis ? Colors.pinkAccent : Colors.cyanAccent)
-                                .withValues(alpha: 0.7),
+                                .withOpacity(0.7),
                             BlendMode.srcATop,
                           ),
                           child: _buildLottieImage(isSpe),
@@ -412,17 +411,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           end: Alignment.bottomCenter,
           colors: [
             Colors.transparent,
-            Colors.pinkAccent.withValues(alpha: _glowAnimation.value),
-            Colors.deepPurpleAccent.withValues(alpha: _glowAnimation.value),
-            Colors.cyanAccent.withValues(alpha: _glowAnimation.value),
+            Colors.pinkAccent.withOpacity(_glowAnimation.value),
+            Colors.deepPurpleAccent.withOpacity(_glowAnimation.value),
+            Colors.cyanAccent.withOpacity(_glowAnimation.value),
             Colors.transparent,
           ],
           stops: const [0.0, 0.2, 0.5, 0.8, 1.0],
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.deepPurpleAccent.withValues(
-              alpha: _glowAnimation.value * 0.6,
+            color: Colors.deepPurpleAccent.withOpacity(
+              _glowAnimation.value * 0.6,
             ),
             blurRadius: 18,
             spreadRadius: 2,
@@ -491,7 +490,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.black.withValues(alpha: 0.03),
+                    color: Colors.black.withOpacity(0.03),
                     blurRadius: 8,
                     offset: const Offset(0, 2),
                   ),
@@ -581,9 +580,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
       decoration: BoxDecoration(
-        border: Border(
-          top: BorderSide(color: Colors.grey.withValues(alpha: 0.1)),
-        ),
+        border: Border(top: BorderSide(color: Colors.grey.withOpacity(0.1))),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -620,9 +617,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         width: double.infinity,
         padding: const EdgeInsets.all(12),
         decoration: BoxDecoration(
-          color: Colors.green.withValues(alpha: 0.08),
+          color: Colors.green.withOpacity(0.08),
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.green.withValues(alpha: 0.2)),
+          border: Border.all(color: Colors.green.withOpacity(0.2)),
         ),
         child: Text(
           hint,

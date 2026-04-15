@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-import 'package:flutter/foundation.dart';
+import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
@@ -34,18 +34,18 @@ class WebSocketClient {
               final data = jsonDecode(message);
               _jsonCommandController.add(data);
             } catch (e) {
-              debugPrint("❌ JSON 解析失败: $e");
+              print("❌ JSON 解析失败: $e");
             }
           } else if (message is List<int>) {
             _audioStreamController.add(Uint8List.fromList(message));
           }
         },
-        onError: (error) => debugPrint("❌ WS Error: $error"),
+        onError: (error) => print("❌ WS Error: $error"),
         onDone: () => disconnect(),
       );
-      debugPrint("🌐 WebSocket Connected");
+      print("🌐 WebSocket Connected");
     } catch (e) {
-      debugPrint("💥 WS Connect Failed: $e");
+      print("💥 WS Connect Failed: $e");
     }
   }
 
@@ -69,6 +69,6 @@ class WebSocketClient {
   void disconnect() {
     _channel?.sink.close(1001);
     _channel = null;
-    debugPrint("🔌 WebSocket Disconnected");
+    print("🔌 WebSocket Disconnected");
   }
 }

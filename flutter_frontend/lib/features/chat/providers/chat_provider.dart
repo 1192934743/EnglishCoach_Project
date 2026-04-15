@@ -1,5 +1,5 @@
 import 'dart:async';
-import 'package:flutter/foundation.dart';
+import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -138,7 +138,7 @@ class ChatNotifier extends Notifier<ChatState> {
       );
       await _player.openPlayer();
     } catch (e) {
-      debugPrint("音频会话配置异常: $e");
+      print("音频会话配置异常: $e");
     }
   }
 
@@ -207,9 +207,8 @@ class ChatNotifier extends Notifier<ChatState> {
           .difference(_playbackStartTime!)
           .inMilliseconds;
       int timeLeftMs = durationMs - elapsedMs;
-      if (timeLeftMs > 0) {
+      if (timeLeftMs > 0)
         await Future.delayed(Duration(milliseconds: timeLeftMs));
-      }
     }
     try {
       if (_player.isPlaying) await _player.stopPlayer();

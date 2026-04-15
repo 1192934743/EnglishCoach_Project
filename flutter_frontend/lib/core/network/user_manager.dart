@@ -1,4 +1,3 @@
-import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:uuid/uuid.dart';
 
@@ -19,9 +18,9 @@ class UserManager {
       // 悄悄生成一个新的隐形身份证！
       _currentUuid = const Uuid().v4();
       await prefs.setString(_uuidKey, _currentUuid!);
-      debugPrint("🌟 [UserManager] 首次打开，已生成隐形 UUID: $_currentUuid");
+      print("🌟 [UserManager] 首次打开，已生成隐形 UUID: $_currentUuid");
     } else {
-      debugPrint("👋 [UserManager] 欢迎回来，当前 UUID: $_currentUuid");
+      print("👋 [UserManager] 欢迎回来，当前 UUID: $_currentUuid");
     }
 
     return _currentUuid!;

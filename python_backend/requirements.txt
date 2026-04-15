@@ -1,0 +1,7 @@
+# EnglishCoach Python backend. Install: pip install -r requirements.txt
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-dotenv>=1.0.0
+openai>=1.59.0
+sqlalchemy>=2.0.0
+websockets>=12.0

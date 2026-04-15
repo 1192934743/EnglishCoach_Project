@@ -223,7 +223,7 @@ class SettingsScreen extends ConsumerWidget {
           style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
         ),
         value: value,
-        activeThumbColor: Colors.blueAccent,
+        activeColor: Colors.blueAccent,
         onChanged: onChanged,
       ),
     );
