@@ -1,0 +1,23 @@
+{
+  "current_active_id": "mcdonalds",
+  "templates": {
+    "mcdonalds": {
+      "scene": "Ordering a Big Mac at McDonald's drive-thru",
+      "level": "Beginner",
+      "role": "Fast-food Server",
+      "voice": "Stanley"
+    },
+    "job_interview": {
+      "scene": "A technical interview for a Python Algorithm Engineer position at a top tech company",
+      "level": "Professional",
+      "role": "Senior Tech Lead",
+      "voice": "Stanley"
+    },
+    "custom_imitation": {
+      "scene": "Practicing daily conversation based on BBC Learning English podcasts",
+      "level": "Intermediate",
+      "role": "Language Partner",
+      "voice": "Stanley"
+    }
+  }
+}

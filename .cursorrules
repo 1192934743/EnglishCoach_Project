@@ -1,0 +1,59 @@
+# 🚀 英语 AI 私教 App (MVP 2.0) - 全局架构与上下文交接文档
+
+
+
+## 1. 项目概览与技术栈
+
+- **定位**：自适应英语 AI 教练 App（MVP 2.0）。
+
+- **前端**：Flutter（跨平台移动端）。
+
+- **后端**：Python + FastAPI（WebSocket 驱动）。
+
+- **核心 AI 服务**：DeepSeek（对话、逻辑、教学辅助），火山引擎 Volcengine（低延迟流式 ASR/TTS）。
+
+
+
+## 2. 后端核心代码架构 (已完成模块化解耦)
+
+- **`server.py` (主调度入口)**：FastAPI 架构，维护 `/ws/coach` 路由，处理音频流收发与引擎调度。
+
+- **`core/audio_service.py` (音频引擎)**：独立封装 ASR 和 TTS WebSocket 调用，含二进制封包与 3 次网络重试防抖。
+
+- **`core/dialogue_engine.py` (大脑与状态机)**：动态组装 Prompt，管理三大状态（破冰 `ICE_BREAKING` -> 考核 `CORE_TASK` -> 桥梁 `EVENT_EXTENSION`），处理 `[ADVANCE]` 信号流转及教学辅助（翻译+提示）生成。
+
+- **`database.py` (数据持久层)**：基于 SQLAlchemy。定义并管理用户 (`User`)、话题 (`Topic`)、考核节点 (`TargetNode`) 及学习进度 (`UserProgress`) 表，自动生成本地 SQLite 数据库文件 **`english_coach.db`**。
+
+- **`auto_test_suite.py` (测试神器)**：注入混沌人格的纯文本自动对抗脚本，结合 LLM 裁判生成中文打分报告。
+
+
+
+## 3. 配置文件要求
+
+- **`config.env` (环境变量)**：必须包含 `DEEPSEEK_KEY`、`DEEPSEEK_BASE`、`VOLC_API_KEY`、`VOLC_RESOURCE_ID` (ASR)、`VOLC_RESOURCE_ID_TTS` (TTS) 及 `VOICE`。
+
+- **`scenes.json` (场景大纲)**：场景模板配置文件。定义当前激活的场景ID (`current_active_id`) 及场景详情（如 `McDonald's Ordering`、难度 `Intermediate`、角色 `Cashier` 等），供引擎动态读取。
+
+
+
+## 4. 前后端 WebSocket 通信协议契约 (API Contract)
+
+前端 (Flutter) 接下来需要解析并处理以下核心数据包：
+
+1. **教学面板数据**：`{"event": "teaching_data", "data": {"ai_translation_cn": "...", "suggested_hints_en": ["...", "..."], "user_text": "...", "ai_text": "..."}}`
+
+2. **进度条数据**：`{"event": "topic_mastery_reached", "progress": 85.0, "next_topic_suggestion": "..."}`
+
+3. **音频流**：纯二进制 PCM 数据流（用于 TTS 播放）。
+
+4. **状态信号**：`{"event": "tts_finished"}` 或 `{"event": "role_swapped"}`。
+
+
+
+## 5. 当前开发进度与下一步任务
+
+- **已完成**：后端的逻辑闭环、防抖处理、全自动测试验证。
+
+- **正在进行（第一战役）**：开始在 **Flutter 端** 编写 WebSocket 数据接收中枢。
+
+- **我的需求**：请 AI 准备好指导我在 Flutter 中解析上述通信协议，并设计“私教教学面板 (Teaching Overlay)”和“打分进度条”的 UI 交互逻辑。
