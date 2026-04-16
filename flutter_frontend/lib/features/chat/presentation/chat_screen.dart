@@ -55,8 +55,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
     ref.listen<SettingsState>(settingsProvider, (prev, next) {
       if (next.autoMode && (prev?.autoMode != true)) {
-        if (ref.read(chatProvider).status == ChatStatus.idle)
+        if (ref.read(chatProvider).status == ChatStatus.idle) {
           notifier.startListening();
+        }
       }
     });
 
@@ -76,18 +77,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
       appBar: AppBar(
-        title: Text(
+        title: const Text(
           'Simulation Practice',
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
-            color: Colors.black87,
-          ),
+          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
         ),
         backgroundColor: Colors.white,
         elevation: 1,
         centerTitle: true,
         actions: [
-          // 🌟 UI 按钮 1：性格下拉菜单
           PopupMenuButton<int>(
             icon: const Icon(Icons.psychology_alt, color: Colors.black87),
             tooltip: "AI性格礼貌度",
@@ -98,7 +95,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               const PopupMenuItem(value: 2, child: Text("极度客气 (Polite)")),
             ],
           ),
-          // 🌟 UI 按钮 2：角色互换按钮（互换后变红）
           IconButton(
             icon: Icon(
               Icons.swap_horiz_rounded,
@@ -154,15 +150,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
             Column(
               children: [
+                // 🌟 这里包裹了一层：根据设置判断是否渲染进度条
+                if (settings.showProgressBar)
+                  _buildMasteryTracker(chatState.masteryProgress),
+
                 Container(
                   margin: EdgeInsets.only(
                     top: _showHistory
                         ? 12.0
-                        : MediaQuery.of(context).size.height * 0.18,
+                        : MediaQuery.of(context).size.height * 0.15,
                     bottom: _showHistory ? 12.0 : 0.0,
                   ),
                   child: Center(
-                    // 传入 isFlipped 状态给数字人，用于显示当前的身份名称
                     child: _buildAvatar(
                       isListening,
                       isSpeaking,
@@ -291,6 +290,83 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
+  Widget _buildMasteryTracker(double progress) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                "Topic Mastery",
+                style: TextStyle(
+                  fontSize: 13,
+                  fontWeight: FontWeight.w600,
+                  color: Colors.black54,
+                ),
+              ),
+              Text(
+                "${progress.toInt()}%",
+                style: const TextStyle(
+                  fontSize: 14,
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFF4CAF50),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(10),
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 500),
+              height: 8,
+              width: double.infinity,
+              alignment: Alignment.centerLeft,
+              decoration: BoxDecoration(color: Colors.grey.shade200),
+              child: AnimatedBuilder(
+                animation: _glowAnimation,
+                builder: (context, child) {
+                  return FractionallySizedBox(
+                    widthFactor: progress / 100.0,
+                    child: Container(
+                      decoration: BoxDecoration(
+                        borderRadius: BorderRadius.circular(10),
+                        gradient: LinearGradient(
+                          colors: [
+                            const Color(0xFF66BB6A),
+                            Colors.greenAccent.withOpacity(
+                              0.8 + (_glowAnimation.value * 0.2),
+                            ),
+                            const Color(0xFF4CAF50),
+                          ],
+                          stops: const [0.0, 0.5, 1.0],
+                        ),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.greenAccent.withOpacity(0.4),
+                            blurRadius: 6 * _glowAnimation.value,
+                            spreadRadius: 1,
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildEmptyState(bool isListening, double fontSize) {
     return Center(
       child: Column(
@@ -328,10 +404,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  // 🌟 修改数字人下方显示的身份标签
   Widget _buildAvatar(bool isLis, bool isSpe, double fs, bool isFlipped) {
     final double exactSize = _showHistory ? 90.0 : 160.0;
-    // 翻转后，AI 就是顾客
     final String roleName = isFlipped ? "Customer (AI)" : "McDonald's Cashier";
 
     return AnimatedBuilder(
@@ -374,7 +448,6 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ],
               ),
             ),
-
             if (!_showHistory) ...[
               const SizedBox(height: 16),
               Text(
@@ -451,7 +524,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         (d['suggested_hints_en'] as List).isNotEmpty;
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 30),
+      padding: const EdgeInsets.only(bottom: 24),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
@@ -461,7 +534,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               margin: const EdgeInsets.only(left: 40, bottom: 12),
               padding: const EdgeInsets.all(16),
               decoration: const BoxDecoration(
-                color: Color(0xFFE8F5E9),
+                color: Color(0xFFF0F4F8),
                 borderRadius: BorderRadius.only(
                   topLeft: Radius.circular(20),
                   topRight: Radius.circular(20),
@@ -477,10 +550,48 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ),
             ),
           ),
+
+          if (hasCorrection)
+            Align(
+              alignment: Alignment.centerRight,
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8, right: 40),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 6,
+                ),
+                decoration: BoxDecoration(
+                  color: Colors.orange.shade50,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.orange.shade200),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      Icons.auto_fix_high,
+                      size: 14,
+                      color: Colors.orange.shade700,
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        d['coach_correction_cn'],
+                        style: TextStyle(
+                          fontSize: settings.fontSize * 0.85,
+                          color: Colors.orange.shade900,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
           Align(
             alignment: Alignment.centerLeft,
             child: Container(
-              margin: const EdgeInsets.only(right: 40),
+              margin: const EdgeInsets.only(right: 30),
               decoration: BoxDecoration(
                 color: Colors.white,
                 borderRadius: const BorderRadius.only(
@@ -490,9 +601,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ),
                 boxShadow: [
                   BoxShadow(
-                    color: Colors.black.withOpacity(0.03),
-                    blurRadius: 8,
-                    offset: const Offset(0, 2),
+                    color: Colors.black.withOpacity(0.04),
+                    blurRadius: 10,
+                    offset: const Offset(0, 4),
                   ),
                 ],
               ),
@@ -507,56 +618,77 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       onSentenceTap: (s) => notifier.speakText(s),
                     ),
                   ),
-                  if (hasTranslation)
-                    _buildAttachmentBox(
-                      Icons.translate,
-                      Colors.blue,
-                      "Translation",
-                      d['ai_translation_cn'],
-                      settings.fontSize,
-                    ),
-                  if (hasCorrection)
-                    _buildAttachmentBox(
-                      Icons.lightbulb_outline,
-                      Colors.orange,
-                      "Correction",
-                      d['coach_correction_cn'],
-                      settings.fontSize,
-                    ),
-                  if (hasHints)
-                    Padding(
-                      padding: const EdgeInsets.all(16),
+
+                  if (hasTranslation || hasHints)
+                    Container(
+                      decoration: BoxDecoration(
+                        color: const Color(0xFFFAFAFA),
+                        borderRadius: const BorderRadius.only(
+                          bottomRight: Radius.circular(20),
+                        ),
+                        border: Border(
+                          top: BorderSide(color: Colors.grey.shade100),
+                        ),
+                      ),
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Row(
-                            children: const [
-                              Icon(
-                                Icons.forum_outlined,
-                                color: Colors.green,
-                                size: 16,
+                          if (hasTranslation)
+                            Container(
+                              width: double.infinity,
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 16,
+                                vertical: 10,
                               ),
-                              SizedBox(width: 6),
-                              Text(
-                                "You can reply:",
+                              decoration: const BoxDecoration(
+                                color: Color(0xFFF0F8FF),
+                              ),
+                              child: Text(
+                                d['ai_translation_cn'],
                                 style: TextStyle(
-                                  fontWeight: FontWeight.bold,
-                                  color: Colors.grey,
-                                  fontSize: 13,
+                                  fontSize: settings.fontSize * 0.9,
+                                  color: Colors.blue.shade800,
                                 ),
                               ),
-                            ],
-                          ),
-                          const SizedBox(height: 10),
-                          ...List<Widget>.from(
-                            (d['suggested_hints_en'] as List).map(
-                              (hint) => _buildHintTile(
-                                hint,
-                                notifier,
-                                settings.fontSize,
+                            ),
+
+                          if (hasHints)
+                            Container(
+                              padding: const EdgeInsets.all(16),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    children: [
+                                      Icon(
+                                        Icons.lightbulb_rounded,
+                                        color: Colors.green.shade400,
+                                        size: 16,
+                                      ),
+                                      const SizedBox(width: 6),
+                                      const Text(
+                                        "Try to reply",
+                                        style: TextStyle(
+                                          fontSize: 12,
+                                          fontWeight: FontWeight.bold,
+                                          color: Colors.black45,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: 8),
+                                  ...List<Widget>.from(
+                                    (d['suggested_hints_en'] as List).map(
+                                      (hint) => _buildHintTile(
+                                        hint,
+                                        notifier,
+                                        settings.fontSize,
+                                      ),
+                                    ),
+                                  ),
+                                ],
                               ),
                             ),
-                          ),
                         ],
                       ),
                     ),
@@ -569,61 +701,25 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildAttachmentBox(
-    IconData icon,
-    Color color,
-    String title,
-    String content,
-    double fontSize,
-  ) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-      decoration: BoxDecoration(
-        border: Border(top: BorderSide(color: Colors.grey.withOpacity(0.1))),
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Row(
-            children: [
-              Icon(icon, color: color, size: 14),
-              const SizedBox(width: 6),
-              Text(
-                title,
-                style: TextStyle(
-                  fontWeight: FontWeight.bold,
-                  color: color,
-                  fontSize: 12,
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 4),
-          Text(
-            content,
-            style: TextStyle(fontSize: fontSize * 0.9, color: Colors.black54),
-          ),
-        ],
-      ),
-    );
-  }
-
   Widget _buildHintTile(String hint, ChatNotifier notifier, double fontSize) {
     return GestureDetector(
       onTap: () => notifier.speakText(hint),
       child: Container(
         margin: const EdgeInsets.only(bottom: 8),
         width: double.infinity,
-        padding: const EdgeInsets.all(12),
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: Colors.green.withOpacity(0.08),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: Colors.green.withOpacity(0.2)),
+          color: const Color(0xFFF1F8E9),
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(color: Colors.green.shade100),
         ),
         child: Text(
           hint,
-          style: TextStyle(fontSize: fontSize * 0.95, color: Colors.black87),
+          style: TextStyle(
+            fontSize: fontSize * 0.95,
+            color: Colors.green.shade800,
+            fontWeight: FontWeight.w500,
+          ),
         ),
       ),
     );
@@ -704,6 +800,7 @@ class __AIChatBubbleState extends State<_AIChatBubble> {
               fontSize: widget.fontSize,
               color: Colors.black87,
               fontWeight: FontWeight.w500,
+              height: 1.4,
             ),
           ),
         ),

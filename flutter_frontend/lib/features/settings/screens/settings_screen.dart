@@ -10,7 +10,6 @@ class SettingsScreen extends ConsumerWidget {
     final settings = ref.watch(settingsProvider);
     final notifier = ref.read(settingsProvider.notifier);
 
-    // 🌟 定义当前配置页的基础字体大小比例
     final double baseSize = settings.fontSize;
 
     return Scaffold(
@@ -21,7 +20,7 @@ class SettingsScreen extends ConsumerWidget {
           style: TextStyle(
             fontWeight: FontWeight.bold,
             color: Colors.black87,
-            fontSize: baseSize + 2, // 🌟 让标题也随之缩放
+            fontSize: baseSize + 2,
           ),
         ),
         backgroundColor: Colors.white,
@@ -59,7 +58,6 @@ class SettingsScreen extends ConsumerWidget {
             baseSize,
           ),
 
-          // 🌟 优化 1 的参数设置：VAD 停顿检测时长
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
@@ -91,7 +89,7 @@ class SettingsScreen extends ConsumerWidget {
                 ),
                 Slider(
                   value: settings.vadTimeout.toDouble(),
-                  min: 500, // 🌟 最小值 500ms
+                  min: 500,
                   max: 2500,
                   divisions: 20,
                   activeColor: Colors.blueAccent,
@@ -138,7 +136,7 @@ class SettingsScreen extends ConsumerWidget {
                 ),
                 Slider(
                   value: settings.fontSize,
-                  min: 10.0, // 🌟 最小值调到 10.0
+                  min: 10.0,
                   max: 24.0,
                   divisions: 7,
                   activeColor: Colors.blueAccent,
@@ -157,6 +155,15 @@ class SettingsScreen extends ConsumerWidget {
 
           const SizedBox(height: 20),
           _buildSectionTitle(tr(ref, "Learning Modules", "教学模块展示"), baseSize),
+          // 🌟 新增：进度条开关
+          _buildSwitchTile(
+            tr(ref, "Show Mastery Tracker", "显示学习进度条"),
+            tr(ref, "Display your topic score on top.", "在聊天界面顶部展示打分进度"),
+            settings.showProgressBar,
+            notifier.toggleProgressBar,
+            Icons.moving_rounded,
+            baseSize,
+          ),
           _buildSwitchTile(
             tr(ref, "Show Correction", "显示语法纠错"),
             tr(ref, "Grammar & pronunciation tips.", "显示老师对你上一句话的纠正"),

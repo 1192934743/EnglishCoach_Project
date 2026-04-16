@@ -8,6 +8,7 @@ class SettingsState {
   final bool showTranslation;
   final bool showHints;
   final int vadTimeout;
+  final bool showProgressBar; // 🌟 新增：进度条开关
 
   SettingsState({
     required this.isChinese,
@@ -17,6 +18,7 @@ class SettingsState {
     required this.showTranslation,
     required this.showHints,
     required this.vadTimeout,
+    required this.showProgressBar,
   });
 
   SettingsState copyWith({
@@ -27,6 +29,7 @@ class SettingsState {
     bool? showTranslation,
     bool? showHints,
     int? vadTimeout,
+    bool? showProgressBar,
   }) {
     return SettingsState(
       isChinese: isChinese ?? this.isChinese,
@@ -36,6 +39,7 @@ class SettingsState {
       showTranslation: showTranslation ?? this.showTranslation,
       showHints: showHints ?? this.showHints,
       vadTimeout: vadTimeout ?? this.vadTimeout,
+      showProgressBar: showProgressBar ?? this.showProgressBar,
     );
   }
 }
@@ -46,11 +50,12 @@ class SettingsNotifier extends Notifier<SettingsState> {
     return SettingsState(
       isChinese: true,
       autoMode: true,
-      fontSize: 12.0, // 🌟 默认字体调小
+      fontSize: 12.0,
       showCorrection: false,
       showTranslation: false,
       showHints: true,
-      vadTimeout: 800, // 🌟 默认 800ms
+      vadTimeout: 800,
+      showProgressBar: true, // 🌟 默认开启进度条
     );
   }
 
@@ -63,6 +68,9 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(showTranslation: val);
   void toggleHints(bool val) => state = state.copyWith(showHints: val);
   void setVadTimeout(int val) => state = state.copyWith(vadTimeout: val);
+  // 🌟 新增 Toggle 函数
+  void toggleProgressBar(bool val) =>
+      state = state.copyWith(showProgressBar: val);
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(

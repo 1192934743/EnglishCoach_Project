@@ -1,3 +1,4 @@
+// lib/features/chat/providers/chat_provider.dart
 import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -26,22 +27,26 @@ class ChatState {
   final ChatStatus status;
   final List<ChatTurn> chatHistory;
   final bool isFlipped;
+  final double masteryProgress; // 🌟 新增：话题掌握度进度 (0.0 - 100.0)
 
   ChatState({
     required this.status,
     required this.chatHistory,
     this.isFlipped = false,
+    this.masteryProgress = 0.0, // 🌟 默认 0
   });
 
   ChatState copyWith({
     ChatStatus? status,
     List<ChatTurn>? chatHistory,
     bool? isFlipped,
+    double? masteryProgress,
   }) {
     return ChatState(
       status: status ?? this.status,
       chatHistory: chatHistory ?? this.chatHistory,
       isFlipped: isFlipped ?? this.isFlipped,
+      masteryProgress: masteryProgress ?? this.masteryProgress,
     );
   }
 }
@@ -80,6 +85,7 @@ class ChatNotifier extends Notifier<ChatState> {
       status: ChatStatus.idle,
       chatHistory: [],
       isFlipped: false,
+      masteryProgress: 0.0,
     );
   }
 
@@ -92,7 +98,6 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  // 🌟 修复：发送切换角色指令时，必须带上 user_id
   Future<void> swapRole() async {
     final wsClient = ref.read(websocketProvider);
     try {
@@ -102,7 +107,6 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  // 🌟 修复：发送更新性格指令时，必须带上 user_id
   Future<void> updatePoliteness(int level) async {
     final wsClient = ref.read(websocketProvider);
     try {
@@ -180,6 +184,10 @@ class ChatNotifier extends Notifier<ChatState> {
         }
       } else if (data['event'] == 'role_swapped') {
         state = state.copyWith(isFlipped: data['is_flipped']);
+      } else if (data['event'] == 'topic_mastery_reached') {
+        // 🌟 新增：处理打分进度条更新
+        final progress = (data['progress'] as num?)?.toDouble() ?? 0.0;
+        state = state.copyWith(masteryProgress: progress);
       }
     }, onError: (_) => forceIdle());
 
@@ -207,8 +215,9 @@ class ChatNotifier extends Notifier<ChatState> {
           .difference(_playbackStartTime!)
           .inMilliseconds;
       int timeLeftMs = durationMs - elapsedMs;
-      if (timeLeftMs > 0)
+      if (timeLeftMs > 0) {
         await Future.delayed(Duration(milliseconds: timeLeftMs));
+      }
     }
     try {
       if (_player.isPlaying) await _player.stopPlayer();
