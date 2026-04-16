@@ -82,6 +82,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str = None):
 
         while True:
             message = await websocket.receive()
+            
+            # 🌟 关键修复点：如果底层告知连接已断开，必须直接跳出循环，防止后续提取 "text" 报错！
+            if message.get("type") == "websocket.disconnect":
+                logger.info(f"👋 用户 {user_id or '未知'} 正常断开了 WebSocket 连接。")
+                break
+                
             if "bytes" in message:
                 audio_buffer.extend(message["bytes"])
             elif "text" in message:
@@ -170,17 +176,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str = None):
                     sentence_buffer = ""
                     punctuation_marks = ['.', '!', '?', ',', '。', '！', '？', '，', '\n']
 
-                    async for chunk in response:
-                        if chunk.choices and chunk.choices[0].delta.content:
-                            delta = chunk.choices[0].delta.content
-                            raw_full_reply += delta
+                    # 🌟 核心修复：添加 try-except 保护罩防止网络断流导致崩溃
+                    try:
+                        async for chunk in response:
+                            if chunk.choices and chunk.choices[0].delta.content:
+                                delta = chunk.choices[0].delta.content
+                                raw_full_reply += delta
 
-                            if not is_test_mode:
-                                sentence_buffer += delta
-                                if any(p in delta for p in punctuation_marks):
-                                    chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
-                                    if chunk_text: await tts_queue.put(chunk_text)
-                                    sentence_buffer = ""
+                                if not is_test_mode:
+                                    sentence_buffer += delta
+                                    if any(p in delta for p in punctuation_marks):
+                                        chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
+                                        if chunk_text: await tts_queue.put(chunk_text)
+                                        sentence_buffer = ""
+                    except Exception as e:
+                        logger.error(f"⚠️ 生成过程中遭遇网络断流: {e}")
+                        error_msg = " [网络波动，信号中断...]"
+                        raw_full_reply += error_msg
+                        if not is_test_mode:
+                            await tts_queue.put("Network interrupted.")
 
                     if not is_test_mode:
                         final_chunk = sentence_buffer.replace("[ADVANCE]", "").strip()
@@ -217,7 +231,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str = None):
                             await websocket.send_text(json.dumps({"event": "tts_finished"}))
 
     except WebSocketDisconnect:
-        pass
+        logger.info(f"👋 用户正常断开了 WebSocket 连接 (WebSocketDisconnect 被捕获)。")
     except Exception as e:
         logger.error(f"💥 异常: {e}", exc_info=True)
     finally:

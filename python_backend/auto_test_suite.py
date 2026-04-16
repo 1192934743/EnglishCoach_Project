@@ -76,7 +76,6 @@ async def run_combat_and_judge():
                     phase = data.get("phase")
 
                     if phase != current_phase_tracker:
-                        # 🌟 修复死循环：如果从收尾回到了破冰，说明是新的一局，清空测试员记忆！
                         if current_phase_tracker == "WRAP_UP" and phase == "ICE_BREAKING":
                             print("\n🔄 [测试员重置] 开启新的一局，测试员记忆已清空...")
                             tester_history = [{"role": "system", "content": persona["prompt"]}]
@@ -90,8 +89,8 @@ async def run_combat_and_judge():
                     tester_history.append({"role": "user", "content": ai_text})
 
                     if valid_turns >= TARGET_TEST_ROUNDS:
-                        print(f"\n✅ 达到设定的 {TARGET_TEST_ROUNDS} 次有效对话上限，对抗结束。")
-                        break
+                        print(f"\n✅ 达到设定的 {TARGET_TEST_ROUNDS} 次有效对话上限，对抗结束。即将断开连接。")
+                        break # 跳出 while，随后将退出 async with 块并切断连接
 
                     print("⏳ 测试员思考中...")
                     completion = await client.chat.completions.create(
@@ -109,40 +108,41 @@ async def run_combat_and_judge():
                     await ws.send(
                         json.dumps({"action": "test_text_input", "text": user_reply, "user_id": TEST_USER_ID}))
 
-            print("\n" + "=" * 50)
-            print("⚖️ 正在呼叫 DeepSeek 裁判进行深度裁决...")
-            print("=" * 50)
+        # 🌟 测试走完让 ws 断开，在这里慢慢调 DeepSeek 裁判接口
+        print("\n" + "=" * 50)
+        print("⚖️ 正在呼叫 DeepSeek 裁判进行深度裁决...")
+        print("=" * 50)
 
-            transcript_str = "\n".join(full_transcript)
-            judge_prompt = f"""
-            以下是一段用户（模拟【{persona['name']}】人格）与英语教练AI之间的对话记录。
-            教练AI的底层被设计为拥有 4 个阶段：ICE_BREAKING(破冰闲聊) -> CORE_TASK(主线考核) -> EVENT_EXTENSION(突发事件) -> WRAP_UP(付款收尾)。
+        transcript_str = "\n".join(full_transcript)
+        judge_prompt = f"""
+        以下是一段用户（模拟【{persona['name']}】人格）与英语教练AI之间的对话记录。
+        教练AI的底层被设计为拥有 4 个阶段：ICE_BREAKING(破冰闲聊) -> CORE_TASK(主线考核) -> EVENT_EXTENSION(突发事件) -> WRAP_UP(付款收尾)。
 
-            【对话记录】:
-            {transcript_str}
+        【对话记录】:
+        {transcript_str}
 
-            请你作为高级质量检测员，对教练AI的表现进行极其严格的评估。
-            你需要考察以下三个维度（每个维度满分 30 分）：
-            1. 四阶段流转与角色保持 (Phase & Roleplay): 教练AI是否平滑且自然地推进了四大阶段（观察括号里的阶段标签）？在过渡时是否生硬？是否始终保持了对应的身份？
-            2. 教学与引导性 (Guiding & Open-ended): 教练AI是否尽量使用了开放式提问引导用户开口？在 CORE_TASK 阶段是否自然地将话题引向了核心任务？
-            3. 控场与应对突发 (Event Handling & Pull-back): 面对偏题、暴躁或突发剧情（EVENT_EXTENSION）时，教练AI是否能妥善应对，并在解决问题后自然地把话题拉回下一阶段？
-            另设 10 分的综合印象分。
+        请你作为高级质量检测员，对教练AI的表现进行极其严格的评估。
+        你需要考察以下三个维度（每个维度满分 30 分）：
+        1. 四阶段流转与角色保持 (Phase & Roleplay): 教练AI是否平滑且自然地推进了四大阶段（观察括号里的阶段标签）？在过渡时是否生硬？是否始终保持了对应的身份？
+        2. 教学与引导性 (Guiding & Open-ended): 教练AI是否尽量使用了开放式提问引导用户开口？在 CORE_TASK 阶段是否自然地将话题引向了核心任务？
+        3. 控场与应对突发 (Event Handling & Pull-back): 面对偏题、暴躁或突发剧情（EVENT_EXTENSION）时，教练AI是否能妥善应对，并在解决问题后自然地把话题拉回下一阶段？
+        另设 10 分的综合印象分。
 
-            【输出要求（必须遵守）】:
-            1. 必须全程使用【简体中文】输出。
-            2. 在报告的最开头，使用极大的字号（Markdown 一级标题）输出最终的【综合得分（百分制）】，例如：# 🏆 最终得分：85/100
-            3. 详细列出各个维度的扣分项和加分项。
-            4. 最后给出一句犀利的总结点评。
-            """
+        【输出要求（必须遵守）】:
+        1. 必须全程使用【简体中文】输出。
+        2. 在报告的最开头，使用极大的字号（Markdown 一级标题）输出最终的【综合得分（百分制）】，例如：# 🏆 最终得分：85/100
+        3. 详细列出各个维度的扣分项和加分项。
+        4. 最后给出一句犀利的总结点评。
+        """
 
-            judge_resp = await client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[{"role": "user", "content": judge_prompt}]
-            )
+        judge_resp = await client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": judge_prompt}]
+        )
 
-            print("\n📊 裁判最终报告：\n")
-            print(judge_resp.choices[0].message.content)
-            print("\n" + "=" * 50)
+        print("\n📊 裁判最终报告：\n")
+        print(judge_resp.choices[0].message.content)
+        print("\n" + "=" * 50)
 
     except Exception as e:
         print(f"❌ 测试脚本异常: {e}")
