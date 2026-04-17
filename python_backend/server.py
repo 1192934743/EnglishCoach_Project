@@ -4,12 +4,13 @@ import asyncio
 import logging
 from typing import Optional
 from contextlib import contextmanager
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
+from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 import openai
 
-from database import SessionLocal, User, Topic
+from database import SessionLocal, User, Topic, TargetNode, UserProgress, LearningSession
 from core.audio_service import run_volcengine_wss_asr, run_tts_to_ws
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
@@ -58,6 +59,139 @@ async def on_startup():
     """服务启动时初始化 VectorStore，使 SessionPlanner 的相似度计算即刻可用"""
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# REST API — 话题浏览器 + 学习统计
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/topics")
+async def get_topics(user_id: Optional[str] = Query(default=None)):
+    """
+    返回所有话题列表，附带用户对该话题的掌握度概况。
+    前端话题浏览器使用。
+    """
+    def _query():
+        with get_db() as db:
+            topics = db.query(Topic).all()
+            result = []
+            for t in topics:
+                nodes = db.query(TargetNode).filter(TargetNode.topic_id == t.id).all()
+                total_nodes = len(nodes)
+                avg_mastery = 0.0
+                last_practiced = None
+                if user_id and nodes:
+                    node_ids = [n.id for n in nodes]
+                    progresses = db.query(UserProgress).filter(
+                        UserProgress.user_id == user_id,
+                        UserProgress.node_id.in_(node_ids),
+                    ).all()
+                    if progresses:
+                        avg_mastery = sum(p.mastery_score for p in progresses) / len(nodes)
+                        dates = [p.last_practiced_at for p in progresses if p.last_practiced_at]
+                        last_practiced = max(dates).isoformat() if dates else None
+                # Count distinct depth levels
+                depth_levels = sorted(set(n.depth_level for n in nodes))
+                result.append({
+                    "id": t.id,
+                    "title": t.title,
+                    "category": t.category or "General",
+                    "learner_level": t.learner_level or "Intermediate",
+                    "role_name": t.role_name or "Coach",
+                    "total_nodes": total_nodes,
+                    "depth_levels": depth_levels,
+                    "avg_mastery": round(avg_mastery, 1),
+                    "last_practiced": last_practiced,
+                })
+            return result
+
+    data = await run_in_threadpool(_query)
+    return JSONResponse(content={"topics": data})
+
+
+@app.get("/api/stats")
+async def get_stats(user_id: str = Query(...)):
+    """
+    返回用户学习统计数据。
+    学习统计页使用。
+    """
+    def _query():
+        import datetime
+        with get_db() as db:
+            # Total sessions
+            sessions = db.query(LearningSession).filter(
+                LearningSession.user_id == user_id
+            ).order_by(LearningSession.start_time.desc()).all()
+
+            # Total nodes practiced (unique)
+            all_progress = db.query(UserProgress).filter(
+                UserProgress.user_id == user_id
+            ).all()
+
+            mastered_nodes = [p for p in all_progress if p.mastery_score >= 60.0]
+            total_practiced = len(all_progress)
+
+            # Streak calculation (consecutive days with at least 1 session)
+            streak = 0
+            if sessions:
+                today = datetime.datetime.utcnow().date()
+                day = today
+                session_dates = set(s.start_time.date() for s in sessions if s.start_time)
+                while day in session_dates:
+                    streak += 1
+                    day -= datetime.timedelta(days=1)
+
+            # Topics practiced
+            topic_ids_practiced = list(set(s.topic_id for s in sessions if s.topic_id))
+
+            # Recent sessions (last 7)
+            recent = []
+            for s in sessions[:7]:
+                topic = db.query(Topic).filter(Topic.id == s.topic_id).first()
+                recent.append({
+                    "topic_title": topic.title if topic else "Unknown",
+                    "depth_tier": s.depth_tier_used or 1,
+                    "nodes_mastered": len(s.nodes_mastered or []),
+                    "date": s.start_time.isoformat() if s.start_time else None,
+                    "quality": s.session_summary.get("avg_quality") if s.session_summary else None,
+                })
+
+            # Per-topic mastery summary
+            topics_summary = []
+            all_topics = db.query(Topic).all()
+            for t in all_topics:
+                nodes = db.query(TargetNode).filter(TargetNode.topic_id == t.id).all()
+                if not nodes:
+                    continue
+                node_ids = [n.id for n in nodes]
+                progs = db.query(UserProgress).filter(
+                    UserProgress.user_id == user_id,
+                    UserProgress.node_id.in_(node_ids),
+                ).all()
+                if not progs:
+                    continue
+                avg = sum(p.mastery_score for p in progs) / len(nodes)
+                topics_summary.append({
+                    "topic_title": t.title,
+                    "category": t.category or "General",
+                    "avg_mastery": round(avg, 1),
+                    "nodes_practiced": len(progs),
+                    "total_nodes": len(nodes),
+                })
+            topics_summary.sort(key=lambda x: x["avg_mastery"], reverse=True)
+
+            return {
+                "total_sessions": len(sessions),
+                "total_expressions_practiced": total_practiced,
+                "total_expressions_mastered": len(mastered_nodes),
+                "topics_touched": len(topic_ids_practiced),
+                "current_streak_days": streak,
+                "recent_sessions": recent,
+                "topics_summary": topics_summary[:10],  # top 10
+            }
+
+    data = await run_in_threadpool(_query)
+    return JSONResponse(content=data)
 
 # ================= 业务全局常量 =================
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度

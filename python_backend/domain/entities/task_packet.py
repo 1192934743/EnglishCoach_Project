@@ -17,6 +17,57 @@ import json
 from dataclasses import dataclass, field, asdict
 
 
+def compute_max_reply_sentences(learner_level: str, depth_tier: int) -> int:
+    """
+    Max in-character sentences per coach turn (excluding a trailing [ADVANCE] token).
+
+    This is **dialogue pacing / cognitive load**, not the same as TargetNode.depth_level
+    or TaskPacket.depth_tier (those select *which expressions* to practice).
+
+    Policy: shorter turns for beginner-labelled topics; more room for advanced learners,
+    especially when practicing higher content tiers (deeper nodes / twists).
+    """
+    s = (learner_level or "Intermediate").strip().lower()
+    tier = max(1, min(5, int(depth_tier or 1)))
+
+    beginner = any(
+        k in s
+        for k in (
+            "begin",
+            "basic",
+            "starter",
+            "elementary",
+            "a1",
+            "a2",
+            "novice",
+            "初级",
+        )
+    )
+    advanced = any(
+        k in s
+        for k in (
+            "advanced",
+            "proficient",
+            "fluent",
+            "c1",
+            "c2",
+            "expert",
+            "mastery",
+            "upper-intermediate",
+            "熟练",
+        )
+    )
+
+    if beginner:
+        return 2
+    if advanced:
+        cap = 5 + (1 if tier >= 2 else 0) + (1 if tier >= 3 else 0)
+        return min(7, cap)
+    # Intermediate default
+    cap = 3 + (1 if tier >= 3 else 0)
+    return min(5, cap)
+
+
 @dataclass
 class DifficultyConfig:
     """对话难度的控制开关集合，由 session_planner 根据用户设置生成。"""
@@ -63,7 +114,10 @@ class TaskPacket:
     voice: str = "Stanley"
 
     # ── 深度控制 ────────────────────────────────────────────────────────────
+    # depth_tier: 本次主练的「内容层级」(对齐 TargetNode.depth_level)，决定选哪些节点，不是每轮句数。
     depth_tier: int = 1
+    # 每轮教练台词句数上限（与 depth_tier 正交；由 LMS 根据 learner_level + depth_tier 计算）
+    max_reply_sentences: int = 3
 
     # ── 节点列表（纯数据字典，不持有 ORM 对象）───────────────────────────────
     target_nodes: list = field(default_factory=list)

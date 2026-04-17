@@ -37,7 +37,7 @@ from sqlalchemy.orm import Session
 from fastapi import WebSocket
 
 from database import User, Topic, TargetNode, UserProgress
-from domain.entities.task_packet import TaskPacket
+from domain.entities.task_packet import TaskPacket, compute_max_reply_sentences
 from application.services.mastery_scorer import (
     update_mastery, L1_EXACT_QUALITY, L1_STEM_QUALITY,
     normalize_text, simple_stem,
@@ -135,6 +135,10 @@ def build_dynamic_prompt(
         role_name = task_packet.role_name
         user_level = task_packet.learner_level
         scene_specific_rules = task_packet.scene_specific_rules
+        depth_tier_val = int(task_packet.depth_tier or 1)
+        max_reply_sentences = int(task_packet.max_reply_sentences or 0) or compute_max_reply_sentences(
+            user_level, depth_tier_val
+        )
 
         # 将 session_goal 注入 prompt（帮助 AI 理解本次练习意图）
         session_goal_line = (
@@ -148,6 +152,8 @@ def build_dynamic_prompt(
         user_level = active_scene.get("level", "Intermediate")
         scene_specific_rules = active_scene.get("scene_specific_rules", [])
         session_goal_line = ""
+        depth_tier_val = 1
+        max_reply_sentences = compute_max_reply_sentences(user_level, depth_tier_val)
 
     phase = session_ctx.get("phase", "ICE_BREAKING")
     loop_count = session_ctx.get("loop_count", 1)
@@ -167,7 +173,11 @@ def build_dynamic_prompt(
     personality_desc = personality_levels.get(politeness_key, personality_levels.get("1", ""))
 
     prompt_blocks = [
-        f"Learner Level: {user_level}",
+        (
+            f"Learner Level: {user_level} | Practice content tier (target nodes): {depth_tier_val} "
+            f"| Coach turn length cap: {max_reply_sentences} short in-character sentences per reply "
+            f"(excluding a trailing [ADVANCE] token if required)"
+        ),
         role_desc,
         personality_desc,
         "",
@@ -240,6 +250,19 @@ def build_dynamic_prompt(
         prompt_blocks.append(directive.get("header", "PHASE 4: WRAP UP (Conclusion)"))
         prompt_blocks.append(directive.get("goal", ""))
         prompt_blocks.append(directive.get("advance", ""))
+
+    if phase == "ICE_BREAKING" and max_reply_sentences <= 2:
+        prompt_blocks.append(
+            "SESSION TIGHT BUDGET: In ICE BREAKING, use at most ONE open-ended question in this turn "
+            "(a greeting plus one question still counts as ≤2 sentences)."
+        )
+
+    # Recency: models often overweight later instructions; repeat length cap after phase text.
+    prompt_blocks.append("")
+    prompt_blocks.append(
+        f"[OUTPUT BUDGET] Your next reply: at most {max_reply_sentences} short in-character sentences "
+        f"before any trailing [ADVANCE] token. No bullet lists, no lecture-style multi-paragraph answers."
+    )
 
     return "\n".join(prompt_blocks)
 

@@ -27,7 +27,7 @@ from typing import Optional
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, User, Topic, TargetNode, UserProgress, LearningSession
-from domain.entities.task_packet import TaskPacket, DifficultyConfig
+from domain.entities.task_packet import TaskPacket, DifficultyConfig, compute_max_reply_sentences
 from infrastructure.vector_store.numpy_store import NumpyVectorStore, embed_topics_bow
 from application.services.mastery_scorer import effective_mastery
 
@@ -259,6 +259,8 @@ def _build_packet_for_topic(
     def _nd(n: TargetNode) -> dict:
         return {"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level}
 
+    max_reply = compute_max_reply_sentences(topic.learner_level or "Intermediate", depth_tier)
+
     return TaskPacket(
         topic_id=topic.id,
         topic_title=topic.title,
@@ -267,6 +269,7 @@ def _build_packet_for_topic(
         learner_level=topic.learner_level or "Intermediate",
         voice=topic.voice or "Stanley",
         depth_tier=depth_tier,
+        max_reply_sentences=max_reply,
         target_nodes=[_nd(n) for n in target_nodes],
         bonus_nodes=[_nd(n) for n in bonus_nodes],
         review_nodes=[_nd(n) for n in review_nodes],
@@ -482,14 +485,16 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
             TargetNode.topic_id == first_topic.id,
             TargetNode.depth_level == 1
         ).all()
+        lvl = first_topic.learner_level or "Intermediate"
         return TaskPacket(
             topic_id=first_topic.id,
             topic_title=first_topic.title,
             scene_prompt=first_topic.system_prompt or first_topic.title,
             role_name=first_topic.role_name or "English Coach",
-            learner_level=first_topic.learner_level or "Intermediate",
+            learner_level=lvl,
             voice=first_topic.voice or "Stanley",
             depth_tier=1,
+            max_reply_sentences=compute_max_reply_sentences(lvl, 1),
             target_nodes=[{"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level} for n in nodes],
             scene_specific_rules=first_topic.scene_specific_rules or [],
             session_goal=f"Practice basic {first_topic.title} conversation.",
@@ -502,5 +507,6 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
         scene_prompt="Have a casual daily conversation to practice English.",
         role_name="English Coach",
         learner_level="Intermediate",
+        max_reply_sentences=compute_max_reply_sentences("Intermediate", 1),
         session_goal="Practice speaking naturally in English.",
     )
