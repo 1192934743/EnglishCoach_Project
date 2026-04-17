@@ -200,7 +200,8 @@ class ChatNotifier extends Notifier<ChatState> {
 
   void _initWebSocketListeners() {
     final wsClient = ref.read(websocketProvider);
-    _commandSubscription = wsClient.commandStream.listen((data) {
+    // async 回调：允许在 error 分支 await forceIdle() 后再写 errorMessage
+    _commandSubscription = wsClient.commandStream.listen((data) async {
       if (data['event'] == 'tts_finished') {
         if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
         _handleAudioFinished();
@@ -220,10 +221,10 @@ class ChatNotifier extends Notifier<ChatState> {
         final progress = (data['progress'] as num?)?.toDouble() ?? 0.0;
         state = state.copyWith(masteryProgress: progress);
       } else if (data['event'] == 'error') {
-        // LLM 超时 / 系统错误：立刻解除等待状态 + 向 UI 推送友好提示
+        // LLM 超时 / 系统错误：先解锁 UI，再写 errorMessage 触发 SnackBar
         final code = data['code'] as String? ?? 'UNKNOWN';
         if (code == 'LLM_TIMEOUT' || code == 'LLM_ERROR') {
-          await forceIdle();
+          await forceIdle(); // 确保 status=idle 后再推 errorMessage
           final message = data['message'] as String? ??
               'Something went wrong. Please try again.';
           state = state.copyWith(errorMessage: message);
