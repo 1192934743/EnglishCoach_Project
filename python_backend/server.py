@@ -12,6 +12,7 @@ import openai
 from database import SessionLocal, User, Topic
 from core.audio_service import run_volcengine_wss_asr, run_tts_to_ws
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
+from domain.entities.session_context import SessionContext
 
 # ================= 0. 初始化与配置 =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -46,11 +47,12 @@ client = openai.AsyncOpenAI(api_key=CONFIG["DEEPSEEK_KEY"], base_url=CONFIG["DEE
 app = FastAPI()
 
 # ================= 业务全局常量 =================
-MAX_HISTORY_LEN = 11               # 保持对话历史的最大长度 (系统提示词 + 10轮对话)
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 音频防爆限制：5MB
 MAX_BUFFER_CHARS = 50              # 流式处理中，无标点字符超过此长度强制截断发送 TTS
+# chat_history token 预算：4 chars ≈ 1 token（粗估），给模型上下文留足余量
+MAX_CONTEXT_TOKENS = 2000          # 进入 LLM 前历史消息的 token 上限（含 system prompt）
 
 # ================= 数据库上下文 =================
 @contextmanager
@@ -86,6 +88,24 @@ def update_user_politeness(user_id: str, level: int):
             user.politeness_level = level
             db.commit()
 
+def trim_chat_history(history: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> list[dict]:
+    """
+    按估算 token 数裁剪对话历史，永远保留 history[0]（system prompt）。
+    策略：从最旧的 Q/A pair（[1][2]）开始丢弃，直到剩余 token 数在预算内。
+    4 chars ≈ 1 token 是业界通行的粗估，对英文文本误差在 10% 内。
+    """
+    if len(history) <= 1:
+        return history
+    system = history[0]
+    turns = history[1:]
+    # 丢弃时以完整的 Q/A pair（2条）为最小单位，避免上下文不对称
+    while len(turns) > 2:
+        total_chars = sum(len(m.get("content", "")) for m in [system] + turns)
+        if total_chars // 4 <= max_tokens:
+            break
+        turns = turns[2:]  # 丢弃最早一对 user/assistant
+    return [system] + turns
+
 async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dict):
     """统一的线程安全 WebSocket 发送工具"""
     try:
@@ -107,19 +127,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
     is_flipped = False
     session_hits = set()
-    
-    session_ctx = {
-        "loop_count": 1,
-        "phase": "ICE_BREAKING",
-        "phase_turns": 0,
-        "active_targets": [],
-        "current_event": "",
-        "llm_wants_to_advance": False,
-        "current_level": 1,
-        "chat_score": 0.0,
-        "task_score": 0.0,
-        "completed_rounds_in_level": 0
-    }
+    session_ctx = SessionContext()  # 可序列化的会话状态，替代原裸 dict
 
     # 获取初始数据 (严格分离 Session)
     with get_db() as db:
@@ -347,9 +355,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
                     clean_full_reply = raw_full_reply.replace("[ADVANCE]", "").strip()
                     chat_history.append({"role": "assistant", "content": clean_full_reply})
-                    
-                    if len(chat_history) > MAX_HISTORY_LEN: 
-                        chat_history = [chat_history[0]] + chat_history[-(MAX_HISTORY_LEN - 1):]
+                    chat_history = trim_chat_history(chat_history)
 
                     logger.info(f"🤖 AI: {clean_full_reply}")
 
