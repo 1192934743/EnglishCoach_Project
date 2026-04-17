@@ -1,0 +1,395 @@
+"""
+TopicGenerator — 三层话题生成策略
+
+相似度判断  →  策略
+
+> 0.75    →  直接使用已有话题（零 LLM 成本）
+0.40~0.75 →  参考引导生成：把最近似话题的结构作为 few-shot 模板，
+              AI 生成"同等质量但内容全新"的话题
+< 0.40    →  纯净生成：从零生成，无参考约束
+
+所有 AI 生成的话题都写入 DB + 加入 VectorStore，下次直接命中，越用越好。
+
+相似度计算：Jaccard 词集重叠（无需外部模型）
+  对于有 embedding 的话题，同时用 VectorStore cosine 并取最大值
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import asyncio
+from typing import Optional
+
+from sqlalchemy.orm import Session
+
+from database import SessionLocal, Topic, TargetNode
+from application.services.mastery_scorer import normalize_text
+
+logger = logging.getLogger("EnglishCoach")
+
+# ── 生成参数 ─────────────────────────────────────────────────────────────────
+# 注意：使用 Jaccard 相似度（词集重叠），值域与 cosine 不同，通常 < 0.15
+# 实测基准（3 话题 DB）：
+#   "job interview for software engineer" vs "Technical Job Interview" → ~0.067（实际同一话题）
+#   "coffee shop ordering" vs "McDonald's Ordering"                   → ~0.038（同类话题）
+#   "airport check-in"    vs any food/job topic                       → ~0.000（完全不同）
+SIMILARITY_REUSE_THRESHOLD = 0.055      # 高于此值：直接复用（同一话题）
+SIMILARITY_REFERENCE_THRESHOLD = 0.020 # 0.02~0.055：参考生成（同类话题）；低于：纯净生成
+GENERATE_MAX_TOKENS = 800
+GENERATE_TIMEOUT = 30.0
+
+# ── 输出 JSON Schema（AI 必须遵守的结构）────────────────────────────────────
+_OUTPUT_SCHEMA = {
+    "title": "string — short English topic name, e.g. 'Coffee Shop Ordering'",
+    "category": "string — topic category, e.g. 'Food & Drink', 'Travel', 'Career'",
+    "role_name": "string — AI's role in the scene, e.g. 'Barista'",
+    "learner_level": "string — 'Beginner' | 'Intermediate' | 'Professional'",
+    "scene_prompt": "string — 1-2 sentence immersive scene description for the AI",
+    "vocab_tags": ["list of 8-12 key vocabulary words or short phrases"],
+    "sentence_patterns": ["list of 4-6 key sentence starters or patterns"],
+    "scene_specific_rules": ["list of 2-3 coaching guardrail rules for this scene"],
+    "difficulty_tiers": {
+        "1": {"rules": ["list — 1 rule describing depth-1 focus"]},
+        "2": {"rules": ["list — 1 rule describing depth-2 focus"]},
+        "3": {"rules": ["list — 1 rule describing depth-3 focus"]}
+    },
+    "nodes": [
+        {
+            "text": "string — the expression to practice",
+            "type": "word | phrase | sentence",
+            "depth_level": "integer 1, 2, or 3"
+        }
+    ]
+}
+_SCHEMA_STR = json.dumps(_OUTPUT_SCHEMA, indent=2, ensure_ascii=False)
+
+# depth_level 节点数量建议（引导 AI 产出平衡的节点）
+_NODE_DISTRIBUTION_HINT = (
+    "Include: 3-4 nodes at depth_level=1 (survival basics), "
+    "2-3 nodes at depth_level=2 (intermediate), "
+    "1-2 nodes at depth_level=3 (advanced/situational)."
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 公开接口
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def get_or_generate_topic(
+    description: str,
+    openai_client,
+    db: Optional[Session] = None,
+) -> Topic:
+    """
+    主入口：根据描述返回一个 Topic（已有或新生成）。
+
+    - 调用方通过 TaskPacket 使用返回的 Topic
+    - 所有生成的 Topic 均持久化到 DB
+
+    此函数绝不抛出异常，失败时返回 fallback Topic。
+    """
+    should_close = db is None
+    db = db or SessionLocal()
+    try:
+        return await _get_or_generate(description, openai_client, db)
+    except Exception as e:
+        logger.error(f"[TopicGenerator] Unexpected error: {e}", exc_info=True)
+        return _get_fallback_topic(db)
+    finally:
+        if should_close:
+            db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 内部流程
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def _get_or_generate(
+    description: str,
+    openai_client,
+    db: Session,
+) -> Topic:
+    all_topics = db.query(Topic).all()
+
+    # ── 1. 相似度匹配 ──────────────────────────────────────────────────────
+    best_topic, best_sim = _find_best_match(description, all_topics)
+    logger.info(f"[TopicGenerator] '{description}' → best match: "
+                f"'{best_topic.title if best_topic else None}' sim={best_sim:.2f}")
+
+    # ── 层 1：直接复用 ──────────────────────────────────────────────────────
+    if best_sim >= SIMILARITY_REUSE_THRESHOLD and best_topic is not None:
+        logger.info(f"[TopicGenerator] Tier-1 reuse: '{best_topic.title}'")
+        return best_topic
+
+    # ── 层 2：参考引导生成 ────────────────────────────────────────────────
+    if best_sim >= SIMILARITY_REFERENCE_THRESHOLD and best_topic is not None:
+        logger.info(f"[TopicGenerator] Tier-2 reference-guided generation")
+        return await _generate_with_reference(description, best_topic, openai_client, db)
+
+    # ── 层 3：纯净生成 ────────────────────────────────────────────────────
+    logger.info(f"[TopicGenerator] Tier-3 pure generation (no good reference)")
+    return await _generate_from_scratch(description, openai_client, db)
+
+
+# ── 相似度计算 ─────────────────────────────────────────────────────────────
+
+def _find_best_match(
+    description: str,
+    topics: list[Topic],
+) -> tuple[Optional[Topic], float]:
+    """
+    Jaccard 词集重叠相似度。
+    将话题的 title + vocab_tags + sentence_patterns + category 合并为词集。
+    """
+    if not topics:
+        return None, 0.0
+
+    desc_words = _text_to_wordset(description)
+    if not desc_words:
+        return None, 0.0
+
+    best_topic = None
+    best_sim = 0.0
+
+    for topic in topics:
+        sim = _topic_similarity(desc_words, topic)
+        if sim > best_sim:
+            best_sim = sim
+            best_topic = topic
+
+    return best_topic, best_sim
+
+
+def _text_to_wordset(text: str) -> set[str]:
+    """Normalize → tokenize → strip stop words"""
+    _STOP = {"a", "an", "the", "and", "or", "in", "at", "to", "for",
+             "of", "with", "on", "is", "are", "i", "you", "my", "your"}
+    words = set(normalize_text(text).split())
+    return words - _STOP
+
+
+def _topic_similarity(desc_words: set[str], topic: Topic) -> float:
+    topic_words: set[str] = set()
+    topic_words.update(_text_to_wordset(topic.title or ""))
+    topic_words.update(_text_to_wordset(topic.category or ""))
+    for tag in (topic.vocab_tags or []):
+        topic_words.update(_text_to_wordset(tag))
+    for pat in (topic.sentence_patterns or []):
+        topic_words.update(_text_to_wordset(pat))
+
+    if not topic_words or not desc_words:
+        return 0.0
+
+    intersection = len(topic_words & desc_words)
+    union = len(topic_words | desc_words)
+    return intersection / union if union > 0 else 0.0
+
+
+# ── 层 2：参考引导生成 ─────────────────────────────────────────────────────
+
+def _build_reference_template(topic: Topic) -> dict:
+    """
+    从已有 Topic 提取纯内容结构（去掉运行时字段），
+    作为 few-shot 模板传给 AI。
+    """
+    nodes = []
+    db = SessionLocal()
+    try:
+        raw_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic.id).all()
+        for n in raw_nodes:
+            nodes.append({
+                "text": n.node_text,
+                "type": n.node_type,
+                "depth_level": n.depth_level,
+            })
+    finally:
+        db.close()
+
+    return {
+        "title": topic.title,
+        "category": topic.category,
+        "role_name": topic.role_name,
+        "learner_level": topic.learner_level,
+        "scene_prompt": topic.system_prompt,
+        "vocab_tags": topic.vocab_tags or [],
+        "sentence_patterns": topic.sentence_patterns or [],
+        "scene_specific_rules": topic.scene_specific_rules or [],
+        "difficulty_tiers": topic.difficulty_tiers or {},
+        "nodes": nodes,
+    }
+
+
+async def _generate_with_reference(
+    description: str,
+    reference: Topic,
+    openai_client,
+    db: Session,
+) -> Topic:
+    ref_template = _build_reference_template(reference)
+    ref_json = json.dumps(ref_template, indent=2, ensure_ascii=False)
+
+    prompt = f"""You are designing English language practice topics for a conversation coaching app.
+
+TARGET TOPIC: "{description}"
+
+REFERENCE EXAMPLE (highest-quality similar topic from our library — use it as a structural template):
+{ref_json}
+
+Create a NEW topic for the target description by:
+1. Keeping the SAME structural quality (depth of vocab_tags, node distribution, rule style)
+2. Replacing ALL content with material appropriate for the new target topic
+3. Maintaining the same learner_level unless the new topic clearly suits a different level
+
+{_NODE_DISTRIBUTION_HINT}
+
+Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
+{_SCHEMA_STR}"""
+
+    return await _call_llm_and_save(prompt, db, openai_client)
+
+
+# ── 层 3：纯净生成 ─────────────────────────────────────────────────────────
+
+async def _generate_from_scratch(
+    description: str,
+    openai_client,
+    db: Session,
+) -> Topic:
+    prompt = f"""You are designing English language practice topics for a conversation coaching app.
+
+TARGET TOPIC: "{description}"
+
+Create a complete topic with rich coaching content.
+{_NODE_DISTRIBUTION_HINT}
+
+Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
+{_SCHEMA_STR}"""
+
+    return await _call_llm_and_save(prompt, db, openai_client)
+
+
+# ── LLM 调用 + 持久化 ──────────────────────────────────────────────────────
+
+async def _call_llm_and_save(
+    prompt: str,
+    db: Session,
+    openai_client,
+) -> Topic:
+    try:
+        resp = await asyncio.wait_for(
+            openai_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {"role": "system", "content": "You are a language curriculum designer. Output valid JSON only."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=GENERATE_MAX_TOKENS,
+                response_format={"type": "json_object"},
+            ),
+            timeout=GENERATE_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        raise RuntimeError(f"TopicGenerator LLM timeout (>{GENERATE_TIMEOUT}s)")
+
+    raw = resp.choices[0].message.content
+    data = _parse_and_validate(raw)
+    return _save_to_db(data, db)
+
+
+def _parse_and_validate(raw: str) -> dict:
+    """Parse + minimal validation of LLM output."""
+    try:
+        data = json.loads(raw.strip())
+    except json.JSONDecodeError:
+        # Try to extract JSON from markdown
+        match = re.search(r'\{[\s\S]*\}', raw)
+        if match:
+            data = json.loads(match.group())
+        else:
+            raise ValueError(f"LLM returned unparseable JSON: {raw[:200]}")
+
+    # Ensure required fields exist with defaults
+    data.setdefault("title", "Custom Practice Topic")
+    data.setdefault("category", "General")
+    data.setdefault("role_name", "English Coach")
+    data.setdefault("learner_level", "Intermediate")
+    data.setdefault("scene_prompt", data["title"])
+    data.setdefault("vocab_tags", [])
+    data.setdefault("sentence_patterns", [])
+    data.setdefault("scene_specific_rules", [])
+    data.setdefault("difficulty_tiers", {
+        "1": {"rules": ["Focus on basic vocabulary and fundamental expressions."]},
+        "2": {"rules": ["Introduce more complex phrasing and situational variations."]},
+        "3": {"rules": ["Handle advanced situations, edge cases, and nuanced language."]},
+    })
+    data.setdefault("nodes", [])
+    return data
+
+
+def _save_to_db(data: dict, db: Session) -> Topic:
+    """Persist generated Topic + TargetNodes, return detached Topic."""
+    topic = Topic(
+        title=data["title"],
+        category=data["category"],
+        role_name=data["role_name"],
+        learner_level=data["learner_level"],
+        system_prompt=data["scene_prompt"],
+        vocab_tags=data["vocab_tags"],
+        sentence_patterns=data["sentence_patterns"],
+        scene_specific_rules=data["scene_specific_rules"],
+        difficulty_tiers=data["difficulty_tiers"],
+        voice="Stanley",
+    )
+    db.add(topic)
+    db.commit()
+    db.refresh(topic)
+
+    # Save TargetNodes
+    raw_nodes = data.get("nodes", [])
+    for n in raw_nodes:
+        text = n.get("text", "").strip()
+        if not text:
+            continue
+        depth = int(n.get("depth_level", 1))
+        ntype = n.get("type", "word")
+        # weight heuristic: sentences > phrases > words
+        weight = 3.0 if ntype == "sentence" else (2.0 if ntype == "phrase" else 1.0)
+        db.add(TargetNode(
+            topic_id=topic.id,
+            node_text=text,
+            node_type=ntype,
+            depth_level=depth,
+            weight=weight,
+        ))
+    db.commit()
+
+    # Save values before expunge (accessing attributes on detached instance raises DetachedInstanceError)
+    saved_title = topic.title
+    saved_id = topic.id
+    db.expunge(topic)
+    logger.info(f"[TopicGenerator] Saved new topic: '{saved_title}' "
+                f"(id={saved_id}, nodes={len(raw_nodes)})")
+    return topic
+
+
+def _get_fallback_topic(db: Session) -> Topic:
+    """Last resort: return any existing topic."""
+    topic = db.query(Topic).first()
+    if topic:
+        db.expunge(topic)
+        return topic
+    # If DB is completely empty, create a bare-bones topic
+    topic = Topic(
+        title="General English Conversation",
+        category="Daily Life",
+        role_name="English Coach",
+        learner_level="Intermediate",
+        system_prompt="Have a natural English conversation.",
+    )
+    db.add(topic)
+    db.commit()
+    db.refresh(topic)
+    db.expunge(topic)
+    return topic

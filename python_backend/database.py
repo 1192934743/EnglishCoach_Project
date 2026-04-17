@@ -1,6 +1,6 @@
 import uuid
 import datetime
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = "sqlite:///english_coach.db"
@@ -13,10 +13,15 @@ class User(Base):
     __tablename__ = 'users'
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
-    level = Column(Integer, default=0)
-    # 🌟 新增：全局礼貌度设置 (0: Rude/Impatient, 1: Normal, 2: Very Polite)
+    level = Column(Integer, default=1)
     politeness_level = Column(Integer, default=1)
-    settings = Column(JSON, default={"depth_preference": 1.0, "new_topic_ratio": 0.2})
+    assessment_done = Column(Boolean, default=False)
+    # depth_preference (1.0~5.0), new_topic_appetite (0.0~1.0), learning_mode ("freeform"/"curriculum")
+    settings = Column(JSON, default=lambda: {
+        "depth_preference": 1.0,
+        "new_topic_appetite": 0.2,
+        "learning_mode": "freeform"
+    })
 
 
 class Topic(Base):
@@ -25,8 +30,26 @@ class Topic(Base):
     title = Column(String, nullable=False)
     category = Column(String)
     difficulty_base = Column(Integer, default=1)
-    system_prompt = Column(String)  # 基础人设
+    system_prompt = Column(String)
     tags = Column(String)
+
+    # ── LMS 扩展字段（新增，nullable 保证旧数据兼容）────────────────────────
+    # 对话 AI 所扮演的角色名称，e.g. "Fast-food Server"
+    role_name = Column(String, nullable=True)
+    # 学习者目标水平，e.g. "Beginner" / "Intermediate" / "Professional"
+    learner_level = Column(String, nullable=True, default="Intermediate")
+    # TTS 声音
+    voice = Column(String, nullable=True, default="Stanley")
+    # 话题核心词汇标签，用于向量化及相似度计算，e.g. ["burger", "fries", "combo"]
+    vocab_tags = Column(JSON, nullable=True)
+    # 话题核心句型标签，e.g. ["I would like to order", "for here or to go"]
+    sentence_patterns = Column(JSON, nullable=True)
+    # 按深度分层的规则配置：{"1": {"rules": [...]}, "2": {"rules": [...]}}
+    difficulty_tiers = Column(JSON, nullable=True)
+    # 场景专属护栏规则（直接注入 Prompt），e.g. ["If user..., then..."]
+    scene_specific_rules = Column(JSON, nullable=True)
+    # 话题特征向量（由 VectorStore 离线生成后写回），JSON 存 float 列表
+    embedding = Column(JSON, nullable=True)
 
 
 class TargetNode(Base):
@@ -34,8 +57,8 @@ class TargetNode(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     topic_id = Column(Integer, ForeignKey('topics.id'))
     node_text = Column(String, nullable=False)
-    node_type = Column(String, default="word")  # word, phrase, sentence
-    depth_level = Column(Integer, default=1)
+    node_type = Column(String, default="word")   # word / phrase / sentence
+    depth_level = Column(Integer, default=1)     # 1=基础, 2=进阶, 3=高阶
     weight = Column(Float, default=1.0)
 
 
@@ -44,12 +67,13 @@ class UserProgress(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     user_id = Column(String, ForeignKey('users.id'))
     node_id = Column(Integer, ForeignKey('target_nodes.id'))
-    mastery_score = Column(Float, default=0.0)
+    mastery_score = Column(Float, default=0.0)    # 0~100
     practice_count = Column(Integer, default=0)
     last_practiced_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 class ChatSession(Base):
+    """旧版 session 记录（保留兼容，新代码请用 LearningSession）"""
     __tablename__ = 'chat_sessions'
     id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id = Column(String, ForeignKey('users.id'))
@@ -58,34 +82,181 @@ class ChatSession(Base):
     summary = Column(JSON, nullable=True)
 
 
+class LearningSession(Base):
+    """
+    LMS 核心记录表：每次完整对话的快照与结果。
+
+    nodes_attempted: 本次尝试使用的节点 id 列表
+    nodes_mastered:  本次判定掌握（mastery += 15 且过阈值）的节点 id 列表
+    task_packet_snapshot: 本次 TaskPacket 的 JSON 快照（方便调试与回溯）
+    session_summary: 评估 AI 事后异步填写（分数、总结、建议）
+    """
+    __tablename__ = 'learning_sessions'
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    user_id = Column(String, ForeignKey('users.id'))
+    topic_id = Column(Integer, ForeignKey('topics.id'))
+    start_time = Column(DateTime, default=datetime.datetime.utcnow)
+    end_time = Column(DateTime, nullable=True)
+    depth_tier_used = Column(Integer, default=1)
+    # JSON list of node IDs
+    nodes_attempted = Column(JSON, nullable=True, default=list)
+    nodes_mastered = Column(JSON, nullable=True, default=list)
+    # Full TaskPacket snapshot for debugging
+    task_packet_snapshot = Column(JSON, nullable=True)
+    # Filled asynchronously by assessment engine after session ends
+    session_summary = Column(JSON, nullable=True)
+
+
 def init_db():
-    print("⏳ 正在重建数据库...")
+    """
+    重建数据库并注入完整的种子数据（含新 LMS 字段）。
+    调用前请删除旧的 english_coach.db 文件。
+    """
+    print("[INFO] Rebuilding database with LMS schema...")
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
 
-    # 注入麦当劳话题
+    # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
     mcdonalds = Topic(
         title="McDonald's Ordering",
         category="Food & Drink",
-        system_prompt="You are in a McDonald's restaurant. Follow the specific persona instructions provided in the dynamic prompt."
+        role_name="Fast-food Server",
+        learner_level="Beginner",
+        voice="Stanley",
+        system_prompt=(
+            "You are a friendly fast-food server at McDonald's drive-thru. "
+            "Follow the specific persona instructions provided in the dynamic prompt."
+        ),
+        vocab_tags=["burger", "fries", "combo", "meal", "drink", "order", "receipt", "change"],
+        sentence_patterns=[
+            "I would like to order",
+            "Can I get",
+            "for here or to go",
+            "Would you like to upsize",
+            "That will be",
+        ],
+        scene_specific_rules=[
+            "If the user says they are not hungry or do not want food, suggest a small side item or a drink instead of ending the conversation.",
+            "Always confirm the complete order before proceeding to payment.",
+            "If the user's order is unclear, politely ask them to repeat or clarify each item.",
+        ],
+        difficulty_tiers={
+            "1": {"rules": ["Focus only on basic food ordering vocabulary. Keep sentences short."]},
+            "2": {"rules": ["Introduce combo meals, upsizing, and payment options."]},
+            "3": {"rules": ["Add dietary restrictions, customizations, and complaint handling."]},
+        },
     )
     db.add(mcdonalds)
     db.commit()
     db.refresh(mcdonalds)
 
-    # 注入大池子节点
-    nodes = [
+    nodes_mcdonalds = [
+        # depth_level=1: 绝对基础，第一次练习必须覆盖
         TargetNode(topic_id=mcdonalds.id, node_text="burger", node_type="word", depth_level=1, weight=1.0),
         TargetNode(topic_id=mcdonalds.id, node_text="fries", node_type="word", depth_level=1, weight=1.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="I would like to order", node_type="sentence", depth_level=1,
-                   weight=3.0),
+        TargetNode(topic_id=mcdonalds.id, node_text="I would like to order", node_type="sentence", depth_level=1, weight=3.0),
+        TargetNode(topic_id=mcdonalds.id, node_text="Can I get", node_type="phrase", depth_level=1, weight=2.0),
+        # depth_level=2: 进阶表达，掌握 tier-1 后解锁
         TargetNode(topic_id=mcdonalds.id, node_text="for here or to go", node_type="phrase", depth_level=2, weight=2.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="combo meal", node_type="word", depth_level=2, weight=2.0),
+        TargetNode(topic_id=mcdonalds.id, node_text="combo meal", node_type="phrase", depth_level=2, weight=2.0),
+        TargetNode(topic_id=mcdonalds.id, node_text="upsize", node_type="word", depth_level=2, weight=1.5),
+        # depth_level=3: 高阶，能处理意外情况
+        TargetNode(topic_id=mcdonalds.id, node_text="I have a food allergy", node_type="sentence", depth_level=3, weight=2.0),
+        TargetNode(topic_id=mcdonalds.id, node_text="Could you make that without", node_type="phrase", depth_level=3, weight=2.0),
     ]
-    db.add_all(nodes)
+    db.add_all(nodes_mcdonalds)
+
+    # ── 话题2：技术面试（专业级）────────────────────────────────────────────
+    interview = Topic(
+        title="Technical Job Interview",
+        category="Career & Professional",
+        role_name="Senior Tech Lead",
+        learner_level="Professional",
+        voice="Stanley",
+        system_prompt=(
+            "You are conducting a technical interview for a Python Algorithm Engineer position. "
+            "Follow the specific persona instructions provided in the dynamic prompt."
+        ),
+        vocab_tags=["algorithm", "complexity", "optimize", "implement", "trade-off", "scalable", "edge case"],
+        sentence_patterns=[
+            "Could you walk me through your approach",
+            "What is the time complexity",
+            "How would you handle edge cases",
+            "In my experience",
+            "I would approach this by",
+        ],
+        scene_specific_rules=[
+            "If the user gives a one-word answer, probe for more detail: 'Could you walk me through your reasoning?'",
+            "Acknowledge correct technical answers with brief positive feedback before moving on.",
+            "If the user seems stuck, offer a single small hint rather than giving the full answer.",
+        ],
+        difficulty_tiers={
+            "1": {"rules": ["Ask simple behavioral questions. Focus on past experience."]},
+            "2": {"rules": ["Introduce algorithm questions. Expect Big-O analysis."]},
+            "3": {"rules": ["Add system design questions. Expect trade-off discussions."]},
+        },
+    )
+    db.add(interview)
+    db.commit()
+    db.refresh(interview)
+
+    nodes_interview = [
+        TargetNode(topic_id=interview.id, node_text="In my experience", node_type="phrase", depth_level=1, weight=2.0),
+        TargetNode(topic_id=interview.id, node_text="I would approach this by", node_type="sentence", depth_level=1, weight=3.0),
+        TargetNode(topic_id=interview.id, node_text="time complexity", node_type="phrase", depth_level=2, weight=2.5),
+        TargetNode(topic_id=interview.id, node_text="edge case", node_type="phrase", depth_level=2, weight=2.0),
+        TargetNode(topic_id=interview.id, node_text="trade-off", node_type="word", depth_level=2, weight=2.0),
+        TargetNode(topic_id=interview.id, node_text="scalable", node_type="word", depth_level=3, weight=1.5),
+        TargetNode(topic_id=interview.id, node_text="bottleneck", node_type="word", depth_level=3, weight=1.5),
+    ]
+    db.add_all(nodes_interview)
+
+    # ── 话题3：日常闲聊（中级）──────────────────────────────────────────────
+    casual = Topic(
+        title="Daily Casual Conversation",
+        category="Daily Life",
+        role_name="Language Partner",
+        learner_level="Intermediate",
+        voice="Stanley",
+        system_prompt=(
+            "You are a friendly British language partner practicing daily conversation. "
+            "Follow the specific persona instructions provided in the dynamic prompt."
+        ),
+        vocab_tags=["weekend", "hobby", "plan", "recommend", "prefer", "actually", "honestly"],
+        sentence_patterns=[
+            "What do you think about",
+            "To be honest",
+            "Have you ever tried",
+            "That reminds me of",
+            "I was wondering if",
+        ],
+        scene_specific_rules=[
+            "Occasionally echo back a rephrased version of what the user said to model natural British English.",
+            "If the user makes a grammatical error, gently model the correct version in your own reply without explicitly pointing it out.",
+        ],
+        difficulty_tiers={
+            "1": {"rules": ["Keep topics simple: weather, hobbies, food."]},
+            "2": {"rules": ["Discuss opinions, preferences, and past experiences."]},
+            "3": {"rules": ["Debate abstract topics, hypotheticals, and current events."]},
+        },
+    )
+    db.add(casual)
+    db.commit()
+    db.refresh(casual)
+
+    nodes_casual = [
+        TargetNode(topic_id=casual.id, node_text="What do you think about", node_type="sentence", depth_level=1, weight=2.5),
+        TargetNode(topic_id=casual.id, node_text="To be honest", node_type="phrase", depth_level=1, weight=2.0),
+        TargetNode(topic_id=casual.id, node_text="Have you ever tried", node_type="sentence", depth_level=2, weight=2.5),
+        TargetNode(topic_id=casual.id, node_text="That reminds me of", node_type="phrase", depth_level=2, weight=2.0),
+        TargetNode(topic_id=casual.id, node_text="I was wondering if", node_type="sentence", depth_level=3, weight=2.0),
+        TargetNode(topic_id=casual.id, node_text="hypothetically speaking", node_type="phrase", depth_level=3, weight=1.5),
+    ]
+    db.add_all(nodes_casual)
+
     db.commit()
     db.close()
-    print("🚀 数据库及初始数据准备就绪！")
+    print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
 
 
 if __name__ == "__main__":

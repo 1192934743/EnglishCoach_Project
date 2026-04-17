@@ -8,7 +8,10 @@ class SettingsState {
   final bool showTranslation;
   final bool showHints;
   final int vadTimeout;
-  final bool showProgressBar; // 🌟 新增：进度条开关
+  final bool showProgressBar;
+  // LMS parameters (synced to backend User.settings)
+  final double depthPreference;    // 1.0 ~ 5.0: how deep to go in each topic
+  final double newTopicAppetite;   // 0.0 ~ 1.0: 0=review-focused, 1=exploration-focused
 
   SettingsState({
     required this.isChinese,
@@ -19,6 +22,8 @@ class SettingsState {
     required this.showHints,
     required this.vadTimeout,
     required this.showProgressBar,
+    this.depthPreference = 1.0,
+    this.newTopicAppetite = 0.2,
   });
 
   SettingsState copyWith({
@@ -30,6 +35,8 @@ class SettingsState {
     bool? showHints,
     int? vadTimeout,
     bool? showProgressBar,
+    double? depthPreference,
+    double? newTopicAppetite,
   }) {
     return SettingsState(
       isChinese: isChinese ?? this.isChinese,
@@ -40,6 +47,8 @@ class SettingsState {
       showHints: showHints ?? this.showHints,
       vadTimeout: vadTimeout ?? this.vadTimeout,
       showProgressBar: showProgressBar ?? this.showProgressBar,
+      depthPreference: depthPreference ?? this.depthPreference,
+      newTopicAppetite: newTopicAppetite ?? this.newTopicAppetite,
     );
   }
 }
@@ -68,9 +77,12 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(showTranslation: val);
   void toggleHints(bool val) => state = state.copyWith(showHints: val);
   void setVadTimeout(int val) => state = state.copyWith(vadTimeout: val);
-  // 🌟 新增 Toggle 函数
   void toggleProgressBar(bool val) =>
       state = state.copyWith(showProgressBar: val);
+  void setDepthPreference(double val) =>
+      state = state.copyWith(depthPreference: val);
+  void setNewTopicAppetite(double val) =>
+      state = state.copyWith(newTopicAppetite: val);
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(

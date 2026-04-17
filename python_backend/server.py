@@ -13,6 +13,12 @@ from database import SessionLocal, User, Topic
 from core.audio_service import run_volcengine_wss_asr, run_tts_to_ws
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
+import uuid
+import application.services.session_planner as session_planner
+import application.services.assessment_engine as assessment_engine
+from application.services.report_builder import build_preliminary_report
+from database import UserProgress
+import infrastructure.topic_generator as topic_generator
 
 # ================= 0. 初始化与配置 =================
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
@@ -46,6 +52,13 @@ client = openai.AsyncOpenAI(api_key=CONFIG["DEEPSEEK_KEY"], base_url=CONFIG["DEE
 
 app = FastAPI()
 
+
+@app.on_event("startup")
+async def on_startup():
+    """服务启动时初始化 VectorStore，使 SessionPlanner 的相似度计算即刻可用"""
+    await run_in_threadpool(session_planner.warm_up)
+    logger.info("🧠 SessionPlanner VectorStore 已就绪。")
+
 # ================= 业务全局常量 =================
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
@@ -78,6 +91,24 @@ def init_or_get_user(user_id: str):
         db.expunge(user)  # 解绑：防止后续在 async 主程中使用其属性时触发 detached 异常
         return user
 
+def _update_lms_settings(user_id: str, depth_preference, new_topic_appetite):
+    """Update LMS parameters in User.settings (thread-safe sync)."""
+    if not user_id:
+        return
+    with get_db() as db:
+        from database import User as UserModel
+        user = db.query(UserModel).filter(UserModel.id == user_id).first()
+        if user:
+            settings = dict(user.settings or {})
+            if depth_preference is not None:
+                settings["depth_preference"] = float(depth_preference)
+            if new_topic_appetite is not None:
+                settings["new_topic_appetite"] = float(new_topic_appetite)
+            user.settings = settings
+            db.commit()
+            logger.info(f"[LMS] Settings updated: depth={settings.get('depth_preference')}, appetite={settings.get('new_topic_appetite')}")
+
+
 def update_user_politeness(user_id: str, level: int):
     """线程安全的同步更新用户礼貌度"""
     if not user_id: 
@@ -87,6 +118,58 @@ def update_user_politeness(user_id: str, level: int):
         if user:
             user.politeness_level = level
             db.commit()
+
+def _take_mastery_snapshot(user_id: str, task_packet) -> dict:
+    """
+    会话开始时快照所有目标节点的掌握度，用于 WRAP_UP 时计算增量。
+    同步函数，通过 run_in_threadpool 调用。
+    """
+    if not task_packet or not user_id:
+        return {}
+    all_nodes = task_packet.target_nodes + task_packet.review_nodes
+    node_ids = [n["id"] for n in all_nodes if n.get("id")]
+    if not node_ids:
+        return {}
+    with get_db() as db:
+        progresses = db.query(UserProgress).filter(
+            UserProgress.user_id == user_id,
+            UserProgress.node_id.in_(node_ids),
+        ).all()
+        return {p.node_id: p.mastery_score for p in progresses}
+
+
+async def _renew_task_packet(
+    user_id: str,
+    old_packet,
+    nodes_hit: set,
+    transcript: list,
+    openai_client,
+    session_id: str = "",
+    websocket=None,
+    ws_lock=None,
+):
+    """
+    WRAP_UP 完成后异步执行的后处理任务（不阻塞新一轮对话）：
+    1. 保存 LearningSession 记录到 DB
+    2. 触发 L2 评估：校正 L1 掌握度 + 推送 final 报告到前端
+    """
+    if not old_packet or not user_id:
+        return
+    try:
+        await run_in_threadpool(
+            session_planner.save_learning_session, user_id, old_packet, nodes_hit
+        )
+    except Exception as e:
+        logger.error(f"[WRAP_UP] save_learning_session error: {e}")
+
+    try:
+        await assessment_engine.run_l2_assessment(
+            transcript, old_packet, user_id, session_id,
+            openai_client, websocket, ws_lock,
+        )
+    except Exception as e:
+        logger.error(f"[WRAP_UP] L2 assessment error (non-blocking): {e}")
+
 
 def trim_chat_history(history: list[dict], max_tokens: int = MAX_CONTEXT_TOKENS) -> list[dict]:
     """
@@ -127,20 +210,37 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
     is_flipped = False
     session_hits = set()
-    session_ctx = SessionContext()  # 可序列化的会话状态，替代原裸 dict
+    session_ctx = SessionContext()       # 可序列化的会话状态
+    current_task_packet = None           # 当前 session 的 TaskPacket
+    session_transcript: list[dict] = [] # L2 评估用对话记录
+    session_id: str = str(uuid.uuid4()) # 每局唯一 ID，用于前端匹配 preliminary/final 报告
+    mastery_snapshot: dict = {}          # 本局开始时的节点掌握度快照
 
-    # 获取初始数据 (严格分离 Session)
-    with get_db() as db:
-        initial_topic = db.query(Topic).first()
-        topic_id_for_progress = initial_topic.id if initial_topic else DEFAULT_TOPIC_ID
-        
+    # 获取或创建用户
     current_user = await run_in_threadpool(init_or_get_user, user_id)
-    initial_prompt = build_dynamic_prompt(current_user, is_flipped, session_ctx)
+
+    # 生成首个 TaskPacket（有用户 ID 时走 LMS，匿名时降级到兜底）
+    if current_user:
+        current_task_packet = await run_in_threadpool(
+            session_planner.build_task_packet, current_user.id
+        )
+        mastery_snapshot = await run_in_threadpool(
+            _take_mastery_snapshot, current_user.id, current_task_packet
+        )
+
+    # 确定话题 ID（用于进度追踪）
+    topic_id_for_progress = (
+        current_task_packet.topic_id
+        if current_task_packet and current_task_packet.topic_id
+        else DEFAULT_TOPIC_ID
+    )
+
+    initial_prompt = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
     chat_history = [{"role": "system", "content": initial_prompt}]
 
     if current_user:
         with get_db() as db:
-            await evaluate_and_check_progress(db, current_user.id, topic_id_for_progress, "", 
+            await evaluate_and_check_progress(db, current_user.id, topic_id_for_progress, "",
                                               session_hits, session_ctx, websocket, ws_lock)
 
     try:
@@ -183,16 +283,77 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 if action == "swap_role":
                     is_flipped = not is_flipped
                     session_ctx["phase"], session_ctx["phase_turns"] = "ICE_BREAKING", 0
-                    chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx)
+                    chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
                     await safe_send_ws(websocket, ws_lock, {"event": "role_swapped", "is_flipped": is_flipped})
+                    continue
+
+                if action == "update_lms_settings":
+                    if current_user:
+                        depth = data.get("depth_preference")
+                        appetite = data.get("new_topic_appetite")
+                        await run_in_threadpool(
+                            _update_lms_settings, current_user.id, depth, appetite
+                        )
                     continue
 
                 if action == "update_politeness":
                     if current_user:
                         level = data.get("level", 1)
                         await run_in_threadpool(update_user_politeness, current_user.id, level)
-                        current_user.politeness_level = level  # 同步更新内存中的脱机对象属性
-                        chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx)
+                        current_user.politeness_level = level
+                        chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
+                    continue
+
+                if action == "request_topic":
+                    # 用户主动请求话题（任意自然语言描述）
+                    # 三层策略：复用 → 参考引导生成 → 纯净生成
+                    description = data.get("description", "").strip()
+                    if description and current_user:
+                        await safe_send_ws(websocket, ws_lock, {
+                            "event": "topic_generating",
+                            "message": f"Finding the best match for: {description}",
+                        })
+                        try:
+                            new_topic = await topic_generator.get_or_generate_topic(
+                                description, client
+                            )
+                            # 追加到 VectorStore（若是新生成的话题）
+                            await run_in_threadpool(session_planner.add_topic_to_store, new_topic)
+                            # 为该话题生成 TaskPacket
+                            current_task_packet = await run_in_threadpool(
+                                session_planner.build_task_packet_for_topic,
+                                current_user.id, new_topic.id
+                            )
+                            topic_id_for_progress = current_task_packet.topic_id
+                            # 重置当前局状态
+                            session_id = str(uuid.uuid4())
+                            session_hits.clear()
+                            session_transcript.clear()
+                            mastery_snapshot = await run_in_threadpool(
+                                _take_mastery_snapshot, current_user.id, current_task_packet
+                            )
+                            # 重建 system prompt 并通知前端
+                            session_ctx = SessionContext()
+                            chat_history = [{
+                                "role": "system",
+                                "content": build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet),
+                            }]
+                            await safe_send_ws(websocket, ws_lock, {
+                                "event": "topic_changed",
+                                "topic_id": current_task_packet.topic_id,
+                                "topic_title": current_task_packet.topic_title,
+                                "role_name": current_task_packet.role_name,
+                                "depth_tier": current_task_packet.depth_tier,
+                                "session_id": session_id,
+                            })
+                            logger.info(f"[TopicRequest] Switched to '{current_task_packet.topic_title}' tier={current_task_packet.depth_tier}")
+                        except Exception as e:
+                            logger.error(f"[TopicRequest] Failed: {e}", exc_info=True)
+                            await safe_send_ws(websocket, ws_lock, {
+                                "event": "error",
+                                "code": "TOPIC_GENERATION_FAILED",
+                                "message": "Could not generate topic. Please try again.",
+                            })
                     continue
                 
                 # 🚀 恢复：前端点读单句的请求支持
@@ -246,18 +407,64 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         continue
 
                     session_ctx["phase_turns"] += 1
-                    logger.info(f"✅ 回合 {session_ctx['phase_turns']} ({session_ctx['phase']}) | 你说: {user_text}")
+                    session_transcript.append({"role": "user", "text": user_text})
+                    logger.info(f"[Turn {session_ctx['phase_turns']}] ({session_ctx['phase']}) User: {user_text}")
 
                     # 2. 状态机评估 (开启新 DB 会话，避免跨会话 Detached 错误)
                     if current_user:
                         with get_db() as db:
                             await evaluate_and_check_progress(db, current_user.id, topic_id_for_progress, user_text,
                                                               session_hits, session_ctx, websocket, ws_lock)
-                            
-                            # 实时查询出 fresh_topic 供引擎推进状态，使用完即随 with 块回收
+
                             fresh_topic = db.query(Topic).filter(Topic.id == topic_id_for_progress).first()
-                            if fresh_topic and advance_state_machine(session_ctx, db, fresh_topic, session_hits):
-                                chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx)
+                            did_transition = advance_state_machine(
+                                session_ctx, db, fresh_topic, session_hits, current_task_packet
+                            )
+                            if did_transition:
+                                if session_ctx["phase"] == "ICE_BREAKING":
+                                    # ── 1. 立刻推送初步报告（L1 数据，< 50ms）──────────
+                                    preliminary = build_preliminary_report(
+                                        task_packet=current_task_packet,
+                                        session_id=session_id,
+                                        session_hits=session_hits,
+                                        session_ctx=session_ctx,
+                                        mastery_snapshot=mastery_snapshot,
+                                        db=db,
+                                        user_id=current_user.id,
+                                    )
+                                    await safe_send_ws(websocket, ws_lock, preliminary)
+
+                                    # ── 2. 后台：保存记录 + 触发 L2（推送 final 报告）──
+                                    asyncio.create_task(_renew_task_packet(
+                                        current_user.id,
+                                        current_task_packet,
+                                        session_hits.copy(),
+                                        session_transcript.copy(),
+                                        client,
+                                        session_id,
+                                        websocket,
+                                        ws_lock,
+                                    ))
+
+                                    # ── 3. 生成新 TaskPacket，重置会话状态 ───────────
+                                    current_task_packet = await run_in_threadpool(
+                                        session_planner.build_task_packet, current_user.id
+                                    )
+                                    topic_id_for_progress = (
+                                        current_task_packet.topic_id
+                                        if current_task_packet.topic_id else DEFAULT_TOPIC_ID
+                                    )
+                                    session_id = str(uuid.uuid4())
+                                    session_hits.clear()
+                                    session_transcript.clear()
+                                    mastery_snapshot = await run_in_threadpool(
+                                        _take_mastery_snapshot, current_user.id, current_task_packet
+                                    )
+                                    logger.info(f"[LMS] New session '{current_task_packet.topic_title}' tier={current_task_packet.depth_tier} id={session_id[:8]}")
+
+                                chat_history[0]["content"] = build_dynamic_prompt(
+                                    current_user, is_flipped, session_ctx, current_task_packet
+                                )
 
                     chat_history.append({"role": "user", "content": f"[{user_emotion} tone] {user_text}"})
 
@@ -351,11 +558,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     # 5. 指令清洗与记录
                     session_ctx["llm_wants_to_advance"] = "[ADVANCE]" in raw_full_reply
                     if session_ctx["llm_wants_to_advance"]:
-                        logger.info("🧠 AI 发出了切阶段信号！将在下一回合生效。")
+                        logger.info("[StateMachine] AI signaled ADVANCE, will transition next turn.")
 
                     clean_full_reply = raw_full_reply.replace("[ADVANCE]", "").strip()
                     chat_history.append({"role": "assistant", "content": clean_full_reply})
                     chat_history = trim_chat_history(chat_history)
+
+                    # 追加 AI 回复到 transcript（L2 评估使用）
+                    session_transcript.append({"role": "assistant", "text": clean_full_reply})
 
                     logger.info(f"🤖 AI: {clean_full_reply}")
 

@@ -5,6 +5,98 @@ import 'package:lottie/lottie.dart';
 import 'dart:ui' as ui;
 import '../providers/chat_provider.dart';
 import '../../../core/providers/settings_provider.dart';
+import 'session_report_sheet.dart';
+
+// ── Topic-change bottom sheet ─────────────────────────────────────────────
+Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
+  final controller = TextEditingController();
+  final notifier = ref.read(chatProvider.notifier);
+
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: Container(
+        decoration: const BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+        ),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(
+              child: Container(
+                width: 36, height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.grey.shade300,
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Text(
+              'Practice a Custom Topic',
+              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+            ),
+            const SizedBox(height: 6),
+            Text(
+              'Describe any topic in English or Chinese — we\'ll create the perfect practice session.',
+              style: TextStyle(fontSize: 13, color: Colors.grey[600]),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: controller,
+              autofocus: true,
+              maxLines: 2,
+              decoration: InputDecoration(
+                hintText: 'e.g. "Ordering at Starbucks" or "机场值机"',
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                  borderSide: const BorderSide(color: Colors.blueAccent, width: 2),
+                ),
+              ),
+            ),
+            const SizedBox(height: 14),
+            SizedBox(
+              width: double.infinity,
+              height: 48,
+              child: ElevatedButton(
+                onPressed: () {
+                  final desc = controller.text.trim();
+                  if (desc.isNotEmpty) {
+                    notifier.requestTopic(desc);
+                    Navigator.of(context).pop();
+                  }
+                },
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: Colors.blueAccent,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  elevation: 0,
+                ),
+                child: const Text(
+                  'Generate Practice Session',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 15,
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    ),
+  );
+  controller.dispose();
+}
 
 class ChatScreen extends ConsumerStatefulWidget {
   const ChatScreen({super.key});
@@ -53,8 +145,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         chatState.chatHistory.isEmpty && chatState.status == ChatStatus.idle;
     final bool shouldShowButton = !settings.autoMode || isFirstStart;
 
+    // Fix B1: Guard with prev != null — prevents auto-firing on first render
     ref.listen<SettingsState>(settingsProvider, (prev, next) {
-      if (next.autoMode && (prev?.autoMode != true)) {
+      if (prev != null && next.autoMode && !prev.autoMode) {
         if (ref.read(chatProvider).status == ChatStatus.idle) {
           notifier.startListening();
         }
@@ -85,9 +178,19 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             duration: const Duration(seconds: 4),
           ),
         );
-        // 用 addPostFrameCallback 确保 build 完成后再改状态，避免 setState-in-build 异常
         WidgetsBinding.instance.addPostFrameCallback((_) {
           ref.read(chatProvider.notifier).clearError();
+        });
+      }
+
+      // 🌟 学习报告卡：preliminary 到达时弹出底部面板
+      if (next.sessionReport != null &&
+          previous?.sessionReport == null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          showSessionReportSheet(context).then((_) {
+            // 面板 dismiss 后清空状态，防止重复弹出
+            ref.read(chatProvider.notifier).clearSessionReport();
+          });
         });
       }
     });
@@ -95,14 +198,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
       appBar: AppBar(
-        title: const Text(
-          'Simulation Practice',
-          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
+        title: Text(
+          chatState.currentTopicTitle,
+          style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
+          overflow: TextOverflow.ellipsis,
         ),
         backgroundColor: Colors.white,
         elevation: 1,
         centerTitle: true,
         actions: [
+          IconButton(
+            icon: const Icon(Icons.add_comment_outlined, color: Colors.black87),
+            tooltip: "Change Practice Topic",
+            onPressed: () => _showTopicRequestSheet(context, ref),
+          ),
           PopupMenuButton<int>(
             icon: const Icon(Icons.psychology_alt, color: Colors.black87),
             tooltip: "AI性格礼貌度",
@@ -168,7 +277,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
             Column(
               children: [
-                // 🌟 这里包裹了一层：根据设置判断是否渲染进度条
+                if (chatState.isGeneratingTopic)
+                  _TopicGeneratingBanner(),
                 if (settings.showProgressBar)
                   _buildMasteryTracker(chatState.masteryProgress),
 
@@ -424,7 +534,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
   Widget _buildAvatar(bool isLis, bool isSpe, double fs, bool isFlipped) {
     final double exactSize = _showHistory ? 90.0 : 160.0;
-    final String roleName = isFlipped ? "Customer (AI)" : "McDonald's Cashier";
+    // 动态角色名：来自 session_report 的 topic 信息；翻转时显示固定文字
+    final chatState = ref.read(chatProvider);
+    final String roleName = isFlipped
+        ? "Customer (You're the coach)"
+        : chatState.currentRoleName;
 
     return AnimatedBuilder(
       animation: _glowAnimation,
@@ -739,6 +853,35 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             fontWeight: FontWeight.w500,
           ),
         ),
+      ),
+    );
+  }
+}
+
+class _TopicGeneratingBanner extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          colors: [Colors.blueAccent.withValues(alpha: 0.12), Colors.purpleAccent.withValues(alpha: 0.08)],
+        ),
+        border: Border(bottom: BorderSide(color: Colors.blueAccent.withValues(alpha: 0.2))),
+      ),
+      child: Row(
+        children: [
+          const SizedBox(
+            width: 16, height: 16,
+            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+          ),
+          const SizedBox(width: 10),
+          Text(
+            'Generating your practice topic...',
+            style: TextStyle(fontSize: 12, color: Colors.blueAccent.shade700, fontWeight: FontWeight.w500),
+          ),
+        ],
       ),
     );
   }

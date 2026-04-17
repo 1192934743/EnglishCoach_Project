@@ -1,6 +1,6 @@
 // lib/features/chat/providers/chat_provider.dart
 import 'dart:async';
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
@@ -9,6 +9,9 @@ import 'package:audio_session/audio_session.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/network/user_manager.dart';
+import '../models/session_report_model.dart';
+
+export '../models/session_report_model.dart';
 
 enum ChatStatus { idle, listening, speaking }
 
@@ -28,8 +31,14 @@ class ChatState {
   final List<ChatTurn> chatHistory;
   final bool isFlipped;
   final double masteryProgress;
-  /// 非 null 时表示有一条需要展示给用户的错误提示，展示后应调用 clearError() 置 null
   final String? errorMessage;
+  // ── LMS 新增字段 ───────────────────────────────────────────────────────
+  /// 非 null 时触发报告卡弹出；dismiss 后调用 clearSessionReport() 置 null
+  final SessionReport? sessionReport;
+  final String currentTopicTitle;
+  final String currentRoleName;
+  /// true while backend is generating a user-requested topic
+  final bool isGeneratingTopic;
 
   ChatState({
     required this.status,
@@ -37,6 +46,10 @@ class ChatState {
     this.isFlipped = false,
     this.masteryProgress = 0.0,
     this.errorMessage,
+    this.sessionReport,
+    this.currentTopicTitle = "Simulation Practice",
+    this.currentRoleName = "AI Coach",
+    this.isGeneratingTopic = false,
   });
 
   ChatState copyWith({
@@ -44,8 +57,11 @@ class ChatState {
     List<ChatTurn>? chatHistory,
     bool? isFlipped,
     double? masteryProgress,
-    // 允许显式传 null 来清空 errorMessage
     Object? errorMessage = _sentinel,
+    Object? sessionReport = _sentinel,
+    String? currentTopicTitle,
+    String? currentRoleName,
+    bool? isGeneratingTopic,
   }) {
     return ChatState(
       status: status ?? this.status,
@@ -55,6 +71,12 @@ class ChatState {
       errorMessage: errorMessage == _sentinel
           ? this.errorMessage
           : errorMessage as String?,
+      sessionReport: sessionReport == _sentinel
+          ? this.sessionReport
+          : sessionReport as SessionReport?,
+      currentTopicTitle: currentTopicTitle ?? this.currentTopicTitle,
+      currentRoleName: currentRoleName ?? this.currentRoleName,
+      isGeneratingTopic: isGeneratingTopic ?? this.isGeneratingTopic,
     );
   }
 }
@@ -82,6 +104,12 @@ class ChatNotifier extends Notifier<ChatState> {
   bool _isInterrupting = false;
   /// 重连标志：上一次状态为 reconnecting，用于判断是否需要重新握手
   bool _wasReconnecting = false;
+  /// Fix B4: 防止 startListening() 并发调用的互斥标志
+  bool _isStartingListen = false;
+  /// Fix B5: 最大录音计时器（静默超时保护）
+  Timer? _maxListenTimer;
+  /// Fix B7: 报告卡展示期间暂停 autoMode 自动开始录音
+  bool _reportShowing = false;
 
   @override
   ChatState build() {
@@ -93,12 +121,12 @@ class ChatNotifier extends Notifier<ChatState> {
     // ── 监听 WS 连接状态，自动处理重连后的握手重建 ─────────────────────────
     final wsClient = ref.read(websocketProvider);
     _connectionSubscription = wsClient.connectionStateStream.listen((connState) {
+      debugPrint('[WS] connectionState → $connState  (status=${state.status})');
       if (connState == WsConnectionState.reconnecting) {
         _wasReconnecting = true;
         forceIdle(); // 重连期间强制空闲，防止录音/播放残留
       } else if (connState == WsConnectionState.connected && _wasReconnecting) {
         _wasReconnecting = false;
-        // 重连成功后重新发送 warmup，恢复后端会话
         Future.delayed(const Duration(milliseconds: 300), () => warmUpConnection());
       }
     });
@@ -109,6 +137,7 @@ class ChatNotifier extends Notifier<ChatState> {
       _ampSubscription?.cancel();
       _connectionSubscription?.cancel();
       _silenceTimer?.cancel();
+      _maxListenTimer?.cancel();
       _recorder.dispose();
       _player.closePlayer();
     });
@@ -126,6 +155,13 @@ class ChatNotifier extends Notifier<ChatState> {
       await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
+      // Sync LMS settings on every connection so backend always reflects current preferences
+      final settings = ref.read(settingsProvider);
+      wsClient.sendCommand("update_lms_settings", {
+        "user_id": userId,
+        "depth_preference": settings.depthPreference,
+        "new_topic_appetite": settings.newTopicAppetite,
+      });
     } catch (_) {}
   }
 
@@ -220,6 +256,17 @@ class ChatNotifier extends Notifier<ChatState> {
       } else if (data['event'] == 'topic_mastery_reached') {
         final progress = (data['progress'] as num?)?.toDouble() ?? 0.0;
         state = state.copyWith(masteryProgress: progress);
+      } else if (data['event'] == 'topic_generating') {
+        state = state.copyWith(isGeneratingTopic: true);
+      } else if (data['event'] == 'topic_changed') {
+        state = state.copyWith(
+          isGeneratingTopic: false,
+          currentTopicTitle: data['topic_title'] as String? ?? state.currentTopicTitle,
+          currentRoleName: data['role_name'] as String? ?? state.currentRoleName,
+          masteryProgress: 0.0,
+        );
+      } else if (data['event'] == 'session_report') {
+        _handleSessionReport(data);
       } else if (data['event'] == 'error') {
         // LLM 超时 / 系统错误：先解锁 UI，再写 errorMessage 触发 SnackBar
         final code = data['code'] as String? ?? 'UNKNOWN';
@@ -269,7 +316,8 @@ class ChatNotifier extends Notifier<ChatState> {
     _playbackStartTime = null;
     _totalBytesReceived = 0;
 
-    if (ref.read(settingsProvider).autoMode) {
+    // Fix B7: do not auto-start while the session report card is visible
+    if (ref.read(settingsProvider).autoMode && !_reportShowing) {
       startListening();
     } else {
       state = state.copyWith(status: ChatStatus.idle);
@@ -277,14 +325,19 @@ class ChatNotifier extends Notifier<ChatState> {
   }
 
   Future<void> startListening() async {
+    // Fix B4: mutex guard — prevents concurrent calls from racing past the status check
+    if (_isStartingListen) return;
     if (state.status == ChatStatus.listening) return;
-    if (_player.isPlaying) await _player.stopPlayer();
-    final status = await Permission.microphone.request();
-    if (!status.isGranted) return;
+    _isStartingListen = true;
 
     try {
-      final session = await AudioSession.instance;
-      await session.setActive(true);
+      if (_player.isPlaying) await _player.stopPlayer();
+      final permStatus = await Permission.microphone.request();
+      if (!permStatus.isGranted) return;
+
+      // Fix B2: removed session.setActive(true) — the `record` package manages
+      // Android AudioFocus internally; calling setActive() here creates a double
+      // focus request that triggers onAudioFocusChange(-1) and breaks recording.
       final wsClient = ref.read(websocketProvider);
       await wsClient.connect();
       const config = RecordConfig(
@@ -303,15 +356,32 @@ class ChatNotifier extends Notifier<ChatState> {
         if (state.status == ChatStatus.listening) wsClient.sendAudio(data);
       });
 
+      // Fix B5: max-listen safety timer — if no voice is detected within 30s,
+      // forceIdle() to prevent the UI from being permanently stuck in "Listening".
+      _maxListenTimer?.cancel();
+      _maxListenTimer = Timer(const Duration(seconds: 30), () {
+        if (state.status == ChatStatus.listening) {
+          // If the user started speaking but silence timer never fired, submit anyway.
+          if (_hasSpoken) {
+            stopListeningAndSubmit();
+          } else {
+            forceIdle();
+          }
+        }
+      });
+
       _ampSubscription?.cancel();
       _ampSubscription = _recorder
           .onAmplitudeChanged(const Duration(milliseconds: 100))
           .listen((amp) {
             if (state.status != ChatStatus.listening) return;
             final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-            if (amp.current > -25.0) {
+            // Fix B3: raised threshold -25 → -35 dBFS, and min frames 3 → 5 (500ms).
+            // Android's AGC easily pushes ambient noise above -25 dBFS causing false
+            // "has spoken" detections within 300ms of starting.
+            if (amp.current > -35.0) {
               _noiseFrames++;
-              if (_noiseFrames > 2) {
+              if (_noiseFrames > 4) {
                 _hasSpoken = true;
                 _silenceTimer?.cancel();
               }
@@ -327,8 +397,14 @@ class ChatNotifier extends Notifier<ChatState> {
               }
             }
           });
-    } catch (e) {
+    } catch (e, st) {
+      // Print the real exception so we can see exactly what failed
+      debugPrint('[startListening] EXCEPTION: $e');
+      debugPrint('[startListening] STACKTRACE: $st');
       forceIdle();
+    } finally {
+      // Fix B4: always release the mutex so future calls are not permanently blocked
+      _isStartingListen = false;
     }
   }
 
@@ -338,6 +414,7 @@ class ChatNotifier extends Notifier<ChatState> {
       await _recorder.stop();
       _ampSubscription?.cancel();
       _silenceTimer?.cancel();
+      _maxListenTimer?.cancel(); // Fix B5
       state = state.copyWith(status: ChatStatus.speaking);
       await _player.startPlayerFromStream(
         codec: Codec.pcm16,
@@ -357,6 +434,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
   Future<void> forceIdle() async {
     _isAutoLooping = false;
+    _isStartingListen = false; // Fix B4: release mutex if we force-idle mid-start
     _playbackStartTime = null;
     _totalBytesReceived = 0;
     try {
@@ -367,6 +445,7 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
     _ampSubscription?.cancel();
     _silenceTimer?.cancel();
+    _maxListenTimer?.cancel(); // Fix B5: cancel the safety timer
     state = state.copyWith(status: ChatStatus.idle);
   }
 
@@ -403,6 +482,61 @@ class ChatNotifier extends Notifier<ChatState> {
   /// UI 展示错误 Snackbar 后调用，清空 errorMessage 防止重复弹出
   void clearError() {
     state = state.copyWith(errorMessage: null);
+  }
+
+  /// 报告卡 dismiss 后调用，防止重复弹出，并恢复 autoMode 录音循环
+  void clearSessionReport() {
+    _reportShowing = false; // Fix B7: resume autoMode cycle after report dismissed
+    state = state.copyWith(sessionReport: null);
+  }
+
+  Future<void> requestTopic(String description) async {
+    if (description.trim().isEmpty) return;
+    final wsClient = ref.read(websocketProvider);
+    try {
+      await wsClient.connect();
+      wsClient.sendCommand("request_topic", {"description": description.trim()});
+    } catch (_) {}
+  }
+
+  Future<void> updateLmsSettings({
+    required double depthPreference,
+    required double newTopicAppetite,
+  }) async {
+    final wsClient = ref.read(websocketProvider);
+    try {
+      await wsClient.connect();
+      final userId = await UserManager.getOrCreateUuid();
+      wsClient.sendCommand("update_lms_settings", {
+        "user_id": userId,
+        "depth_preference": depthPreference,
+        "new_topic_appetite": newTopicAppetite,
+      });
+    } catch (_) {}
+  }
+
+  void _handleSessionReport(Map<String, dynamic> data) {
+    final stage = data['stage'] as String? ?? 'preliminary';
+
+    if (stage == 'preliminary') {
+      // Fix B7: pause autoMode while report card is visible, and stop any
+      // ongoing recording/playback so the UI is clean when the sheet appears.
+      _reportShowing = true;
+      forceIdle(); // async, but fire-and-forget is fine here
+
+      final report = SessionReport.fromJson(data);
+      state = state.copyWith(
+        sessionReport: report,
+        currentTopicTitle: report.topicTitle,
+        currentRoleName: report.topicTitle,
+      );
+    } else if (stage == 'final') {
+      final existing = state.sessionReport;
+      final incomingId = data['session_id'] as String? ?? '';
+      if (existing != null && existing.sessionId == incomingId) {
+        state = state.copyWith(sessionReport: existing.mergeWithFinal(data));
+      }
+    }
   }
 
   Future<void> toggleButton() async {

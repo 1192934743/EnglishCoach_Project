@@ -1,12 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-// ⚠️ 请替换成你项目真实的导入路径
 import 'core/providers/settings_provider.dart';
 import 'features/chat/presentation/chat_screen.dart';
 import 'features/settings/screens/settings_screen.dart';
+import 'features/onboarding/onboarding_screen.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
   runApp(const ProviderScope(child: EnglishCoachApp()));
 }
 
@@ -15,13 +17,60 @@ class EnglishCoachApp extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    return const MaterialApp(
+    return MaterialApp(
       debugShowCheckedModeBanner: false,
-      home: MainScreen(),
+      theme: ThemeData(
+        useMaterial3: true,
+        colorSchemeSeed: Colors.blue,
+      ),
+      home: const _AppEntry(),
     );
   }
 }
 
+// ── Entry point: check onboarding status, then route accordingly ─────────────
+class _AppEntry extends StatefulWidget {
+  const _AppEntry();
+  @override
+  State<_AppEntry> createState() => _AppEntryState();
+}
+
+class _AppEntryState extends State<_AppEntry> {
+  bool? _onboardingDone;
+
+  @override
+  void initState() {
+    super.initState();
+    _checkOnboarding();
+  }
+
+  Future<void> _checkOnboarding() async {
+    final prefs = await SharedPreferences.getInstance();
+    final done = prefs.getBool('onboarding_done') ?? false;
+    if (mounted) setState(() => _onboardingDone = done);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_onboardingDone == null) {
+      // Loading: show a blank splash while checking prefs
+      return const Scaffold(
+        backgroundColor: Color(0xFFF4F6F9),
+        body: Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    if (!_onboardingDone!) {
+      return OnboardingScreen(
+        onComplete: () => setState(() => _onboardingDone = true),
+      );
+    }
+
+    return const MainScreen();
+  }
+}
+
+// ── Main screen with bottom nav ───────────────────────────────────────────────
 class MainScreen extends ConsumerStatefulWidget {
   const MainScreen({super.key});
 
@@ -42,7 +91,6 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         currentIndex: _currentIndex,
         onTap: (index) => setState(() => _currentIndex = index),
         selectedItemColor: Colors.blueAccent,
-        // 🌟 核心：使用 tr() 监听切换底部导航文字
         items: [
           BottomNavigationBarItem(
             icon: const Icon(Icons.chat_bubble_outline),

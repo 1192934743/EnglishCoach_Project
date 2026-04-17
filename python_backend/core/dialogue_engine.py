@@ -17,8 +17,13 @@ Dialogue Engine - English Coach
 
 [Prompt 物理隔离架构]:
 - 所有英文文案（通用规则、阶段指令、性格描述）存储于 prompts/global_rules.json。
-- 场景三元组与场景专属护栏存储于 scenes.json（每个 template 下的 scene_specific_rules）。
+- 场景三元组与场景专属护栏：优先从 TaskPacket 读取；TaskPacket 为 None 时降级到 scenes.json。
 - 本文件只负责结构组装与动态变量注入，不硬编码任何一句英文提示词。
+
+[TaskPacket 集成]:
+- build_dynamic_prompt 新增 task_packet 可选参数
+- 传入 TaskPacket 时：scene/role/level/rules 均从 TaskPacket 读取（LMS 主导）
+- task_packet=None 时：降级到 scenes.json（向后兼容，便于测试和迁移期使用）
 """
 
 import os
@@ -32,6 +37,11 @@ from sqlalchemy.orm import Session
 from fastapi import WebSocket
 
 from database import User, Topic, TargetNode, UserProgress
+from domain.entities.task_packet import TaskPacket
+from application.services.mastery_scorer import (
+    update_mastery, L1_EXACT_QUALITY, L1_STEM_QUALITY,
+    normalize_text, simple_stem,
+)
 
 logger = logging.getLogger("EnglishCoach")
 
@@ -102,18 +112,42 @@ def clean_llm_json(raw_text: str) -> dict:
 
 # ================= 核心提示词构建 =================
 
-def build_dynamic_prompt(user: Optional[User], is_flipped: bool, session_ctx: dict):
+def build_dynamic_prompt(
+    user: Optional[User],
+    is_flipped: bool,
+    session_ctx: dict,
+    task_packet: Optional[TaskPacket] = None,
+):
     """
-    Prompt 组装入口。所有英文文案从 global_rules.json / scenes.json 加载，
-    本函数只负责结构拼接与动态变量（{scene_name}/{new_targets} 等）注入。
+    Prompt 组装入口。
+
+    优先级：
+    1. task_packet 不为 None → 从 TaskPacket 读取场景信息（LMS 主导模式）
+    2. task_packet 为 None  → 降级到 scenes.json（兼容模式，用于测试/迁移期）
+
+    所有英文文案模板仍从 global_rules.json 加载，本函数只负责结构拼接与变量注入。
     """
-    active_scene = load_active_scene()
     rules = load_global_rules()
 
-    scene_name = active_scene.get("scene", "Daily Conversation")
-    role_name = active_scene.get("role", "Assistant")
-    user_level = active_scene.get("level", "Intermediate")
-    scene_specific_rules = active_scene.get("scene_specific_rules", [])
+    if task_packet is not None:
+        # ── LMS 主导模式：从 TaskPacket 读取场景三元组 ──────────────────────
+        scene_name = task_packet.scene_prompt
+        role_name = task_packet.role_name
+        user_level = task_packet.learner_level
+        scene_specific_rules = task_packet.scene_specific_rules
+
+        # 将 session_goal 注入 prompt（帮助 AI 理解本次练习意图）
+        session_goal_line = (
+            f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else ""
+        )
+    else:
+        # ── 兼容模式：从 scenes.json 读取 ───────────────────────────────────
+        active_scene = load_active_scene()
+        scene_name = active_scene.get("scene", "Daily Conversation")
+        role_name = active_scene.get("role", "Assistant")
+        user_level = active_scene.get("level", "Intermediate")
+        scene_specific_rules = active_scene.get("scene_specific_rules", [])
+        session_goal_line = ""
 
     phase = session_ctx.get("phase", "ICE_BREAKING")
     loop_count = session_ctx.get("loop_count", 1)
@@ -147,11 +181,16 @@ def build_dynamic_prompt(user: Optional[User], is_flipped: bool, session_ctx: di
             prompt_blocks.append(f"{i}. {rule}")
         prompt_blocks.append("")
 
-    # ── 场景专属护栏（来自 scenes.json） ────────────────────────────────────
+    # ── 场景专属护栏（优先来自 TaskPacket，兼容模式来自 scenes.json）───────────
     if scene_specific_rules:
         prompt_blocks.append("[SCENE-SPECIFIC RULES]")
         for rule in scene_specific_rules:
             prompt_blocks.append(f"- {rule}")
+        prompt_blocks.append("")
+
+    # ── 本次练习目标（仅 TaskPacket 模式下注入）──────────────────────────────
+    if session_goal_line:
+        prompt_blocks.append(session_goal_line)
         prompt_blocks.append("")
 
     # ── 阶段控制框架 ────────────────────────────────────────────────────────
@@ -209,12 +248,18 @@ def build_dynamic_prompt(user: Optional[User], is_flipped: bool, session_ctx: di
 async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int, user_text: str, session_hits: set,
                                       session_ctx: dict, websocket: WebSocket, ws_lock: asyncio.Lock):
     """
-    打分与进度评估模块。
-    @param _topic_id: 当前保留作备用参数，供后续话题维度细粒度统计。
+    L1 评估层：轻量同步，每轮对话触发。
+
+    升级点（Phase 2）：
+    1. 文本规范化：缩写展开 + 词干匹配（normalize_text / simple_stem）
+    2. 命中质量分级：精准匹配=1.0，词干匹配=0.8
+    3. 掌握度更新：SM-2 公式（update_mastery）替换原来的 flat +15
+    4. 更新 last_practiced_at（之前从未更新）
+
+    @param _topic_id: 保留作备用，供后续话题维度细粒度统计。
     """
     try:
         phase = session_ctx.get("phase", "ICE_BREAKING")
-        user_text_lower = user_text.lower()
 
         # --- 计分模块 1：闲聊分 (40%) ---
         if phase in ["ICE_BREAKING", "EVENT_EXTENSION", "WRAP_UP"]:
@@ -224,9 +269,9 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                     added_score = CHAT_SCORE_CURVE[chat_idx]
                     session_ctx["chat_score"] = min(40.0, session_ctx.get("chat_score", 0.0) + added_score)
                     session_ctx["chat_interaction_count"] = chat_idx + 1
-                    logger.info(f"💬 [闲聊加分] 曲线阶段 {chat_idx+1} (+{added_score}分) | 当前轮闲聊分: {session_ctx['chat_score']:.1f}/40")
+                    logger.info(f"[L1] Chat curve step {chat_idx+1} (+{added_score:.1f}) | total={session_ctx['chat_score']:.1f}/40")
 
-        # --- 计分模块 2：核心任务分 (60%) ---
+        # --- 计分模块 2：核心任务 L1 命中检测 (60%) ---
         is_core_task = (phase == "CORE_TASK")
         new_targets = session_ctx.get("new_targets", [])
         history_targets = session_ctx.get("history_targets", [])
@@ -234,54 +279,60 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
 
         if is_core_task and all_active_targets:
             points_per_new_word = 60.0 / len(new_targets) if new_targets else 10.0
-            hit_occurred = False
-            current_hits = []
+
+            # 规范化用户输入（缩写展开，仅做一次）
+            user_normalized = normalize_text(user_text)
+
+            # hit_info: [(node_id, quality_score)]
+            hit_info: list[tuple[int, float]] = []
 
             for node in all_active_targets:
                 node_id = node.get("id")
-                if node_id is None:
-                    continue
-
                 node_text = node.get("node_text", "")
-                if not node_text:
+                if node_id is None or not node_text or node_id in session_hits:
                     continue
 
-                # NLP 边界升级：使用 \w 防止撇号 (如 "don't") 或带有非英文字符的词语被错误截断
-                pattern = rf"(?<!\w){re.escape(node_text.lower())}(?!\w)"
-                if re.search(pattern, user_text_lower) and node_id not in session_hits:
+                node_normalized = normalize_text(node_text)
+                quality = _l1_match_quality(node_normalized, user_normalized)
+                if quality > 0:
                     session_hits.add(node_id)
-                    current_hits.append(node_id)
+                    hit_info.append((node_id, quality))
 
-                    is_new_word = any(n.get("id") == node_id for n in new_targets)
-                    added_task = points_per_new_word if is_new_word else (points_per_new_word * 0.5)
+                    is_new = any(n.get("id") == node_id for n in new_targets)
+                    added_task = points_per_new_word if is_new else (points_per_new_word * 0.5)
+                    added_task *= quality  # 词干匹配只得 80% 分
                     session_ctx["task_score"] = min(60.0, session_ctx.get("task_score", 0.0) + added_task)
-                    hit_occurred = True
-                    logger.info(f"🎯 [任务加分] 精准击中核心词 '{node_text}' (+{added_task:.1f}分)")
+                    logger.info(f"[L1] Hit '{node_text}' quality={quality:.2f} +{added_task:.1f}pts")
 
-            # 消除 N+1 查询，批量拉取和更新进度
-            if hit_occurred and current_hits:
-                existing_progress = db.query(UserProgress).filter(
+            # 批量更新 UserProgress（SM-2 公式）
+            if hit_info:
+                hit_ids = [h[0] for h in hit_info]
+                existing = db.query(UserProgress).filter(
                     UserProgress.user_id == user_id,
-                    UserProgress.node_id.in_(current_hits)
+                    UserProgress.node_id.in_(hit_ids),
                 ).all()
-                progress_map = {p.node_id: p for p in existing_progress}
+                progress_map = {p.node_id: p for p in existing}
 
-                for hit_id in current_hits:
-                    progress = progress_map.get(hit_id)
+                for node_id, quality in hit_info:
+                    progress = progress_map.get(node_id)
                     if not progress:
-                        progress = UserProgress(user_id=user_id, node_id=hit_id, mastery_score=0, practice_count=0)
+                        progress = UserProgress(
+                            user_id=user_id, node_id=node_id,
+                            mastery_score=0.0, practice_count=0,
+                        )
                         db.add(progress)
                     progress.practice_count += 1
-                    progress.mastery_score = min(100.0, progress.mastery_score + 15.0)
+                    progress.mastery_score = update_mastery(
+                        progress.mastery_score, was_correct=True, quality=quality
+                    )
+                    progress.last_practiced_at = __import__("datetime").datetime.utcnow()
 
                 db.commit()
 
         # --- 计分模块 3：计算并下发总进度 ---
         completed_rounds = session_ctx.get("completed_rounds_in_level", 0)
         current_round_score = session_ctx.get("chat_score", 0.0) + session_ctx.get("task_score", 0.0)
-
-        total_level_score = (completed_rounds * 100.0) + current_round_score
-        overall_progress = min(100.0, total_level_score / float(ROUNDS_PER_LEVEL))
+        overall_progress = min(100.0, ((completed_rounds * 100.0) + current_round_score) / float(ROUNDS_PER_LEVEL))
 
         try:
             async with ws_lock:
@@ -292,13 +343,55 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                     "next_topic_suggestion": ""
                 }))
         except Exception as e:
-            logger.error(f"Ws 发送进度异常: {e}")
+            logger.error(f"Ws send progress error: {e}")
 
     except Exception as e:
-        logger.error(f"打分系统异常: {e}", exc_info=True)
+        logger.error(f"evaluate_and_check_progress error: {e}", exc_info=True)
 
 
-def advance_state_machine(session_ctx: dict, db: Session, current_topic: Topic, session_hits: set):
+def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
+    """
+    L1 节点命中检测，返回质量分 0~1（0 = 未命中）。
+
+    检测顺序（优先精准）：
+    1. 精准匹配：node 完整出现在 user_text 中（词边界匹配）→ 1.0
+    2. 词干匹配：node 中每个词的词干都出现在 user 词干集合中 → 0.8
+    """
+    # 精准匹配（带词边界，防止 "order" 误匹配 "disorder"）
+    pattern_exact = rf"(?<!\w){re.escape(node_normalized)}(?!\w)"
+    if re.search(pattern_exact, user_normalized):
+        return L1_EXACT_QUALITY
+
+    # 词干匹配：只有用户输入做 stem，节点词本身已是原型，不 stem（否则 "burger"→"burg" 导致误判）
+    node_words = node_normalized.split()
+    if len(node_words) <= 3:  # 超过 3 词的短语不做词干匹配，避免误报
+        # 用户词的 stem 集合 + 原始词集合（双保险）
+        user_word_set = {w for w in user_normalized.split() if len(w) >= 3}
+        user_stem_set = {simple_stem(w) for w in user_word_set}
+        all_user_forms = user_word_set | user_stem_set
+
+        # 节点中长度 >= 3 的词直接与用户词形集合匹配
+        node_key_words = [w for w in node_words if len(w) >= 3]
+        if node_key_words and all(nw in all_user_forms for nw in node_key_words):
+            return L1_STEM_QUALITY
+
+    return 0.0
+
+
+def advance_state_machine(
+    session_ctx: dict,
+    db: Session,
+    current_topic: Topic,
+    session_hits: set,
+    task_packet: Optional[TaskPacket] = None,
+):
+    """
+    推进对话阶段状态机。
+
+    task_packet 参数（可选）：
+    - 若提供，进入 CORE_TASK 时优先使用 TaskPacket 中的 target_nodes（LMS 决策）
+    - 若未提供，降级为从 DB 随机采样（兼容旧流程）
+    """
     phase = session_ctx.get("phase", "ICE_BREAKING")
     llm_signal = session_ctx.get("llm_wants_to_advance", False)
     transitioned = False
@@ -313,20 +406,28 @@ def advance_state_machine(session_ctx: dict, db: Session, current_topic: Topic, 
 
         old_new = session_ctx.get("new_targets", [])
         session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
+        used_ids = {n.get("id") for n in session_ctx["history_targets"] if n.get("id") is not None}
 
-        all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == current_topic.id).all() if current_topic else []
-        # 铁壁防御：过滤 None
-        used_ids = [n.get("id") for n in session_ctx["history_targets"] if n.get("id") is not None]
-        available = [n for n in all_nodes if n.id not in used_ids]
-
-        selected_nodes = random.sample(available, min(2, len(available))) if available else []
-        session_ctx["new_targets"] = [{"id": n.id, "node_text": n.node_text} for n in selected_nodes]
+        if task_packet is not None:
+            # ── LMS 主导：使用 TaskPacket 中的节点 ─────────────────────────
+            available = [n for n in task_packet.all_practice_nodes if n.get("id") not in used_ids]
+            session_ctx["new_targets"] = available[:3]  # 每轮最多 3 个新节点
+            if not available:
+                logger.warning("⚠️ TaskPacket 无可用目标节点，CORE_TASK 将作为普通对话进行。")
+            else:
+                logger.info(f"🔄 [推进] 进入核心考核（TaskPacket 模式）！本轮词: {[n.get('node_text') for n in session_ctx['new_targets']]}")
+        else:
+            # ── 兼容模式：从 DB 随机采样 ────────────────────────────────────
+            all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == current_topic.id).all() if current_topic else []
+            available_db = [n for n in all_nodes if n.id not in used_ids]
+            selected_nodes = random.sample(available_db, min(2, len(available_db))) if available_db else []
+            session_ctx["new_targets"] = [{"id": n.id, "node_text": n.node_text} for n in selected_nodes]
+            if not all_nodes:
+                logger.warning("⚠️ Topic 无目标词，CORE_TASK 将作为普通聊天进行。")
+            else:
+                logger.info(f"🔄 [推进] 进入核心考核（兼容模式）！本轮新词: {[n.get('node_text') for n in session_ctx['new_targets']]}")
 
         transitioned = True
-        if not all_nodes:
-            logger.warning("⚠️ Topic 无目标词，CORE_TASK 将作为普通聊天进行。")
-        else:
-            logger.info(f"🔄 [推进] 进入核心考核！本轮新词: {[n.get('node_text') for n in session_ctx['new_targets']]}")
 
     elif phase == "CORE_TASK" and (llm_signal or force_advance):
         session_ctx["phase"] = "EVENT_EXTENSION"
