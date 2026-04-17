@@ -27,13 +27,16 @@ class ChatState {
   final ChatStatus status;
   final List<ChatTurn> chatHistory;
   final bool isFlipped;
-  final double masteryProgress; // 🌟 新增：话题掌握度进度 (0.0 - 100.0)
+  final double masteryProgress;
+  /// 非 null 时表示有一条需要展示给用户的错误提示，展示后应调用 clearError() 置 null
+  final String? errorMessage;
 
   ChatState({
     required this.status,
     required this.chatHistory,
     this.isFlipped = false,
-    this.masteryProgress = 0.0, // 🌟 默认 0
+    this.masteryProgress = 0.0,
+    this.errorMessage,
   });
 
   ChatState copyWith({
@@ -41,15 +44,23 @@ class ChatState {
     List<ChatTurn>? chatHistory,
     bool? isFlipped,
     double? masteryProgress,
+    // 允许显式传 null 来清空 errorMessage
+    Object? errorMessage = _sentinel,
   }) {
     return ChatState(
       status: status ?? this.status,
       chatHistory: chatHistory ?? this.chatHistory,
       isFlipped: isFlipped ?? this.isFlipped,
       masteryProgress: masteryProgress ?? this.masteryProgress,
+      errorMessage: errorMessage == _sentinel
+          ? this.errorMessage
+          : errorMessage as String?,
     );
   }
 }
+
+// copyWith 的哨兵值，用于区分「未传参」与「显式传 null」
+const Object _sentinel = Object();
 
 class ChatNotifier extends Notifier<ChatState> {
   late AudioRecorder _recorder;
@@ -58,6 +69,7 @@ class ChatNotifier extends Notifier<ChatState> {
   StreamSubscription? _commandSubscription;
   StreamSubscription? _audioSubscription;
   StreamSubscription<Amplitude>? _ampSubscription;
+  StreamSubscription? _connectionSubscription;
   Timer? _silenceTimer;
 
   bool _hasSpoken = false;
@@ -66,6 +78,11 @@ class ChatNotifier extends Notifier<ChatState> {
   int _totalBytesReceived = 0;
   DateTime? _playbackStartTime;
 
+  /// 打断标志：true 期间，所有 TTS 回调（音频流 / tts_finished）均被忽略
+  bool _isInterrupting = false;
+  /// 重连标志：上一次状态为 reconnecting，用于判断是否需要重新握手
+  bool _wasReconnecting = false;
+
   @override
   ChatState build() {
     _recorder = AudioRecorder();
@@ -73,10 +90,24 @@ class ChatNotifier extends Notifier<ChatState> {
     _initWebSocketListeners();
     Future.delayed(const Duration(milliseconds: 500), () => warmUpConnection());
 
+    // ── 监听 WS 连接状态，自动处理重连后的握手重建 ─────────────────────────
+    final wsClient = ref.read(websocketProvider);
+    _connectionSubscription = wsClient.connectionStateStream.listen((connState) {
+      if (connState == WsConnectionState.reconnecting) {
+        _wasReconnecting = true;
+        forceIdle(); // 重连期间强制空闲，防止录音/播放残留
+      } else if (connState == WsConnectionState.connected && _wasReconnecting) {
+        _wasReconnecting = false;
+        // 重连成功后重新发送 warmup，恢复后端会话
+        Future.delayed(const Duration(milliseconds: 300), () => warmUpConnection());
+      }
+    });
+
     ref.onDispose(() {
       _commandSubscription?.cancel();
       _audioSubscription?.cancel();
       _ampSubscription?.cancel();
+      _connectionSubscription?.cancel();
       _silenceTimer?.cancel();
       _recorder.dispose();
       _player.closePlayer();
@@ -171,6 +202,7 @@ class ChatNotifier extends Notifier<ChatState> {
     final wsClient = ref.read(websocketProvider);
     _commandSubscription = wsClient.commandStream.listen((data) {
       if (data['event'] == 'tts_finished') {
+        if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
         _handleAudioFinished();
       } else if (data['event'] == 'teaching_data') {
         final d = data['data'];
@@ -185,13 +217,23 @@ class ChatNotifier extends Notifier<ChatState> {
       } else if (data['event'] == 'role_swapped') {
         state = state.copyWith(isFlipped: data['is_flipped']);
       } else if (data['event'] == 'topic_mastery_reached') {
-        // 🌟 新增：处理打分进度条更新
         final progress = (data['progress'] as num?)?.toDouble() ?? 0.0;
         state = state.copyWith(masteryProgress: progress);
+      } else if (data['event'] == 'error') {
+        // LLM 超时 / 系统错误：立刻解除等待状态 + 向 UI 推送友好提示
+        final code = data['code'] as String? ?? 'UNKNOWN';
+        if (code == 'LLM_TIMEOUT' || code == 'LLM_ERROR') {
+          await forceIdle();
+          final message = data['message'] as String? ??
+              'Something went wrong. Please try again.';
+          state = state.copyWith(errorMessage: message);
+        }
       }
     }, onError: (_) => forceIdle());
 
     _audioSubscription = wsClient.audioStream.listen((audioBytes) {
+      // 打断期间或非播放状态时，丢弃网络中残留的 PCM 包
+      if (_isInterrupting) return;
       if (state.status == ChatStatus.speaking && _player.isPlaying) {
         _playbackStartTime ??= DateTime.now();
         _totalBytesReceived += audioBytes.length;
@@ -327,13 +369,49 @@ class ChatNotifier extends Notifier<ChatState> {
     state = state.copyWith(status: ChatStatus.idle);
   }
 
+  /// P0 打断机制：AI 说话途中用户开口 → 立刻停播 + 清空 PCM + 通知后端 + 开始录音
+  Future<void> interruptAndListen() async {
+    if (state.status != ChatStatus.speaking) return;
+
+    // ── 1. 设置打断标志，屏蔽所有后续 TTS 回调 ───────────────────────────
+    _isInterrupting = true;
+    _isAutoLooping = false;
+
+    // ── 2. 关闭 PCM 输入 sink（清空 flutter_sound 内部缓冲区）─────────────
+    try {
+      await _player.uint8ListSink?.close();
+    } catch (_) {}
+
+    // ── 3. 强制停止播放器（立刻停音）─────────────────────────────────────
+    try {
+      if (_player.isPlaying) await _player.stopPlayer();
+    } catch (_) {}
+
+    // ── 4. 清零前端 PCM 追踪状态 ──────────────────────────────────────────
+    _totalBytesReceived = 0;
+    _playbackStartTime = null;
+
+    // ── 5. 通知后端取消 TTS，同时清空后端 audio_buffer ────────────────────
+    ref.read(websocketProvider).sendCommand("cancel_tts", {});
+
+    // ── 6. 解除打断标志，切换到录音状态 ──────────────────────────────────
+    _isInterrupting = false;
+    await startListening();
+  }
+
+  /// UI 展示错误 Snackbar 后调用，清空 errorMessage 防止重复弹出
+  void clearError() {
+    state = state.copyWith(errorMessage: null);
+  }
+
   Future<void> toggleButton() async {
     if (state.status == ChatStatus.idle) {
       await startListening();
     } else if (state.status == ChatStatus.listening) {
       await stopListeningAndSubmit();
     } else if (state.status == ChatStatus.speaking) {
-      await forceIdle();
+      // 🛑 打断：不再只是停到 idle，而是立刻开始新一轮录音
+      await interruptAndListen();
     }
   }
 }

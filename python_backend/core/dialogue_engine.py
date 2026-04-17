@@ -14,6 +14,11 @@ Dialogue Engine - English Coach
 - 所有的切阶段行为，均由系统 Prompt 约束 LLM 在回复末尾输出 "[ADVANCE]" 触发。
 - 注意分工: 由 server.py 负责从大模型文本中提取该标记，并写入 session_ctx["llm_wants_to_advance"]。
 - 本模块 (dialogue_engine) 负责在下一轮用户交互时，读取该标志位并推进状态机。
+
+[Prompt 物理隔离架构]:
+- 所有英文文案（通用规则、阶段指令、性格描述）存储于 prompts/global_rules.json。
+- 场景三元组与场景专属护栏存储于 scenes.json（每个 template 下的 scene_specific_rules）。
+- 本文件只负责结构组装与动态变量注入，不硬编码任何一句英文提示词。
 """
 
 import os
@@ -34,8 +39,11 @@ logger = logging.getLogger("EnglishCoach")
 
 ROUNDS_PER_LEVEL = 3           # 每个段位需要完成的局数
 MAX_TURNS_PER_PHASE = 25       # 兜底机制：每个阶段最大互动轮数，超时强制推进
-# 绝对路径，确保从任意目录启动 uvicorn 均能正常加载场景配置
-SCENES_FILE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "scenes.json")
+
+_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))  # python_backend/
+# 绝对路径，确保从任意目录启动 uvicorn 均能正常加载配置
+SCENES_FILE_PATH = os.path.join(_BACKEND_DIR, "scenes.json")
+GLOBAL_RULES_FILE_PATH = os.path.join(_BACKEND_DIR, "prompts", "global_rules.json")
 
 EVENT_POOL = [
     "A colleague just texted the user asking them to add something specific to the order. Ask the user what their colleague wants.",
@@ -63,6 +71,15 @@ def load_active_scene(file_path=SCENES_FILE_PATH):
         logger.warning(f"⚠️ Could not load scenes.json ({e}). Using default.")
         return {"scene": "McDonald's Ordering", "level": "Intermediate", "role": "McDonald's Cashier"}
 
+def load_global_rules(file_path=GLOBAL_RULES_FILE_PATH):
+    """加载全局 Prompt 配置，支持热更新；加载失败时返回空字典，prompt 降级但不崩溃"""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"🚨 Could not load global_rules.json ({e}). Prompt will be degraded.")
+        return {}
+
 def clean_llm_json(raw_text: str) -> dict:
     """工业级 LLM JSON 清洗工具，逆向解析防长篇废话与多代码块干扰"""
     raw_text = raw_text.strip()
@@ -86,80 +103,104 @@ def clean_llm_json(raw_text: str) -> dict:
 # ================= 核心提示词构建 =================
 
 def build_dynamic_prompt(user: Optional[User], is_flipped: bool, session_ctx: dict):
-    #毎回リアルタイムで最新のシーンを取得（ホットリロード対応）
+    """
+    Prompt 组装入口。所有英文文案从 global_rules.json / scenes.json 加载，
+    本函数只负责结构拼接与动态变量（{scene_name}/{new_targets} 等）注入。
+    """
     active_scene = load_active_scene()
+    rules = load_global_rules()
 
     scene_name = active_scene.get("scene", "Daily Conversation")
     role_name = active_scene.get("role", "Assistant")
     user_level = active_scene.get("level", "Intermediate")
-
-    role_desc = f"You are acting as: {role_name} in a {scene_name} setting." if not is_flipped else f"You are the CUSTOMER/USER. The user is acting as the {role_name}."
-
-    politeness = {
-        0: "Your personality: IMPATIENT and RUDE.",
-        1: "Your personality: PROFESSIONAL and POLITE.",
-        2: "Your personality: EXTREMELY POLITE and TALKATIVE."
-    }
-    personality_desc = politeness.get(user.politeness_level, politeness[1]) if user else politeness[1]
+    scene_specific_rules = active_scene.get("scene_specific_rules", [])
 
     phase = session_ctx.get("phase", "ICE_BREAKING")
     loop_count = session_ctx.get("loop_count", 1)
 
-    prompt_blocks = []
-    prompt_blocks.append(f"Learner Level: {user_level}")
-    prompt_blocks.append(role_desc)
-    prompt_blocks.append(personality_desc)
-    prompt_blocks.append("")
+    # ── 角色与性格 ──────────────────────────────────────────────────────────
+    role_desc = (
+        f"You are acting as: {role_name} in a {scene_name} setting."
+        if not is_flipped
+        else f"You are the CUSTOMER/USER. The user is acting as the {role_name}."
+    )
+    personality_levels = rules.get("personality_levels", {
+        "0": "Your personality: IMPATIENT and RUDE.",
+        "1": "Your personality: PROFESSIONAL and POLITE.",
+        "2": "Your personality: EXTREMELY POLITE and TALKATIVE."
+    })
+    politeness_key = str(user.politeness_level) if user else "1"
+    personality_desc = personality_levels.get(politeness_key, personality_levels.get("1", ""))
 
-    prompt_blocks.append("[UNIVERSAL COACHING RULES]")
-    prompt_blocks.append("1. PROBE DEEPER: Never ask simple Yes/No questions. Use open-ended questions (What, How, Why) and ask for reasons or details to encourage longer, more complex user responses.")
-    prompt_blocks.append("2. PULL-BACK MANDATE: If the user tries to end the simulation prematurely or goes completely off-topic (e.g., 'I'm leaving now'), gently re-engage them (e.g., 'Before we finish, let's quickly sort this out.') and immediately steer back to the current phase's goal.")
-    prompt_blocks.append("3. CONCISE COACHING: Keep your replies conversational and encouraging. Aim for 2-3 sentences.")
-    prompt_blocks.append("4. PLAIN TEXT: Reply in plain English text only. Spell out numbers/symbols.")
-    prompt_blocks.append("5. NO SPOILERS: Never reveal the target words/phrases directly to the user.")
-    prompt_blocks.append("")
+    prompt_blocks = [
+        f"Learner Level: {user_level}",
+        role_desc,
+        personality_desc,
+        "",
+    ]
 
-    prompt_blocks.append("[PHASE CONTROL]")
-    prompt_blocks.append(f"You are the director. We are in Round {loop_count}.")
-    prompt_blocks.append(f"Current Phase: {phase}")
-    prompt_blocks.append("HOW TO ADVANCE: When the current phase's objective is naturally satisfied based on the guidelines below, you MUST append EXACTLY \"[ADVANCE]\" to the VERY END of your reply to trigger the next stage.")
-    prompt_blocks.append("CRITICAL: NEVER output just \"[ADVANCE]\" by itself! You MUST provide a natural, conversational reply first, and then put \"[ADVANCE]\" at the very end.")
-    prompt_blocks.append("")
+    # ── 通用规则 ────────────────────────────────────────────────────────────
+    universal_rules = rules.get("universal_rules", [])
+    if universal_rules:
+        prompt_blocks.append("[UNIVERSAL COACHING RULES]")
+        for i, rule in enumerate(universal_rules, 1):
+            prompt_blocks.append(f"{i}. {rule}")
+        prompt_blocks.append("")
 
+    # ── 场景专属护栏（来自 scenes.json） ────────────────────────────────────
+    if scene_specific_rules:
+        prompt_blocks.append("[SCENE-SPECIFIC RULES]")
+        for rule in scene_specific_rules:
+            prompt_blocks.append(f"- {rule}")
+        prompt_blocks.append("")
+
+    # ── 阶段控制框架 ────────────────────────────────────────────────────────
+    phase_control = rules.get("phase_control", {})
+    if phase_control:
+        prompt_blocks.append("[PHASE CONTROL]")
+        prompt_blocks.append(
+            phase_control.get("header", "").format(loop_count=loop_count, phase=phase)
+        )
+        prompt_blocks.append(phase_control.get("advance_rule", ""))
+        prompt_blocks.append(phase_control.get("advance_critical", ""))
+        prompt_blocks.append("")
+
+    # ── 当前阶段指令（从 JSON 读取，用 .format() 注入动态变量）─────────────
     prompt_blocks.append("[YOUR CURRENT DIRECTIVE]:")
+    directive = rules.get("phase_directives", {}).get(phase, {})
 
     if phase == "ICE_BREAKING":
-        prompt_blocks.append("PHASE 1: ICE BREAKING (Small Talk)")
-        prompt_blocks.append(f"Goal: Build rapport. Ask 1-2 open-ended questions related to the {scene_name} to start a natural conversation. (e.g., 'What brings you here today?', 'Is this your first time trying this?').")
-        prompt_blocks.append("STRICT FIREWALL: DO NOT process the main transaction or mission in this phase! Focus only on small talk.")
-        prompt_blocks.append("ADVANCE RULE: The moment the user tries to initiate the core task or states their main purpose, acknowledge it briefly and IMMEDIATELY output [ADVANCE] at the end of your reply. Leave the actual task execution for Phase 2!")
+        prompt_blocks.append(directive.get("header", "PHASE 1: ICE BREAKING (Small Talk)"))
+        prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
+        prompt_blocks.append(directive.get("firewall", ""))
+        prompt_blocks.append(directive.get("advance", ""))
 
     elif phase == "CORE_TASK":
-        new_targets_list = [n.get('node_text') for n in session_ctx.get("new_targets", []) if n.get('node_text')]
-        history_targets_list = [n.get('node_text') for n in session_ctx.get("history_targets", []) if n.get('node_text')]
+        new_targets_list = [n.get("node_text") for n in session_ctx.get("new_targets", []) if n.get("node_text")]
+        history_targets_list = [n.get("node_text") for n in session_ctx.get("history_targets", []) if n.get("node_text")]
         new_targets = ", ".join([f"'{t}'" for t in new_targets_list])
         history_targets = ", ".join([f"'{t}'" for t in history_targets_list])
-        history_instruction = f"If natural, casually review these past words too: {history_targets}." if history_targets else ""
 
-        prompt_blocks.append("PHASE 2: CORE TASK (Language Practice)")
-        prompt_blocks.append(f"Goal: Guide the user through the main task of the {scene_name} while focusing on language practice.")
-        prompt_blocks.append(f"DIRECTIVE: Naturally guide the user to say these NEW words: {new_targets}.")
-        if history_instruction:
-            prompt_blocks.append(history_instruction)
-        prompt_blocks.append(f"COACHING MANDATE: Your primary role is a coach, not just a {role_name}. If the user uses a very simple phrase, gently model a more natural alternative in your response. (e.g., If user says 'I want burger,' you reply 'Excellent, one burger coming up. And would you like any toppings on that?').")
-        prompt_blocks.append("ADVANCE RULE: Output [ADVANCE] ONLY when the core task is fully complete (e.g., order is confirmed, appointment is set, problem is initially diagnosed).")
+        prompt_blocks.append(directive.get("header", "PHASE 2: CORE TASK (Language Practice)"))
+        prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
+        prompt_blocks.append(directive.get("directive", "").format(new_targets=new_targets))
+        if history_targets:
+            prompt_blocks.append(directive.get("history", "").format(history_targets=history_targets))
+        prompt_blocks.append(directive.get("coaching", "").format(role_name=role_name))
+        prompt_blocks.append(directive.get("advance", ""))
 
     elif phase == "EVENT_EXTENSION":
-        prompt_blocks.append("PHASE 3: EVENT EXTENSION (The Twist)")
-        prompt_blocks.append("Goal: Introduce a LOGICAL and REASONABLE complication related to the Core Task. Your aim is to test the user's problem-solving and negotiation language skills.")
-        prompt_blocks.append(f"SYSTEM OVERRIDE: Introduce this specific scenario: '{session_ctx.get('current_event', 'There is a small problem with your request.')}'")
-        prompt_blocks.append("MAINTAIN COACH ROLE: Do not just act out the event. You are a coach observing a test. Guide the user by asking questions like 'Oh, that's unexpected. What do you think we should do?' or 'How would you explain the situation?'. Help them solve the problem.")
-        prompt_blocks.append("ADVANCE RULE: Once the user has successfully navigated the complication using their English skills, provide a brief concluding statement for the event (e.g., 'Great, looks like we've sorted that out.') and then output [ADVANCE].")
+        current_event = session_ctx.get("current_event", "There is a small problem with your request.")
+        prompt_blocks.append(directive.get("header", "PHASE 3: EVENT EXTENSION (The Twist)"))
+        prompt_blocks.append(directive.get("goal", ""))
+        prompt_blocks.append(directive.get("override", "").format(current_event=current_event))
+        prompt_blocks.append(directive.get("coach_role", ""))
+        prompt_blocks.append(directive.get("advance", ""))
 
     elif phase == "WRAP_UP":
-        prompt_blocks.append("PHASE 4: WRAP UP (Conclusion)")
-        prompt_blocks.append("Goal: Conclude the conversation naturally. Provide a single, brief sentence of positive feedback on how the user performed during the session (especially during the twist).")
-        prompt_blocks.append("ADVANCE RULE: After giving feedback and saying your final goodbye, output [ADVANCE] to end the simulation. (e.g., 'You handled that unexpected problem really well. Have a great day! [ADVANCE]').")
+        prompt_blocks.append(directive.get("header", "PHASE 4: WRAP UP (Conclusion)"))
+        prompt_blocks.append(directive.get("goal", ""))
+        prompt_blocks.append(directive.get("advance", ""))
 
     return "\n".join(prompt_blocks)
 

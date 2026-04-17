@@ -5,19 +5,33 @@
       "scene": "Ordering a Big Mac at McDonald's drive-thru",
       "level": "Beginner",
       "role": "Fast-food Server",
-      "voice": "Stanley"
+      "voice": "Stanley",
+      "scene_specific_rules": [
+        "If the user says they are not hungry or do not want food, suggest a small side item or a drink instead of ending the conversation.",
+        "Always confirm the complete order before proceeding to payment.",
+        "If the user's order is unclear, politely ask them to repeat or clarify each item."
+      ]
     },
     "job_interview": {
       "scene": "A technical interview for a Python Algorithm Engineer position at a top tech company",
       "level": "Professional",
       "role": "Senior Tech Lead",
-      "voice": "Stanley"
+      "voice": "Stanley",
+      "scene_specific_rules": [
+        "If the user gives a one-word answer, probe for more detail: 'Could you walk me through your reasoning?'",
+        "Acknowledge correct technical answers with brief positive feedback before moving on.",
+        "If the user seems stuck, offer a single small hint rather than giving the full answer."
+      ]
     },
     "custom_imitation": {
       "scene": "Practicing daily conversation based on BBC Learning English podcasts",
       "level": "Intermediate",
       "role": "Language Partner",
-      "voice": "Stanley"
+      "voice": "Stanley",
+      "scene_specific_rules": [
+        "Occasionally echo back a rephrased version of what the user said to model natural British English.",
+        "If the user makes a grammatical error, gently model the correct version in your own reply without explicitly pointing it out."
+      ]
     }
   }
 }

@@ -62,6 +62,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     });
 
     ref.listen<ChatState>(chatProvider, (previous, next) {
+      // 滚动到最新消息
       if (previous != null &&
           previous.chatHistory.length != next.chatHistory.length) {
         if (_scrollController.hasClients && _scrollController.offset > 50) {
@@ -71,6 +72,23 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             curve: Curves.easeOutCubic,
           );
         }
+      }
+
+      // LLM 超时 / 错误：弹出 Snackbar，展示后立刻清空 errorMessage
+      if (next.errorMessage != null &&
+          next.errorMessage != previous?.errorMessage) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(next.errorMessage!),
+            backgroundColor: Colors.redAccent,
+            behavior: SnackBarBehavior.floating,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+        // 用 addPostFrameCallback 确保 build 完成后再改状态，避免 setState-in-build 异常
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ref.read(chatProvider.notifier).clearError();
+        });
       }
     });
 

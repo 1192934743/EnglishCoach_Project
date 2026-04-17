@@ -199,6 +199,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
                     continue
 
+                # 🛑 打断机制：用户开口时取消正在进行的 TTS 合成与播放
+                if action == "cancel_tts":
+                    # 1. 取消 TTS 消费任务（当前正在向火山引擎请求合成的协程）
+                    if consumer_task and not consumer_task.done():
+                        consumer_task.cancel()
+                        try:
+                            await asyncio.wait_for(consumer_task, timeout=0.5)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                    consumer_task = None
+                    # 2. 清空 TTS 队列，防止已入队但未合成的句子继续消费
+                    if tts_queue:
+                        while not tts_queue.empty():
+                            try:
+                                tts_queue.get_nowait()
+                            except asyncio.QueueEmpty:
+                                break
+                    tts_queue = None
+                    # 3. 清空音频接收缓冲区，防止旧 PCM 混入下一轮 ASR
+                    audio_buffer.clear()
+                    logger.info("🛑 [打断] 用户打断 TTS，已取消合成任务并清空缓冲区。")
+                    continue
+
                 if action in ["user_finish_speaking", "test_text_input"]:
                     is_test_mode = (action == "test_text_input")
 
@@ -253,39 +276,68 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             consumer_task.cancel()
                         consumer_task = asyncio.create_task(tts_consumer(tts_queue))
 
-                    # 4. LLM 流式对话
-                    response = await client.chat.completions.create(
-                        model="deepseek-chat", messages=chat_history,
-                        max_tokens=LLM_MAX_TOKENS, stream=True
-                    )
-
+                    # 4. LLM 流式对话（包含首包连接 + 全量 chunk 消费，统一超时保护）
                     raw_full_reply = ""
                     sentence_buffer = ""
                     punctuation_marks = ['.', '!', '?', ',', '。', '！', '？', '，', '\n']
 
-                    try:
+                    async def _stream_llm_to_queue():
+                        """将 create + async for 封装为单协程，便于 wait_for 统一超时"""
+                        nonlocal raw_full_reply, sentence_buffer
+                        response = await client.chat.completions.create(
+                            model="deepseek-chat", messages=chat_history,
+                            max_tokens=LLM_MAX_TOKENS, stream=True
+                        )
                         async for chunk in response:
                             if chunk.choices and chunk.choices[0].delta.content:
                                 delta = chunk.choices[0].delta.content
                                 raw_full_reply += delta
-
                                 if not is_test_mode and tts_queue:
                                     sentence_buffer += delta
-                                    # 标点符号断句 OR 长度防阻塞兜底
                                     if any(p in delta for p in punctuation_marks) or len(sentence_buffer) > MAX_BUFFER_CHARS:
                                         chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
-                                        if chunk_text: await tts_queue.put(chunk_text)
+                                        if chunk_text:
+                                            await tts_queue.put(chunk_text)
                                         sentence_buffer = ""
-                    except Exception as e:
-                        logger.error(f"⚠️ 生成网络断流: {e}")
-                        raw_full_reply += " [网络波动，信号中断...]"
-                        if not is_test_mode and tts_queue:
-                            await tts_queue.put("网络信号好像有点差，请稍后再试。")
 
-                    # 尾盘入列
+                    async def _abort_tts():
+                        """超时 / 报错时统一清理 TTS 资源，防止消费任务永久挂起"""
+                        nonlocal consumer_task, tts_queue
+                        if consumer_task and not consumer_task.done():
+                            consumer_task.cancel()
+                            try:
+                                await asyncio.wait_for(consumer_task, timeout=0.5)
+                            except (asyncio.CancelledError, asyncio.TimeoutError):
+                                pass
+                        consumer_task = None
+                        tts_queue = None
+
+                    try:
+                        await asyncio.wait_for(_stream_llm_to_queue(), timeout=20.0)
+                    except asyncio.TimeoutError:
+                        logger.error("⏱️ LLM 响应超时（>20s），本轮中止。")
+                        await _abort_tts()
+                        await safe_send_ws(websocket, ws_lock, {
+                            "event": "error",
+                            "code": "LLM_TIMEOUT",
+                            "message": "The AI coach is taking a bit too long to think. Could you please try saying that again?"
+                        })
+                        continue  # 回到 while 循环等待下一帧，连接不断
+                    except Exception as e:
+                        logger.error(f"💥 LLM 调用异常: {e}", exc_info=True)
+                        await _abort_tts()
+                        await safe_send_ws(websocket, ws_lock, {
+                            "event": "error",
+                            "code": "LLM_ERROR",
+                            "message": "Something went wrong with the AI. Please try again in a moment."
+                        })
+                        continue
+
+                    # 尾盘入列（仅在正常完成时执行）
                     if not is_test_mode and tts_queue:
                         final_chunk = sentence_buffer.replace("[ADVANCE]", "").strip()
-                        if final_chunk: await tts_queue.put(final_chunk)
+                        if final_chunk:
+                            await tts_queue.put(final_chunk)
                         await tts_queue.put(None)
 
                     # 5. 指令清洗与记录
