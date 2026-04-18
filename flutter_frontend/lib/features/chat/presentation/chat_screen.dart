@@ -8,15 +8,34 @@ import '../../../core/providers/settings_provider.dart';
 import 'session_report_sheet.dart';
 
 // ── Topic-change bottom sheet ─────────────────────────────────────────────
-Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
-  final controller = TextEditingController();
-  final notifier = ref.read(chatProvider.notifier);
+/// Owns [TextEditingController] so dispose order matches the modal route (avoids
+/// "used after being disposed" when the sheet closes with IME / focus transitions).
+class _TopicRequestSheet extends ConsumerStatefulWidget {
+  const _TopicRequestSheet({required this.onSubmit});
+  final void Function(String description) onSubmit;
 
-  await showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    backgroundColor: Colors.transparent,
-    builder: (_) => Padding(
+  @override
+  ConsumerState<_TopicRequestSheet> createState() => _TopicRequestSheetState();
+}
+
+class _TopicRequestSheetState extends ConsumerState<_TopicRequestSheet> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    _controller = TextEditingController();
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
       padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
       child: Container(
         decoration: const BoxDecoration(
@@ -30,7 +49,8 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
           children: [
             Center(
               child: Container(
-                width: 36, height: 4,
+                width: 36,
+                height: 4,
                 decoration: BoxDecoration(
                   color: Colors.grey.shade300,
                   borderRadius: BorderRadius.circular(2),
@@ -38,22 +58,30 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
               ),
             ),
             const SizedBox(height: 16),
-            const Text(
-              'Practice a Custom Topic',
-              style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+            Text(
+              tr(ref, 'Practice a Custom Topic', '自定义练习话题'),
+              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 6),
             Text(
-              'Describe any topic in English or Chinese — we\'ll create the perfect practice session.',
+              tr(
+                ref,
+                'Describe any topic in English or Chinese — we\'ll create the perfect practice session.',
+                '用中文或英文描述任意场景，我们会为你生成合适的对练内容。',
+              ),
               style: TextStyle(fontSize: 13, color: Colors.grey[600]),
             ),
             const SizedBox(height: 14),
             TextField(
-              controller: controller,
+              controller: _controller,
               autofocus: true,
               maxLines: 2,
               decoration: InputDecoration(
-                hintText: 'e.g. "Ordering at Starbucks" or "机场值机"',
+                hintText: tr(
+                  ref,
+                  'e.g. "Ordering at Starbucks" or "机场值机"',
+                  '例如：星巴克点单、机场值机',
+                ),
                 border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
@@ -67,9 +95,9 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
               height: 48,
               child: ElevatedButton(
                 onPressed: () {
-                  final desc = controller.text.trim();
+                  final desc = _controller.text.trim();
                   if (desc.isNotEmpty) {
-                    notifier.requestTopic(desc);
+                    widget.onSubmit(desc);
                     Navigator.of(context).pop();
                   }
                 },
@@ -80,9 +108,9 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
                   ),
                   elevation: 0,
                 ),
-                child: const Text(
-                  'Generate Practice Session',
-                  style: TextStyle(
+                child: Text(
+                  tr(ref, 'Generate Practice Session', '生成练习场景'),
+                  style: const TextStyle(
                     color: Colors.white,
                     fontWeight: FontWeight.bold,
                     fontSize: 15,
@@ -93,9 +121,20 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
           ],
         ),
       ),
+    );
+  }
+}
+
+Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
+  final notifier = ref.read(chatProvider.notifier);
+  await showModalBottomSheet<void>(
+    context: context,
+    isScrollControlled: true,
+    backgroundColor: Colors.transparent,
+    builder: (_) => _TopicRequestSheet(
+      onSubmit: (desc) => notifier.requestTopic(desc),
     ),
   );
-  controller.dispose();
 }
 
 class ChatScreen extends ConsumerStatefulWidget {
@@ -199,7 +238,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       backgroundColor: const Color(0xFFF4F6F9),
       appBar: AppBar(
         title: Text(
-          chatState.currentTopicTitle,
+          chatTopicDisplayTitle(
+            ref,
+            chatState.currentTopicTitle,
+            titleZh: chatState.currentTopicTitleZh.isEmpty
+                ? null
+                : chatState.currentTopicTitleZh,
+          ),
           style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
           overflow: TextOverflow.ellipsis,
         ),
@@ -209,17 +254,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         actions: [
           IconButton(
             icon: const Icon(Icons.add_comment_outlined, color: Colors.black87),
-            tooltip: "Change Practice Topic",
+            tooltip: tr(ref, 'Change practice topic', '切换练习话题'),
             onPressed: () => _showTopicRequestSheet(context, ref),
           ),
           PopupMenuButton<int>(
             icon: const Icon(Icons.psychology_alt, color: Colors.black87),
-            tooltip: "AI性格礼貌度",
+            tooltip: tr(ref, 'Coach politeness', '教练礼貌程度'),
             onSelected: (level) => notifier.updatePoliteness(level),
             itemBuilder: (context) => [
-              const PopupMenuItem(value: 0, child: Text("刁钻暴躁 (Rude)")),
-              const PopupMenuItem(value: 1, child: Text("正常服务 (Normal)")),
-              const PopupMenuItem(value: 2, child: Text("极度客气 (Polite)")),
+              PopupMenuItem(
+                value: 0,
+                child: Text(tr(ref, 'Difficult & rude', '刁钻暴躁')),
+              ),
+              PopupMenuItem(
+                value: 1,
+                child: Text(tr(ref, 'Normal & professional', '正常礼貌')),
+              ),
+              PopupMenuItem(
+                value: 2,
+                child: Text(tr(ref, 'Very warm & polite', '极度客气')),
+              ),
             ],
           ),
           IconButton(
@@ -227,7 +281,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               Icons.swap_horiz_rounded,
               color: chatState.isFlipped ? Colors.pinkAccent : Colors.black87,
             ),
-            tooltip: "切换角色",
+            tooltip: tr(ref, 'Swap roles', '切换角色'),
             onPressed: () => notifier.swapRole(),
           ),
           IconButton(
@@ -277,10 +331,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
 
             Column(
               children: [
-                if (chatState.isGeneratingTopic)
-                  _TopicGeneratingBanner(),
+                if (chatState.isGeneratingTopic) _TopicGeneratingBanner(),
                 if (settings.showProgressBar)
-                  _buildMasteryTracker(chatState.masteryProgress),
+                  _buildMasteryTracker(ref, chatState.masteryProgress),
 
                 Container(
                   margin: EdgeInsets.only(
@@ -291,6 +344,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   ),
                   child: Center(
                     child: _buildAvatar(
+                      ref,
                       isListening,
                       isSpeaking,
                       settings.fontSize,
@@ -317,7 +371,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             ],
                           ),
                           child: chatState.chatHistory.isEmpty
-                              ? _buildEmptyState(isListening, settings.fontSize)
+                              ? _buildEmptyState(ref, isListening, settings.fontSize)
                               : ListView.builder(
                                   controller: _scrollController,
                                   reverse: true,
@@ -335,6 +389,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                         1 -
                                         index;
                                     return _buildChatTurn(
+                                      ref,
                                       chatState.chatHistory[reversedIndex],
                                       settings,
                                       notifier,
@@ -394,10 +449,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             const SizedBox(width: 8),
                             Text(
                               isListening
-                                  ? "I'm listening..."
+                                  ? tr(ref, "I'm listening...", '正在聆听…')
                                   : (isSpeaking
-                                        ? "AI Speaking..."
-                                        : "Tap to Start"),
+                                        ? tr(ref, 'AI speaking...', 'AI 回复中…')
+                                        : tr(ref, 'Tap to start', '点击开始')),
                               style: const TextStyle(
                                 color: Colors.white,
                                 fontWeight: FontWeight.bold,
@@ -418,7 +473,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildMasteryTracker(double progress) {
+  Widget _buildMasteryTracker(WidgetRef ref, double progress) {
+    final p = progress.clamp(0.0, 100.0);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
       decoration: BoxDecoration(
@@ -431,16 +487,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text(
-                "Topic Mastery",
-                style: TextStyle(
+              Text(
+                tr(ref, 'Topic Mastery', '话题掌握度'),
+                style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
                   color: Colors.black54,
                 ),
               ),
               Text(
-                "${progress.toInt()}%",
+                '${p.toInt()}%',
                 style: const TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
@@ -462,15 +518,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 animation: _glowAnimation,
                 builder: (context, child) {
                   return FractionallySizedBox(
-                    widthFactor: progress / 100.0,
+                    widthFactor: (p / 100.0).clamp(0.0, 1.0),
                     child: Container(
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(10),
                         gradient: LinearGradient(
                           colors: [
                             const Color(0xFF66BB6A),
-                            Colors.greenAccent.withOpacity(
-                              0.8 + (_glowAnimation.value * 0.2),
+                            Colors.greenAccent.withValues(
+                              alpha: 0.8 + (_glowAnimation.value * 0.2),
                             ),
                             const Color(0xFF4CAF50),
                           ],
@@ -478,7 +534,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         ),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.greenAccent.withOpacity(0.4),
+                            color: Colors.greenAccent.withValues(
+                              alpha: 0.4 * _glowAnimation.value,
+                            ),
                             blurRadius: 6 * _glowAnimation.value,
                             spreadRadius: 1,
                           ),
@@ -495,7 +553,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildEmptyState(bool isListening, double fontSize) {
+  Widget _buildEmptyState(WidgetRef ref, bool isListening, double fontSize) {
     return Center(
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -508,8 +566,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           const SizedBox(height: 20),
           Text(
             isListening
-                ? "I'm listening... Try saying 'Hello'!"
-                : "Tap the pill below to start!",
+                ? tr(ref, "I'm listening... Try saying 'Hello'!", '正在聆听…试试说 Hello！')
+                : tr(ref, 'Tap the pill below to start!', '点击下方按钮开始对话！'),
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey[600], fontSize: fontSize),
           ),
@@ -532,12 +590,18 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     );
   }
 
-  Widget _buildAvatar(bool isLis, bool isSpe, double fs, bool isFlipped) {
+  Widget _buildAvatar(
+    WidgetRef ref,
+    bool isLis,
+    bool isSpe,
+    double fs,
+    bool isFlipped,
+  ) {
     final double exactSize = _showHistory ? 90.0 : 160.0;
     // 动态角色名：来自 session_report 的 topic 信息；翻转时显示固定文字
     final chatState = ref.read(chatProvider);
     final String roleName = isFlipped
-        ? "Customer (You're the coach)"
+        ? tr(ref, "Customer (you're the coach)", '顾客（由你来当教练）')
         : chatState.currentRoleName;
 
     return AnimatedBuilder(
@@ -583,7 +647,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             if (!_showHistory) ...[
               const SizedBox(height: 16),
               Text(
-                isLis ? "Listening..." : (isSpe ? "Speaking..." : "Ready"),
+                isLis
+                    ? tr(ref, 'Listening...', '聆听中…')
+                    : (isSpe
+                        ? tr(ref, 'Speaking...', '说话中…')
+                        : tr(ref, 'Ready', '就绪')),
                 style: TextStyle(
                   fontSize: fs + 2,
                   fontWeight: FontWeight.bold,
@@ -637,6 +705,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 
   Widget _buildChatTurn(
+    WidgetRef ref,
     ChatTurn turn,
     SettingsState settings,
     ChatNotifier notifier,
@@ -798,9 +867,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                         size: 16,
                                       ),
                                       const SizedBox(width: 6),
-                                      const Text(
-                                        "Try to reply",
-                                        style: TextStyle(
+                                      Text(
+                                        tr(ref, 'Try to reply', '试着这样回'),
+                                        style: const TextStyle(
                                           fontSize: 12,
                                           fontWeight: FontWeight.bold,
                                           color: Colors.black45,
@@ -858,9 +927,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   }
 }
 
-class _TopicGeneratingBanner extends StatelessWidget {
+class _TopicGeneratingBanner extends ConsumerWidget {
+  const _TopicGeneratingBanner();
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
@@ -878,7 +949,7 @@ class _TopicGeneratingBanner extends StatelessWidget {
           ),
           const SizedBox(width: 10),
           Text(
-            'Generating your practice topic...',
+            tr(ref, 'Generating your practice topic...', '正在生成练习场景…'),
             style: TextStyle(fontSize: 12, color: Colors.blueAccent.shade700, fontWeight: FontWeight.w500),
           ),
         ],

@@ -26,8 +26,22 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, User, Topic, TargetNode, UserProgress, LearningSession
-from domain.entities.task_packet import TaskPacket, DifficultyConfig, compute_max_reply_sentences
+from database import (
+    SessionLocal,
+    User,
+    Topic,
+    TargetNode,
+    UserProgress,
+    LearningSession,
+    effective_topic_title_zh,
+)
+
+from domain.entities.task_packet import (
+    TaskPacket,
+    DifficultyConfig,
+    compute_max_reply_sentences,
+    effective_learner_label,
+)
 from infrastructure.vector_store.numpy_store import NumpyVectorStore, embed_topics_bow
 from application.services.mastery_scorer import effective_mastery
 
@@ -40,6 +54,8 @@ _store_ready: bool = False
 # ── 深度晋级阈值 ──────────────────────────────────────────────────────────
 MASTERY_THRESHOLD_FOR_TIER_UP = 75.0   # 当前 tier 所有节点平均掌握度超过此值则晋级
 MAX_DEPTH_TIER = 3                      # 话题最高深度层级（与 difficulty_tiers 的 key 对应）
+# 与 /api/topics 的 avg_mastery 一致：平均掌握度超过此值后，自动选题明显降权（仍可手动点练）
+MASTERY_AUTO_PICK_SOFT_CAP = 88.0
 
 # ── 遗忘曲线参数（简化 SM-2）──────────────────────────────────────────────
 REVIEW_URGENCY_HALF_LIFE_DAYS = 3.0    # 半衰期（天）：练习 N 天后复习紧迫度达 50%
@@ -259,14 +275,20 @@ def _build_packet_for_topic(
     def _nd(n: TargetNode) -> dict:
         return {"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level}
 
-    max_reply = compute_max_reply_sentences(topic.learner_level or "Intermediate", depth_tier)
+    row = db.query(User).filter(User.id == user_id).first()
+    settings_dict = dict(row.settings or {}) if row else None
+    topic_lv = topic.learner_level or "Intermediate"
+    eff_label = effective_learner_label(settings_dict, topic_lv, topic_lv)
+    max_reply = compute_max_reply_sentences(eff_label, depth_tier)
 
+    tzh = effective_topic_title_zh(topic)
     return TaskPacket(
         topic_id=topic.id,
         topic_title=topic.title,
+        topic_title_zh=tzh,
         scene_prompt=topic.system_prompt or topic.title,
         role_name=topic.role_name or topic.category or "English Coach",
-        learner_level=topic.learner_level or "Intermediate",
+        learner_level=eff_label,
         voice=topic.voice or "Stanley",
         depth_tier=depth_tier,
         max_reply_sentences=max_reply,
@@ -306,15 +328,19 @@ def _build(user_id: str, db: Session) -> TaskPacket:
 
     scored: list[tuple[float, Topic]] = []
     for topic in all_topics:
-        score = _score_topic(topic, user_id, recent_topic_ids, total_sessions, new_topic_appetite, db)
+        score = _score_topic(
+            topic, user_id, recent_topic_ids, total_sessions, new_topic_appetite, db
+        )
         scored.append((score, topic))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    best_topic = scored[0][1]
+    best_score, best_topic = scored[0][0], scored[0][1]
+    avg_pick = _topic_avg_mastery_display(best_topic.id, user_id, db)
 
     packet = _build_packet_for_topic(user_id, best_topic, depth_preference, db)
     logger.info(
-        f"[SessionPlanner] TaskPacket: topic='{best_topic.title}' tier={packet.depth_tier} "
+        f"[SessionPlanner] TaskPacket: topic='{best_topic.title}' score={best_score:.2f} "
+        f"avg_mastery={avg_pick:.1f}% tier={packet.depth_tier} "
         f"target={len(packet.target_nodes)} review={len(packet.review_nodes)}"
     )
     return packet
@@ -322,6 +348,35 @@ def _build(user_id: str, db: Session) -> TaskPacket:
 
 
 # ── 话题评分 ──────────────────────────────────────────────────────────────
+
+def _topic_avg_mastery_display(topic_id: int, user_id: str, db: Session) -> float:
+    """
+    与 GET /api/topics 中 avg_mastery 一致：已记录进度的节点分数之和 / 该话题总节点数。
+    从未练过（无 UserProgress）视为 0。
+    """
+    nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic_id).all()
+    if not nodes:
+        return 0.0
+    node_ids = [n.id for n in nodes]
+    progresses = (
+        db.query(UserProgress)
+        .filter(UserProgress.user_id == user_id, UserProgress.node_id.in_(node_ids))
+        .all()
+    )
+    if not progresses:
+        return 0.0
+    return sum(float(p.mastery_score) for p in progresses) / float(len(nodes))
+
+
+def _mastery_gap_priority(avg_mastery: float) -> float:
+    """
+    0~1：平均掌握度越低越接近 1，便于优先安排「未满」的话题；
+    已达 MASTERY_AUTO_PICK_SOFT_CAP 的话题接近谷底，避免「都快练完了还总被自动选中」。
+    """
+    if avg_mastery >= MASTERY_AUTO_PICK_SOFT_CAP:
+        return 0.08
+    return max(0.08, (MASTERY_AUTO_PICK_SOFT_CAP - avg_mastery) / MASTERY_AUTO_PICK_SOFT_CAP)
+
 
 def _score_topic(
     topic: Topic,
@@ -333,7 +388,9 @@ def _score_topic(
 ) -> float:
     """
     话题综合评分（0~100）：
-      相似度权重 40% + 遗忘复习权重 40% + 探索新鲜度权重 20%
+      相似度 32% + 复习紧迫度 32% + 探索新鲜度 16% + 「未满掌握度」缺口 20%
+
+    缺口项与 /api/topics 展示的平均掌握度对齐，使自动开练更倾向平均仍低于 ~88% 的话题。
     """
     # ── 1. 相似度得分（与最近 3 次话题的平均余弦相似度）─────────────────────
     similarity_score = 0.0
@@ -361,7 +418,15 @@ def _score_topic(
     # 用户 new_topic_appetite 越低，新鲜度权重越低（偏好复习已学话题）
     novelty_score = novelty * new_topic_appetite
 
-    total = similarity_score * 40 + review_urgency * 40 + novelty_score * 20
+    avg_disp = _topic_avg_mastery_display(topic.id, user_id, db)
+    gap_priority = _mastery_gap_priority(avg_disp)
+
+    total = (
+        similarity_score * 32.0
+        + review_urgency * 32.0
+        + novelty_score * 16.0
+        + gap_priority * 20.0
+    )
     return total
 
 
@@ -485,16 +550,19 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
             TargetNode.topic_id == first_topic.id,
             TargetNode.depth_level == 1
         ).all()
-        lvl = first_topic.learner_level or "Intermediate"
+        topic_lv = first_topic.learner_level or "Intermediate"
+        eff = effective_learner_label(None, topic_lv, topic_lv)
+        tz = effective_topic_title_zh(first_topic)
         return TaskPacket(
             topic_id=first_topic.id,
             topic_title=first_topic.title,
+            topic_title_zh=tz,
             scene_prompt=first_topic.system_prompt or first_topic.title,
             role_name=first_topic.role_name or "English Coach",
-            learner_level=lvl,
+            learner_level=eff,
             voice=first_topic.voice or "Stanley",
             depth_tier=1,
-            max_reply_sentences=compute_max_reply_sentences(lvl, 1),
+            max_reply_sentences=compute_max_reply_sentences(eff, 1),
             target_nodes=[{"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level} for n in nodes],
             scene_specific_rules=first_topic.scene_specific_rules or [],
             session_goal=f"Practice basic {first_topic.title} conversation.",
@@ -504,9 +572,12 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
     return TaskPacket(
         topic_id=0,
         topic_title="Daily Conversation",
+        topic_title_zh="日常对话",
         scene_prompt="Have a casual daily conversation to practice English.",
         role_name="English Coach",
         learner_level="Intermediate",
-        max_reply_sentences=compute_max_reply_sentences("Intermediate", 1),
+        max_reply_sentences=compute_max_reply_sentences(
+            effective_learner_label(None, "Intermediate", "Intermediate"), 1
+        ),
         session_goal="Practice speaking naturally in English.",
     )

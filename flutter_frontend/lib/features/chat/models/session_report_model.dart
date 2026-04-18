@@ -95,6 +95,7 @@ class SessionReport {
   final String sessionId;
   final String stage; // 'preliminary' | 'final'
   final String topicTitle;
+  final String? topicTitleZh;
   final int depthTier;
   final double sessionScore;
   final int hitCount;
@@ -103,6 +104,7 @@ class SessionReport {
   final List<String> newlyMastered;
   final TierStatus tierStatus;
   final String encouragement;
+  final String? encouragementZh;
   // L2 fields
   final double? avgQuality;
   final String? qualityLabel;
@@ -112,6 +114,7 @@ class SessionReport {
     required this.sessionId,
     required this.stage,
     required this.topicTitle,
+    this.topicTitleZh,
     required this.depthTier,
     required this.sessionScore,
     required this.hitCount,
@@ -120,6 +123,7 @@ class SessionReport {
     required this.newlyMastered,
     required this.tierStatus,
     required this.encouragement,
+    this.encouragementZh,
     this.avgQuality,
     this.qualityLabel,
     this.l2Assessed = false,
@@ -134,6 +138,7 @@ class SessionReport {
       sessionId: j['session_id'] as String? ?? '',
       stage: j['stage'] as String? ?? 'preliminary',
       topicTitle: j['topic_title'] as String? ?? '',
+      topicTitleZh: j['topic_title_zh'] as String?,
       depthTier: (j['depth_tier'] as num?)?.toInt() ?? 1,
       sessionScore: (j['session_score'] as num?)?.toDouble() ?? 0.0,
       hitCount: (j['hit_count'] as num?)?.toInt() ?? 0,
@@ -142,6 +147,7 @@ class SessionReport {
       newlyMastered: rawMastered,
       tierStatus: TierStatus.fromJson(rawTier),
       encouragement: j['encouragement'] as String? ?? '',
+      encouragementZh: j['encouragement_zh'] as String?,
       avgQuality: (j['avg_quality'] as num?)?.toDouble(),
       qualityLabel: j['quality_label'] as String?,
       l2Assessed: j['l2_assessed'] as bool? ?? false,
@@ -175,6 +181,7 @@ class SessionReport {
       sessionId: sessionId,
       stage: 'final',
       topicTitle: topicTitle,
+      topicTitleZh: topicTitleZh,
       depthTier: depthTier,
       sessionScore: sessionScore,
       hitCount: hitCount,
@@ -183,6 +190,7 @@ class SessionReport {
       newlyMastered: newlyMastered,
       tierStatus: tierStatus,
       encouragement: encouragement,
+      encouragementZh: encouragementZh,
       avgQuality: (finalJson['avg_quality'] as num?)?.toDouble(),
       qualityLabel: finalJson['quality_label'] as String?,
       l2Assessed: true,

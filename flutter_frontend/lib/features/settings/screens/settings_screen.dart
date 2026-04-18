@@ -18,22 +18,10 @@ class SettingsScreen extends ConsumerWidget {
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
-      appBar: AppBar(
-        title: Text(
-          tr(ref, 'Settings', '应用设置'),
-          style: TextStyle(
-            fontWeight: FontWeight.bold,
-            color: Colors.black87,
-            fontSize: baseSize + 2,
-          ),
-        ),
-        backgroundColor: Colors.white,
-        elevation: 1,
-        centerTitle: true,
-      ),
-      body: ListView(
-        padding: const EdgeInsets.all(20),
-        children: [
+      body: SafeArea(
+        child: ListView(
+          padding: const EdgeInsets.all(20),
+          children: [
           _buildSectionTitle(
             tr(ref, "Language & Interface", "语言与界面"),
             baseSize,
@@ -42,7 +30,12 @@ class SettingsScreen extends ConsumerWidget {
             tr(ref, "Chinese Interface", "中文界面"),
             tr(ref, "Switch UI text to Chinese", "将应用界面切换为中文"),
             settings.isChinese,
-            notifier.toggleLanguage,
+            (v) {
+              notifier.toggleLanguage(v);
+              SharedPreferences.getInstance().then(
+                (p) => p.setBool('ui_is_chinese', v),
+              );
+            },
             Icons.language,
             baseSize,
           ),
@@ -226,10 +219,65 @@ class SettingsScreen extends ConsumerWidget {
               },
             ),
           ),
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  tr(ref, "Your English level", "你的英语水平"),
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: baseSize),
+                ),
+                SizedBox(height: baseSize * 0.25),
+                Text(
+                  tr(
+                    ref,
+                    "Adjust how challenging and how fast-paced the coach feels.",
+                    "调节教练的难度与节奏感。",
+                  ),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                ),
+                SizedBox(height: baseSize * 0.5),
+                DropdownButton<String>(
+                  value: settings.learnerLevel,
+                  isExpanded: true,
+                  items: [
+                    'Beginner',
+                    'Elementary',
+                    'Intermediate',
+                    'Advanced',
+                  ]
+                      .map(
+                        (e) => DropdownMenuItem<String>(
+                          value: e,
+                          child: Text(learnerLevelUiLabel(ref, e)),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (v) async {
+                    if (v == null) return;
+                    notifier.setLearnerLevel(v);
+                    final prefs = await SharedPreferences.getInstance();
+                    await prefs.setString('learner_level', v);
+                    await chatNotifier.updateLmsSettings(
+                      depthPreference: settings.depthPreference,
+                      newTopicAppetite: settings.newTopicAppetite,
+                      learnerLevel: v,
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
           _buildSliderTile(
             title: tr(ref, "Topic Depth", "话题深度"),
             subtitle: tr(ref, "How deep to go before moving on.", "每个话题练多深再切换"),
-            valueLabel: _depthLabel(settings.depthPreference),
+            valueLabel: _depthLabel(ref, settings.depthPreference),
             value: settings.depthPreference,
             min: 1.0, max: 5.0, divisions: 4,
             color: Colors.deepPurple,
@@ -239,6 +287,7 @@ class SettingsScreen extends ConsumerWidget {
               chatNotifier.updateLmsSettings(
                 depthPreference: val,
                 newTopicAppetite: settings.newTopicAppetite,
+                learnerLevel: settings.learnerLevel,
               );
             },
           ),
@@ -246,7 +295,7 @@ class SettingsScreen extends ConsumerWidget {
           _buildSliderTile(
             title: tr(ref, "Topic Exploration", "话题探索欲"),
             subtitle: tr(ref, "Balance between new topics and review.", "倾向于探索新话题 vs 反复巩固"),
-            valueLabel: _appetiteLabel(settings.newTopicAppetite),
+            valueLabel: _appetiteLabel(ref, settings.newTopicAppetite),
             value: settings.newTopicAppetite,
             min: 0.0, max: 1.0, divisions: 4,
             color: Colors.teal,
@@ -256,25 +305,34 @@ class SettingsScreen extends ConsumerWidget {
               chatNotifier.updateLmsSettings(
                 depthPreference: settings.depthPreference,
                 newTopicAppetite: val,
+                learnerLevel: settings.learnerLevel,
               );
             },
           ),
         ],
+        ),
       ),
     );
   }
 
-  String _depthLabel(double v) {
-    const labels = ['Basics only', 'Beginner', 'Intermediate', 'Advanced', 'Expert'];
-    return labels[(v.round() - 1).clamp(0, 4)];
+  String _depthLabel(WidgetRef ref, double v) {
+    final i = (v.round() - 1).clamp(0, 4);
+    final labels = [
+      tr(ref, 'Basics only', '仅基础'),
+      tr(ref, 'Beginner', '初级'),
+      tr(ref, 'Intermediate', '中级'),
+      tr(ref, 'Advanced', '高级'),
+      tr(ref, 'Expert', '专家'),
+    ];
+    return labels[i];
   }
 
-  String _appetiteLabel(double v) {
-    if (v <= 0.15) return 'Review-focused';
-    if (v <= 0.35) return 'Mostly review';
-    if (v <= 0.55) return 'Balanced';
-    if (v <= 0.75) return 'Mostly new';
-    return 'Explorer';
+  String _appetiteLabel(WidgetRef ref, double v) {
+    if (v <= 0.15) return tr(ref, 'Review-focused', '以巩固为主');
+    if (v <= 0.35) return tr(ref, 'Mostly review', '偏重复习');
+    if (v <= 0.55) return tr(ref, 'Balanced', '均衡');
+    if (v <= 0.75) return tr(ref, 'Mostly new', '偏重新话题');
+    return tr(ref, 'Explorer', '探索型');
   }
 
   Widget _buildSectionTitle(String title, double baseSize) => Padding(
@@ -311,9 +369,17 @@ class SettingsScreen extends ConsumerWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(title, style: TextStyle(fontSize: baseSize, fontWeight: FontWeight.bold)),
+              Expanded(
+                child: Text(
+                  title,
+                  style: TextStyle(fontSize: baseSize, fontWeight: FontWeight.bold),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              const SizedBox(width: 8),
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
                 decoration: BoxDecoration(
@@ -323,6 +389,8 @@ class SettingsScreen extends ConsumerWidget {
                 child: Text(
                   valueLabel,
                   style: TextStyle(fontSize: baseSize * 0.85, color: color, fontWeight: FontWeight.bold),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ),
             ],

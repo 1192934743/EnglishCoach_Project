@@ -125,11 +125,16 @@ def build_preliminary_report(
     session_score = min(100.0, session_ctx.get("chat_score", 0.0) + session_ctx.get("task_score", 0.0))
     hit_count = sum(1 for n in nodes_data if n["hit"])
 
+    enc_en, enc_zh = _encouragement_pair(
+        avg_eff, task_packet.depth_tier, newly_mastered, tier_unlocked
+    )
+
     return {
         "event": "session_report",
         "stage": "preliminary",
         "session_id": session_id,
         "topic_title": task_packet.topic_title,
+        "topic_title_zh": getattr(task_packet, "topic_title_zh", None),
         "depth_tier": task_packet.depth_tier,
         "session_score": round(session_score, 1),
         "hit_count": hit_count,
@@ -142,9 +147,8 @@ def build_preliminary_report(
             "threshold": MASTERY_THRESHOLD,
             "unlocked_next_tier": tier_unlocked,
         },
-        "encouragement": _build_encouragement(
-            avg_eff, task_packet.depth_tier, newly_mastered, tier_unlocked
-        ),
+        "encouragement": enc_en,
+        "encouragement_zh": enc_zh,
     }
 
 
@@ -208,6 +212,7 @@ def build_final_report(
         "stage": "final",
         "session_id": session_id,
         "topic_title": task_packet.topic_title,
+        "topic_title_zh": getattr(task_packet, "topic_title_zh", None),
         "depth_tier": task_packet.depth_tier,
         "avg_quality": round(avg_quality, 2),
         "quality_label": _quality_label(avg_quality, bool(attempted_qualities)),
@@ -220,38 +225,56 @@ def build_final_report(
 # 辅助函数
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _build_encouragement(
+def _encouragement_pair(
     avg_eff: float,
     tier: int,
     newly_mastered: list[str],
     tier_unlocked: bool,
-) -> str:
-    """基于掌握度数据生成鼓励文字（纯模板，零 LLM 成本）"""
+) -> tuple[str, str]:
+    """英 / 中鼓励语（纯模板，零 LLM）。"""
     if tier_unlocked:
-        return (
+        en = (
             f"Outstanding! You've mastered Tier {tier}. "
             f"Your next session will unlock deeper Tier {tier + 1} expressions!"
         )
+        zh = (
+            f"太棒了！你已完成第 {tier} 层。"
+            f"下次对练将解锁更深一层的第 {tier + 1} 层表达！"
+        )
+        return en, zh
     if newly_mastered:
         words = ", ".join(f'"{w}"' for w in newly_mastered[:2])
         suffix = " and more" if len(newly_mastered) > 2 else ""
-        return f"Great job! You've now mastered {words}{suffix}. Keep it up!"
+        en = f"Great job! You've now mastered {words}{suffix}. Keep it up!"
+        words_zh = "、".join(f'「{w}」' for w in newly_mastered[:2])
+        suf = "等" if len(newly_mastered) > 2 else ""
+        zh = f"做得好！你已掌握 {words_zh}{suf}，继续保持！"
+        return en, zh
 
     gap = MASTERY_THRESHOLD - avg_eff
     if avg_eff >= 60:
-        return (
+        en = (
             f"Almost there! Just {gap:.0f} more mastery points "
             f"to unlock Tier {tier + 1} content."
         )
+        zh = (
+            f"就差一点！再积累约 {gap:.0f} 点掌握度，"
+            f"即可解锁第 {tier + 1} 层内容。"
+        )
+        return en, zh
     if avg_eff >= 30:
-        return (
+        en = (
             "Good progress! Repeat these expressions a few more times "
             "to build lasting confidence."
         )
-    return (
+        zh = "进展不错！把这些表达多练几遍，会更有底气。"
+        return en, zh
+    en = (
         "Every practice session counts! "
         "You're building a solid foundation — keep going!"
     )
+    zh = "每一练都有用！你在打牢基础，加油！"
+    return en, zh
 
 
 def _quality_label(quality: float, attempted: bool) -> str:
@@ -273,6 +296,7 @@ def _empty_report(stage: str, session_id: str, task_packet: TaskPacket) -> dict:
         "stage": stage,
         "session_id": session_id,
         "topic_title": task_packet.topic_title,
+        "topic_title_zh": getattr(task_packet, "topic_title_zh", None),
         "depth_tier": task_packet.depth_tier,
         "session_score": 0.0,
         "hit_count": 0,
@@ -286,4 +310,5 @@ def _empty_report(stage: str, session_id: str, task_packet: TaskPacket) -> dict:
             "unlocked_next_tier": False,
         },
         "encouragement": "Keep practicing! Every session brings you closer to fluency.",
+        "encouragement_zh": "继续练习！每一局都让你离流利更近一步。",
     }

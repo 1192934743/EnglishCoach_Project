@@ -2,6 +2,7 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:flutter_sound/flutter_sound.dart';
@@ -36,7 +37,10 @@ class ChatState {
   /// 非 null 时触发报告卡弹出；dismiss 后调用 clearSessionReport() 置 null
   final SessionReport? sessionReport;
   final String currentTopicTitle;
+  /// 来自后端 `topics.title_zh` / TaskPacket；空则界面用 `topicTitleUiLabel` 兜底。
+  final String currentTopicTitleZh;
   final String currentRoleName;
+
   /// true while backend is generating a user-requested topic
   final bool isGeneratingTopic;
 
@@ -48,6 +52,7 @@ class ChatState {
     this.errorMessage,
     this.sessionReport,
     this.currentTopicTitle = "Simulation Practice",
+    this.currentTopicTitleZh = '',
     this.currentRoleName = "AI Coach",
     this.isGeneratingTopic = false,
   });
@@ -60,6 +65,7 @@ class ChatState {
     Object? errorMessage = _sentinel,
     Object? sessionReport = _sentinel,
     String? currentTopicTitle,
+    String? currentTopicTitleZh,
     String? currentRoleName,
     bool? isGeneratingTopic,
   }) {
@@ -75,6 +81,7 @@ class ChatState {
           ? this.sessionReport
           : sessionReport as SessionReport?,
       currentTopicTitle: currentTopicTitle ?? this.currentTopicTitle,
+      currentTopicTitleZh: currentTopicTitleZh ?? this.currentTopicTitleZh,
       currentRoleName: currentRoleName ?? this.currentRoleName,
       isGeneratingTopic: isGeneratingTopic ?? this.isGeneratingTopic,
     );
@@ -102,12 +109,16 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// 打断标志：true 期间，所有 TTS 回调（音频流 / tts_finished）均被忽略
   bool _isInterrupting = false;
+
   /// 重连标志：上一次状态为 reconnecting，用于判断是否需要重新握手
   bool _wasReconnecting = false;
+
   /// Fix B4: 防止 startListening() 并发调用的互斥标志
   bool _isStartingListen = false;
+
   /// Fix B5: 最大录音计时器（静默超时保护）
   Timer? _maxListenTimer;
+
   /// Fix B7: 报告卡展示期间暂停 autoMode 自动开始录音
   bool _reportShowing = false;
 
@@ -120,14 +131,19 @@ class ChatNotifier extends Notifier<ChatState> {
 
     // ── 监听 WS 连接状态，自动处理重连后的握手重建 ─────────────────────────
     final wsClient = ref.read(websocketProvider);
-    _connectionSubscription = wsClient.connectionStateStream.listen((connState) {
+    _connectionSubscription = wsClient.connectionStateStream.listen((
+      connState,
+    ) {
       debugPrint('[WS] connectionState → $connState  (status=${state.status})');
       if (connState == WsConnectionState.reconnecting) {
         _wasReconnecting = true;
         forceIdle(); // 重连期间强制空闲，防止录音/播放残留
       } else if (connState == WsConnectionState.connected && _wasReconnecting) {
         _wasReconnecting = false;
-        Future.delayed(const Duration(milliseconds: 300), () => warmUpConnection());
+        Future.delayed(
+          const Duration(milliseconds: 300),
+          () => warmUpConnection(),
+        );
       }
     });
 
@@ -155,14 +171,38 @@ class ChatNotifier extends Notifier<ChatState> {
       await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
-      // Sync LMS settings on every connection so backend always reflects current preferences
+      // 等待服务端 warmup_success（可带 user_settings）先到达，再回写本地 LMS，减少竞态
+      await Future<void>.delayed(const Duration(milliseconds: 200));
       final settings = ref.read(settingsProvider);
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": settings.depthPreference,
         "new_topic_appetite": settings.newTopicAppetite,
+        "learner_level": settings.learnerLevel,
       });
     } catch (_) {}
+  }
+
+  /// 服务端 DB 中的 user.settings（握手时下发）。有字段才覆盖本地。
+  Future<void> _applyUserSettingsFromServer(Object? raw) async {
+    if (raw is! Map) return;
+    final us = Map<String, dynamic>.from(raw);
+    if (us.isEmpty) return;
+    final sn = ref.read(settingsProvider.notifier);
+    final prefs = await SharedPreferences.getInstance();
+    final lv = us['learner_level'];
+    if (lv is String && lv.trim().isNotEmpty) {
+      sn.setLearnerLevel(lv.trim());
+      await prefs.setString('learner_level', lv.trim());
+    }
+    final dp = us['depth_preference'];
+    if (dp is num) {
+      sn.setDepthPreference(dp.toDouble());
+    }
+    final ap = us['new_topic_appetite'];
+    if (ap is num) {
+      sn.setNewTopicAppetite(ap.toDouble());
+    }
   }
 
   Future<void> swapRole() async {
@@ -238,7 +278,9 @@ class ChatNotifier extends Notifier<ChatState> {
     final wsClient = ref.read(websocketProvider);
     // async 回调：允许在 error 分支 await forceIdle() 后再写 errorMessage
     _commandSubscription = wsClient.commandStream.listen((data) async {
-      if (data['event'] == 'tts_finished') {
+      if (data['event'] == 'warmup_success') {
+        await _applyUserSettingsFromServer(data['user_settings']);
+      } else if (data['event'] == 'tts_finished') {
         if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
         _handleAudioFinished();
       } else if (data['event'] == 'teaching_data') {
@@ -259,23 +301,33 @@ class ChatNotifier extends Notifier<ChatState> {
       } else if (data['event'] == 'topic_generating') {
         state = state.copyWith(isGeneratingTopic: true);
       } else if (data['event'] == 'topic_changed') {
+        final zhRaw = data['topic_title_zh'];
+        final zh = zhRaw is String ? zhRaw.trim() : '';
         state = state.copyWith(
           isGeneratingTopic: false,
-          currentTopicTitle: data['topic_title'] as String? ?? state.currentTopicTitle,
-          currentRoleName: data['role_name'] as String? ?? state.currentRoleName,
+          currentTopicTitle:
+              data['topic_title'] as String? ?? state.currentTopicTitle,
+          currentTopicTitleZh: zh.isNotEmpty ? zh : '',
+          currentRoleName:
+              data['role_name'] as String? ?? state.currentRoleName,
           masteryProgress: 0.0,
         );
       } else if (data['event'] == 'session_report') {
         _handleSessionReport(data);
       } else if (data['event'] == 'error') {
-        // LLM 超时 / 系统错误：先解锁 UI，再写 errorMessage 触发 SnackBar
         final code = data['code'] as String? ?? 'UNKNOWN';
-        if (code == 'LLM_TIMEOUT' || code == 'LLM_ERROR') {
-          await forceIdle(); // 确保 status=idle 后再推 errorMessage
-          final message = data['message'] as String? ??
-              'Something went wrong. Please try again.';
-          state = state.copyWith(errorMessage: message);
-        }
+        final needIdle = code == 'LLM_TIMEOUT' ||
+            code == 'LLM_ERROR' ||
+            code == 'TOPIC_GENERATION_FAILED';
+        if (needIdle) await forceIdle();
+        final isZh = ref.read(settingsProvider).isChinese;
+        final zh = (data['message_zh'] as String?)?.trim();
+        final en = (data['message'] as String?)?.trim();
+        final message = (isZh && zh != null && zh.isNotEmpty)
+            ? zh
+            : (en ??
+                (isZh ? '出错了，请稍后再试。' : 'Something went wrong. Please try again.'));
+        state = state.copyWith(errorMessage: message);
       }
     }, onError: (_) => forceIdle());
 
@@ -434,7 +486,8 @@ class ChatNotifier extends Notifier<ChatState> {
 
   Future<void> forceIdle() async {
     _isAutoLooping = false;
-    _isStartingListen = false; // Fix B4: release mutex if we force-idle mid-start
+    _isStartingListen =
+        false; // Fix B4: release mutex if we force-idle mid-start
     _playbackStartTime = null;
     _totalBytesReceived = 0;
     try {
@@ -486,7 +539,8 @@ class ChatNotifier extends Notifier<ChatState> {
 
   /// 报告卡 dismiss 后调用，防止重复弹出，并恢复 autoMode 录音循环
   void clearSessionReport() {
-    _reportShowing = false; // Fix B7: resume autoMode cycle after report dismissed
+    _reportShowing =
+        false; // Fix B7: resume autoMode cycle after report dismissed
     state = state.copyWith(sessionReport: null);
   }
 
@@ -495,13 +549,17 @@ class ChatNotifier extends Notifier<ChatState> {
     final wsClient = ref.read(websocketProvider);
     try {
       await wsClient.connect();
-      wsClient.sendCommand("request_topic", {"description": description.trim()});
+      wsClient.sendCommand("request_topic", {
+        "description": description.trim(),
+      });
     } catch (_) {}
   }
 
+  // 🌟 修改：主动更新设置时也传 learnerLevel
   Future<void> updateLmsSettings({
     required double depthPreference,
     required double newTopicAppetite,
+    required String learnerLevel,
   }) async {
     final wsClient = ref.read(websocketProvider);
     try {
@@ -511,6 +569,7 @@ class ChatNotifier extends Notifier<ChatState> {
         "user_id": userId,
         "depth_preference": depthPreference,
         "new_topic_appetite": newTopicAppetite,
+        "learner_level": learnerLevel,
       });
     } catch (_) {}
   }
@@ -525,10 +584,11 @@ class ChatNotifier extends Notifier<ChatState> {
       forceIdle(); // async, but fire-and-forget is fine here
 
       final report = SessionReport.fromJson(data);
+      final zh = report.topicTitleZh?.trim() ?? '';
       state = state.copyWith(
         sessionReport: report,
         currentTopicTitle: report.topicTitle,
-        currentRoleName: report.topicTitle,
+        currentTopicTitleZh: zh.isNotEmpty ? zh : state.currentTopicTitleZh,
       );
     } else if (stage == 'final') {
       final existing = state.sessionReport;

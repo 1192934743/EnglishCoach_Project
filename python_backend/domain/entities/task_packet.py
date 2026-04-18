@@ -15,6 +15,69 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field, asdict
+from typing import Optional
+
+_CANONICAL_LEVELS = ("Beginner", "Elementary", "Intermediate", "Advanced")
+
+
+def canonical_learner_level(raw: Optional[str], fallback: str = "Intermediate") -> str:
+    """Map free-text / aliases to Beginner | Elementary | Intermediate | Advanced."""
+    fb = fallback if fallback in _CANONICAL_LEVELS else "Intermediate"
+    if not raw or not str(raw).strip():
+        return fb
+    key = str(raw).strip().lower().replace("_", " ").replace("-", " ")
+    aliases = {
+        "beginner": "Beginner",
+        "a1": "Beginner",
+        "starter": "Beginner",
+        "novice": "Beginner",
+        "初级": "Beginner",
+        "零基础": "Beginner",
+        "elementary": "Elementary",
+        "a2": "Elementary",
+        "basic": "Elementary",
+        "intermediate": "Intermediate",
+        "b1": "Intermediate",
+        "b2": "Intermediate",
+        "medium": "Intermediate",
+        "中级": "Intermediate",
+        "advanced": "Advanced",
+        "upper intermediate": "Advanced",
+        "upper-intermediate": "Advanced",
+        "c1": "Advanced",
+        "c2": "Advanced",
+        "proficient": "Advanced",
+        "fluent": "Advanced",
+        "熟练": "Advanced",
+        "mastery": "Advanced",
+        "expert": "Advanced",
+    }
+    if key in aliases:
+        return aliases[key]
+    for c in _CANONICAL_LEVELS:
+        if c.lower() == key:
+            return c
+    for c in _CANONICAL_LEVELS:
+        cl, kl = c.lower(), key
+        if cl in kl or kl in cl:
+            return c
+    return fb
+
+
+def effective_learner_label(
+    user_settings: Optional[dict],
+    task_learner_level: Optional[str],
+    scene_default: str,
+) -> str:
+    """user.settings['learner_level'] > TaskPacket/scene label（与对话引擎共用）。"""
+    fb = canonical_learner_level(scene_default or "Intermediate")
+    if user_settings:
+        r = user_settings.get("learner_level")
+        if isinstance(r, str) and r.strip():
+            return canonical_learner_level(r.strip(), fb)
+    if task_learner_level:
+        return canonical_learner_level(task_learner_level, fb)
+    return canonical_learner_level(scene_default, fb)
 
 
 def compute_max_reply_sentences(learner_level: str, depth_tier: int) -> int:
@@ -27,43 +90,17 @@ def compute_max_reply_sentences(learner_level: str, depth_tier: int) -> int:
     Policy: shorter turns for beginner-labelled topics; more room for advanced learners,
     especially when practicing higher content tiers (deeper nodes / twists).
     """
-    s = (learner_level or "Intermediate").strip().lower()
     tier = max(1, min(5, int(depth_tier or 1)))
-
-    beginner = any(
-        k in s
-        for k in (
-            "begin",
-            "basic",
-            "starter",
-            "elementary",
-            "a1",
-            "a2",
-            "novice",
-            "初级",
-        )
-    )
-    advanced = any(
-        k in s
-        for k in (
-            "advanced",
-            "proficient",
-            "fluent",
-            "c1",
-            "c2",
-            "expert",
-            "mastery",
-            "upper-intermediate",
-            "熟练",
-        )
-    )
-
-    if beginner:
-        return 2
-    if advanced:
+    canon = canonical_learner_level(learner_level)
+    if canon == "Beginner":
+        # 三句极短台词：如问候 + 简单承接 + 一个问题，避免模型压成「只说一句」
+        return 3
+    if canon == "Elementary":
+        return 3
+    if canon == "Advanced":
         cap = 5 + (1 if tier >= 2 else 0) + (1 if tier >= 3 else 0)
         return min(7, cap)
-    # Intermediate default
+    # Intermediate
     cap = 3 + (1 if tier >= 3 else 0)
     return min(5, cap)
 
@@ -108,6 +145,7 @@ class TaskPacket:
     # ── 话题基础信息 ────────────────────────────────────────────────────────
     topic_id: int = 0
     topic_title: str = "Daily Conversation"
+    topic_title_zh: Optional[str] = None
     scene_prompt: str = "A casual daily conversation"
     role_name: str = "English Coach"
     learner_level: str = "Intermediate"

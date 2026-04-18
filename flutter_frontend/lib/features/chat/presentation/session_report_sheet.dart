@@ -6,6 +6,7 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../../core/providers/settings_provider.dart';
 import '../providers/chat_provider.dart'; // re-exports session_report_model.dart
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -45,13 +46,13 @@ class _SessionReportSheetWrapper extends ConsumerWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 // 主体内容
 // ─────────────────────────────────────────────────────────────────────────────
-class _SessionReportContent extends StatelessWidget {
+class _SessionReportContent extends ConsumerWidget {
   final SessionReport report;
 
   const _SessionReportContent({required this.report});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final mq = MediaQuery.of(context);
 
     return DraggableScrollableSheet(
@@ -80,21 +81,21 @@ class _SessionReportContent extends StatelessWidget {
                     bottom: mq.padding.bottom + 20,
                   ),
                   children: [
-                    _buildHeader(context, report),
+                    _buildHeader(context, ref, report),
                     const SizedBox(height: 24),
-                    _buildScoreRow(report),
+                    _buildScoreRow(ref, report),
                     const SizedBox(height: 24),
-                    _buildTierSection(report),
+                    _buildTierSection(ref, report),
                     const SizedBox(height: 24),
-                    _buildNodesSection(report),
+                    _buildNodesSection(ref, report),
                     if (report.isFinal && report.avgQuality != null) ...[
                       const SizedBox(height: 20),
-                      _buildQualityBadge(report),
+                      _buildQualityBadge(ref, report),
                     ],
                     const SizedBox(height: 24),
-                    _buildEncouragement(report),
+                    _buildEncouragement(ref, report),
                     const SizedBox(height: 24),
-                    _buildContinueButton(context),
+                    _buildContinueButton(context, ref),
                   ],
                 ),
               ),
@@ -106,7 +107,7 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 标题区 ──────────────────────────────────────────────────────────────
-  Widget _buildHeader(BuildContext context, SessionReport report) {
+  Widget _buildHeader(BuildContext context, WidgetRef ref, SessionReport report) {
     return Column(
       children: [
         const SizedBox(height: 8),
@@ -119,7 +120,7 @@ class _SessionReportContent extends StatelessWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    'Session Complete',
+                    tr(ref, 'Session complete', '本局完成'),
                     style: TextStyle(
                       fontSize: 13,
                       color: Colors.grey[500],
@@ -128,7 +129,11 @@ class _SessionReportContent extends StatelessWidget {
                   ),
                   const SizedBox(height: 2),
                   Text(
-                    report.topicTitle,
+                    chatTopicDisplayTitle(
+                      ref,
+                      report.topicTitle,
+                      titleZh: report.topicTitleZh,
+                    ),
                     style: const TextStyle(
                       fontSize: 20,
                       fontWeight: FontWeight.bold,
@@ -140,7 +145,7 @@ class _SessionReportContent extends StatelessWidget {
                 ],
               ),
             ),
-            _TierBadge(tier: report.depthTier),
+            _TierBadge(ref: ref, tier: report.depthTier),
           ],
         ),
         if (report.isFinal) ...[
@@ -157,7 +162,7 @@ class _SessionReportContent extends StatelessWidget {
                 const Icon(Icons.verified_rounded, size: 14, color: _kBlue),
                 const SizedBox(width: 6),
                 Text(
-                  'AI-verified quality analysis ready',
+                  tr(ref, 'AI-verified quality analysis ready', 'AI 已完成口语质量分析'),
                   style: const TextStyle(fontSize: 12, color: _kBlue, fontWeight: FontWeight.w600),
                 ),
               ],
@@ -169,10 +174,10 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 得分区（圆形进度 + 命中统计）──────────────────────────────────────────
-  Widget _buildScoreRow(SessionReport report) {
+  Widget _buildScoreRow(WidgetRef ref, SessionReport report) {
     return Row(
       children: [
-        _ScoreCircle(score: report.sessionScore),
+        _ScoreCircle(ref: ref, score: report.sessionScore),
         const SizedBox(width: 20),
         Expanded(
           child: Column(
@@ -181,7 +186,7 @@ class _SessionReportContent extends StatelessWidget {
               _StatRow(
                 icon: Icons.check_circle_rounded,
                 color: _kGreen,
-                label: 'Expressions hit',
+                label: tr(ref, 'Expressions hit', '命中表达'),
                 value: '${report.hitCount} / ${report.totalNodes}',
               ),
               const SizedBox(height: 10),
@@ -189,7 +194,7 @@ class _SessionReportContent extends StatelessWidget {
                 _StatRow(
                   icon: Icons.star_rounded,
                   color: _kOrange,
-                  label: 'Newly mastered',
+                  label: tr(ref, 'Newly mastered', '新掌握'),
                   value: report.newlyMastered.length.toString(),
                 ),
                 const SizedBox(height: 10),
@@ -197,8 +202,8 @@ class _SessionReportContent extends StatelessWidget {
               _StatRow(
                 icon: Icons.layers_rounded,
                 color: _kBlue,
-                label: 'Depth tier',
-                value: 'Tier ${report.depthTier}',
+                label: tr(ref, 'Depth tier', '难度层级'),
+                value: tr(ref, 'Tier ${report.depthTier}', '第 ${report.depthTier} 层'),
               ),
             ],
           ),
@@ -208,7 +213,7 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 深度进度条 ───────────────────────────────────────────────────────────
-  Widget _buildTierSection(SessionReport report) {
+  Widget _buildTierSection(WidgetRef ref, SessionReport report) {
     final ts = report.tierStatus;
     return Container(
       padding: const EdgeInsets.all(16),
@@ -227,8 +232,8 @@ class _SessionReportContent extends StatelessWidget {
             children: [
               Text(
                 ts.unlockedNextTier
-                    ? '🎉 Tier ${ts.tier + 1} Unlocked!'
-                    : 'Tier ${ts.tier} Progress',
+                    ? tr(ref, '🎉 Tier ${ts.tier + 1} Unlocked!', '🎉 已解锁第 ${ts.tier + 1} 层！')
+                    : tr(ref, 'Tier ${ts.tier} progress', '第 ${ts.tier} 层进度'),
                 style: TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
@@ -260,7 +265,9 @@ class _SessionReportContent extends StatelessWidget {
           if (!ts.unlockedNextTier) ...[
             const SizedBox(height: 8),
             Text(
-              '${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} more mastery points to unlock Tier ${ts.tier + 1}',
+              ref.watch(settingsProvider).isChinese
+                  ? '还需 ${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} 点掌握度即可解锁第 ${ts.tier + 1} 层'
+                  : '${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} more mastery points to unlock Tier ${ts.tier + 1}',
               style: TextStyle(fontSize: 12, color: Colors.grey[500]),
             ),
           ],
@@ -270,12 +277,12 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 节点列表 ─────────────────────────────────────────────────────────────
-  Widget _buildNodesSection(SessionReport report) {
+  Widget _buildNodesSection(WidgetRef ref, SessionReport report) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          'Expressions Practiced',
+          tr(ref, 'Expressions practiced', '本局练习的表达'),
           style: TextStyle(
             fontSize: 14,
             fontWeight: FontWeight.bold,
@@ -285,14 +292,14 @@ class _SessionReportContent extends StatelessWidget {
         const SizedBox(height: 12),
         ...report.nodes.map((node) => Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: _NodeCard(node: node),
+              child: _NodeCard(ref: ref, node: node),
             )),
       ],
     );
   }
 
   // ── L2 平均质量徽章 ──────────────────────────────────────────────────────
-  Widget _buildQualityBadge(SessionReport report) {
+  Widget _buildQualityBadge(WidgetRef ref, SessionReport report) {
     final q = report.avgQuality!;
     final label = report.qualityLabel ?? 'good';
     final (color, icon) = _qualityColorAndIcon(label);
@@ -312,12 +319,12 @@ class _SessionReportContent extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  'Overall Speaking Quality',
+                  tr(ref, 'Overall speaking quality', '口语整体质量'),
                   style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  _qualityLabelText(label),
+                  _qualityLabelText(ref, label),
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -341,7 +348,12 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 鼓励文字 ─────────────────────────────────────────────────────────────
-  Widget _buildEncouragement(SessionReport report) {
+  Widget _buildEncouragement(WidgetRef ref, SessionReport report) {
+    final isZh = ref.watch(settingsProvider).isChinese;
+    final zhEnc = report.encouragementZh?.trim();
+    final body = (isZh && zhEnc != null && zhEnc.isNotEmpty)
+        ? zhEnc
+        : report.encouragement;
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.all(16),
@@ -355,7 +367,7 @@ class _SessionReportContent extends StatelessWidget {
         borderRadius: BorderRadius.circular(16),
       ),
       child: Text(
-        report.encouragement,
+        body,
         textAlign: TextAlign.center,
         style: const TextStyle(
           fontSize: 14,
@@ -368,7 +380,7 @@ class _SessionReportContent extends StatelessWidget {
   }
 
   // ── 继续按钮 ─────────────────────────────────────────────────────────────
-  Widget _buildContinueButton(BuildContext context) {
+  Widget _buildContinueButton(BuildContext context, WidgetRef ref) {
     return SizedBox(
       width: double.infinity,
       height: 52,
@@ -380,9 +392,9 @@ class _SessionReportContent extends StatelessWidget {
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
           elevation: 0,
         ),
-        child: const Text(
-          'Keep Practicing',
-          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        child: Text(
+          tr(ref, 'Keep practicing', '继续练习'),
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
         ),
       ),
     );
@@ -414,8 +426,9 @@ class _DragHandle extends StatelessWidget {
 }
 
 class _TierBadge extends StatelessWidget {
+  final WidgetRef ref;
   final int tier;
-  const _TierBadge({required this.tier});
+  const _TierBadge({required this.ref, required this.tier});
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -425,7 +438,7 @@ class _TierBadge extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
       ),
       child: Text(
-        'Tier $tier',
+        tr(ref, 'Tier $tier', '第 $tier 层'),
         style: const TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.bold,
@@ -437,8 +450,9 @@ class _TierBadge extends StatelessWidget {
 }
 
 class _ScoreCircle extends StatelessWidget {
+  final WidgetRef ref;
   final double score;
-  const _ScoreCircle({required this.score});
+  const _ScoreCircle({required this.ref, required this.score});
 
   Color get _color {
     if (score >= 80) return _kGreen;
@@ -474,7 +488,7 @@ class _ScoreCircle extends StatelessWidget {
                 ),
               ),
               Text(
-                'pts',
+                tr(ref, 'pts', '分'),
                 style: TextStyle(fontSize: 10, color: Colors.grey[500]),
               ),
             ],
@@ -514,8 +528,9 @@ class _StatRow extends StatelessWidget {
 }
 
 class _NodeCard extends StatelessWidget {
+  final WidgetRef ref;
   final SessionNodeReport node;
-  const _NodeCard({required this.node});
+  const _NodeCard({required this.ref, required this.node});
 
   @override
   Widget build(BuildContext context) {
@@ -584,6 +599,7 @@ class _NodeCard extends StatelessWidget {
           if (hit) ...[
             const SizedBox(height: 10),
             _MasteryBar(
+              ref: ref,
               before: node.masteryBefore,
               after: node.masteryNow,
             ),
@@ -603,7 +619,7 @@ class _NodeCard extends StatelessWidget {
                 ),
                 const SizedBox(width: 6),
                 Text(
-                  _qualityLabelText(node.qualityLabel!),
+                  _qualityLabelText(ref, node.qualityLabel!),
                   style: TextStyle(
                     fontSize: 12,
                     color: qualityColor,
@@ -627,9 +643,10 @@ class _NodeCard extends StatelessWidget {
 }
 
 class _MasteryBar extends StatelessWidget {
+  final WidgetRef ref;
   final double before;
   final double after;
-  const _MasteryBar({required this.before, required this.after});
+  const _MasteryBar({required this.ref, required this.before, required this.after});
 
   @override
   Widget build(BuildContext context) {
@@ -639,7 +656,10 @@ class _MasteryBar extends StatelessWidget {
         Row(
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
-            Text('Mastery', style: TextStyle(fontSize: 11, color: Colors.grey[500])),
+            Text(
+              tr(ref, 'Mastery', '掌握度'),
+              style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+            ),
             Text(
               '${after.toInt()}%',
               style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold, color: _kGreen),
@@ -701,12 +721,12 @@ class _MasteryBar extends StatelessWidget {
   };
 }
 
-String _qualityLabelText(String label) {
+String _qualityLabelText(WidgetRef ref, String label) {
   return switch (label) {
-    'excellent'  => 'Excellent — natural & correct',
-    'good'       => 'Good — correct',
-    'fair'       => 'Fair — needs polish',
-    'needs_work' => 'Needs more practice',
-    _            => 'Not attempted',
+    'excellent' => tr(ref, 'Excellent — natural & correct', '优秀：自然且准确'),
+    'good' => tr(ref, 'Good — correct', '良好：表达正确'),
+    'fair' => tr(ref, 'Fair — needs polish', '一般：还可打磨'),
+    'needs_work' => tr(ref, 'Needs more practice', '需加强练习'),
+    _ => tr(ref, 'Not attempted', '未评估'),
   };
 }

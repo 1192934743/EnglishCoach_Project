@@ -4,6 +4,8 @@ import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import 'backend_config.dart';
+
 // ── 连接状态枚举 ────────────────────────────────────────────────────────────
 enum WsConnectionState { disconnected, connecting, connected, reconnecting }
 
@@ -35,7 +37,7 @@ class WebSocketClient {
   WsConnectionState _state = WsConnectionState.disconnected;
 
   // ── 配置常量 ──────────────────────────────────────────────────────────────
-  static const String _url = "ws://172.20.10.4:8000/ws/coach";
+  static String get _url => kBackendWsUrl;
   static const int _maxReconnectAttempts = 5;
   static const Duration _heartbeatInterval = Duration(seconds: 20);
 

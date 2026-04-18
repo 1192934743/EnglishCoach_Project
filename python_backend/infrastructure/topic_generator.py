@@ -24,7 +24,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, Topic, TargetNode
+from database import SessionLocal, Topic, TargetNode, topic_title_zh_fallback
 from application.services.mastery_scorer import normalize_text
 
 logger = logging.getLogger("EnglishCoach")
@@ -43,6 +43,7 @@ GENERATE_TIMEOUT = 30.0
 # ── 输出 JSON Schema（AI 必须遵守的结构）────────────────────────────────────
 _OUTPUT_SCHEMA = {
     "title": "string — short English topic name, e.g. 'Coffee Shop Ordering'",
+    "title_zh": "string — short Chinese UI label for Chinese-mode users, e.g. '咖啡店点餐' (2–12 chars typical)",
     "category": "string — topic category, e.g. 'Food & Drink', 'Travel', 'Career'",
     "role_name": "string — AI's role in the scene, e.g. 'Barista'",
     "learner_level": "string — 'Beginner' | 'Intermediate' | 'Professional'",
@@ -120,6 +121,17 @@ async def _get_or_generate(
 
     # ── 层 1：直接复用 ──────────────────────────────────────────────────────
     if best_sim >= SIMILARITY_REUSE_THRESHOLD and best_topic is not None:
+        # 旧库话题可能没有 title_zh：用内置英文→中文表补写 DB，便于中文界面与 API
+        if not (getattr(best_topic, "title_zh", None) or "").strip():
+            zh_fb = topic_title_zh_fallback(best_topic.title)
+            if zh_fb:
+                best_topic.title_zh = zh_fb
+                db.commit()
+                db.refresh(best_topic)
+                logger.info(
+                    "[TopicGenerator] Backfilled title_zh for reused topic %r",
+                    best_topic.title,
+                )
         logger.info(f"[TopicGenerator] Tier-1 reuse: '{best_topic.title}'")
         return best_topic
 
@@ -209,6 +221,7 @@ def _build_reference_template(topic: Topic) -> dict:
 
     return {
         "title": topic.title,
+        "title_zh": getattr(topic, "title_zh", None) or "",
         "category": topic.category,
         "role_name": topic.role_name,
         "learner_level": topic.learner_level,
@@ -244,6 +257,8 @@ Create a NEW topic for the target description by:
 
 {_NODE_DISTRIBUTION_HINT}
 
+Always include title_zh (natural Chinese for the same topic as title).
+
 Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
 {_SCHEMA_STR}"""
 
@@ -264,6 +279,8 @@ TARGET TOPIC: "{description}"
 Create a complete topic with rich coaching content.
 {_NODE_DISTRIBUTION_HINT}
 
+Always include title_zh (natural Chinese for the same topic as title).
+
 Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
 {_SCHEMA_STR}"""
 
@@ -271,6 +288,64 @@ Return ONLY a JSON object matching this exact schema (no markdown, no explanatio
 
 
 # ── LLM 调用 + 持久化 ──────────────────────────────────────────────────────
+
+_FILL_TITLE_ZH_TIMEOUT = 18.0
+
+
+async def llm_fill_title_zh_only(openai_client, title_en: str) -> Optional[str]:
+    """
+    仅根据英文 canonical 标题生成短中文 UI 名（2–12 字典型）。
+    供批量补全脚本与主生成流程复用；失败返回 None。
+    """
+    title_en = (title_en or "").strip()
+    if not title_en:
+        return None
+    try:
+        resp = await asyncio.wait_for(
+            openai_client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Output a single JSON object only. Keys: title_zh (string).",
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f'English practice topic title: "{title_en}"\n'
+                            "Reply with JSON only: "
+                            '{"title_zh":"<short natural Chinese UI name, 2-12 Chinese characters, no English>"}'
+                        ),
+                    },
+                ],
+                max_tokens=120,
+                response_format={"type": "json_object"},
+            ),
+            timeout=_FILL_TITLE_ZH_TIMEOUT,
+        )
+        raw = resp.choices[0].message.content
+        extra = json.loads(raw.strip())
+        z = (extra.get("title_zh") or "").strip()
+        return z or None
+    except Exception as e:
+        logger.warning("[TopicGenerator] llm_fill_title_zh_only failed for %r: %s", title_en, e)
+        return None
+
+
+async def _fill_title_zh_if_missing(data: dict, openai_client) -> None:
+    """
+    主 JSON 里若未给出 title_zh（模型偶发漏字段），补一次极短调用，保证新生成话题可中文展示。
+    """
+    if (data.get("title_zh") or "").strip():
+        return
+    title_en = (data.get("title") or "").strip()
+    if not title_en:
+        return
+    z = await llm_fill_title_zh_only(openai_client, title_en)
+    if z:
+        data["title_zh"] = z
+        logger.info("[TopicGenerator] Filled missing title_zh via follow-up LLM call")
+
 
 async def _call_llm_and_save(
     prompt: str,
@@ -295,6 +370,7 @@ async def _call_llm_and_save(
 
     raw = resp.choices[0].message.content
     data = _parse_and_validate(raw)
+    await _fill_title_zh_if_missing(data, openai_client)
     return _save_to_db(data, db)
 
 
@@ -312,6 +388,7 @@ def _parse_and_validate(raw: str) -> dict:
 
     # Ensure required fields exist with defaults
     data.setdefault("title", "Custom Practice Topic")
+    data.setdefault("title_zh", "")
     data.setdefault("category", "General")
     data.setdefault("role_name", "English Coach")
     data.setdefault("learner_level", "Intermediate")
@@ -330,8 +407,10 @@ def _parse_and_validate(raw: str) -> dict:
 
 def _save_to_db(data: dict, db: Session) -> Topic:
     """Persist generated Topic + TargetNodes, return detached Topic."""
+    tzh = (data.get("title_zh") or "").strip()
     topic = Topic(
         title=data["title"],
+        title_zh=tzh or None,
         category=data["category"],
         role_name=data["role_name"],
         learner_level=data["learner_level"],
@@ -383,6 +462,7 @@ def _get_fallback_topic(db: Session) -> Topic:
     # If DB is completely empty, create a bare-bones topic
     topic = Topic(
         title="General English Conversation",
+        title_zh="通用英语对话",
         category="Daily Life",
         role_name="English Coach",
         learner_level="Intermediate",

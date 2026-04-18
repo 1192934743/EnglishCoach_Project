@@ -1,3 +1,5 @@
+// lib/core/providers/settings_provider.dart
+import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 class SettingsState {
@@ -9,9 +11,10 @@ class SettingsState {
   final bool showHints;
   final int vadTimeout;
   final bool showProgressBar;
-  // LMS parameters (synced to backend User.settings)
-  final double depthPreference;    // 1.0 ~ 5.0: how deep to go in each topic
-  final double newTopicAppetite;   // 0.0 ~ 1.0: 0=review-focused, 1=exploration-focused
+  final double depthPreference;
+  final double newTopicAppetite;
+  // 🌟 新增：用户英语熟练度等级
+  final String learnerLevel;
 
   SettingsState({
     required this.isChinese,
@@ -24,6 +27,7 @@ class SettingsState {
     required this.showProgressBar,
     this.depthPreference = 1.0,
     this.newTopicAppetite = 0.2,
+    this.learnerLevel = "Intermediate", // 默认中级
   });
 
   SettingsState copyWith({
@@ -37,6 +41,7 @@ class SettingsState {
     bool? showProgressBar,
     double? depthPreference,
     double? newTopicAppetite,
+    String? learnerLevel,
   }) {
     return SettingsState(
       isChinese: isChinese ?? this.isChinese,
@@ -49,6 +54,7 @@ class SettingsState {
       showProgressBar: showProgressBar ?? this.showProgressBar,
       depthPreference: depthPreference ?? this.depthPreference,
       newTopicAppetite: newTopicAppetite ?? this.newTopicAppetite,
+      learnerLevel: learnerLevel ?? this.learnerLevel,
     );
   }
 }
@@ -64,7 +70,7 @@ class SettingsNotifier extends Notifier<SettingsState> {
       showTranslation: false,
       showHints: true,
       vadTimeout: 800,
-      showProgressBar: true, // 🌟 默认开启进度条
+      showProgressBar: true,
     );
   }
 
@@ -83,6 +89,8 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(depthPreference: val);
   void setNewTopicAppetite(double val) =>
       state = state.copyWith(newTopicAppetite: val);
+  // 🌟 新增：更新等级的方法
+  void setLearnerLevel(String val) => state = state.copyWith(learnerLevel: val);
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(
@@ -91,4 +99,108 @@ final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(
 
 String tr(WidgetRef ref, String en, String cn) {
   return ref.watch(settingsProvider).isChinese ? cn : en;
+}
+
+/// LMS / 设置里使用的 canonical 等级（英文）在界面上的显示名；传给后端的 [canonical] 仍为英文。
+String learnerLevelUiLabel(WidgetRef ref, String canonical) {
+  switch (canonical.trim()) {
+    case 'Beginner':
+      return tr(ref, 'Beginner', '入门（零基础）');
+    case 'Elementary':
+      return tr(ref, 'Elementary', '初级');
+    case 'Intermediate':
+      return tr(ref, 'Intermediate', '中级');
+    case 'Advanced':
+      return tr(ref, 'Advanced', '高级');
+    default:
+      return canonical.trim();
+  }
+}
+
+/// 种子库 / 兜底话题的英文标题 → 中文界面展示名（与 DB `topics.title` 一致）。
+/// AI 新生成等未知标题保持英文；请求后端仍用英文 `title`。
+const Map<String, String> _kTopicTitleZh = {
+  "McDonald's Ordering": '麦当劳点餐',
+  'Technical Job Interview': '技术岗位面试',
+  'Daily Casual Conversation': '日常闲聊',
+  'General English Conversation': '通用英语对话',
+  'Daily Conversation': '日常对话',
+  'Simulation Practice': '场景模拟对练',
+};
+
+String topicTitleUiLabel(WidgetRef ref, String englishTitle) {
+  if (!ref.watch(settingsProvider).isChinese) return englishTitle;
+  final key = englishTitle.trim();
+  if (key.isEmpty) return englishTitle;
+  final direct = _kTopicTitleZh[key];
+  if (direct != null) return direct;
+  for (final e in _kTopicTitleZh.entries) {
+    if (e.key.toLowerCase() == key.toLowerCase()) return e.value;
+  }
+  return englishTitle;
+}
+
+/// 聊天/统计等：中文界面优先用后端 `title_zh`，否则用种子映射，再否则英文标题。
+String chatTopicDisplayTitle(
+  WidgetRef ref,
+  String englishTitle, {
+  String? titleZh,
+}) {
+  if (!ref.watch(settingsProvider).isChinese) return englishTitle;
+  final z = titleZh?.trim();
+  if (z != null && z.isNotEmpty) return z;
+  return topicTitleUiLabel(ref, englishTitle);
+}
+
+// ── 掌握度三档：仅影响 App 文案与图形，不改变后端算法。阈值与后端常量对齐。──
+
+/// 与 `python_backend/application/services/session_planner.py` 中
+/// `MASTERY_AUTO_PICK_SOFT_CAP` 保持数值一致（自动选题软上限、话题列表「已扎实」筛选）。
+const double kMasteryAutoPickSoftCapPercent = 88.0;
+
+/// 与同一文件中 `MASTERY_THRESHOLD_FOR_TIER_UP` 保持数值一致（深度晋级均值门槛）。
+const double kMasteryTierUpThresholdPercent = 75.0;
+
+/// 平均掌握度 0–100 → 三档**展示**（不向用户展示具体数字）。
+enum MasteryUiBand { exploring, advancing, fluent }
+
+MasteryUiBand masteryUiBandFromPercent(double percent0to100) {
+  final p = percent0to100.clamp(0.0, 100.0);
+  if (p >= kMasteryAutoPickSoftCapPercent) return MasteryUiBand.fluent;
+  if (p >= kMasteryTierUpThresholdPercent) return MasteryUiBand.advancing;
+  return MasteryUiBand.exploring;
+}
+
+String masteryUiBandLabel(WidgetRef ref, MasteryUiBand band) {
+  switch (band) {
+    case MasteryUiBand.exploring:
+      return tr(ref, 'Getting started', '起步阶段');
+    case MasteryUiBand.advancing:
+      return tr(ref, 'Making progress', '稳步提升');
+    case MasteryUiBand.fluent:
+      return tr(ref, 'Strong grasp', '掌握扎实');
+  }
+}
+
+/// 与 [masteryUiBandFromPercent] 对应：1 / 2 / 3 颗星（示意档位，非精确数值）。
+int masteryStarCount(MasteryUiBand band) {
+  switch (band) {
+    case MasteryUiBand.exploring:
+      return 1;
+    case MasteryUiBand.advancing:
+      return 2;
+    case MasteryUiBand.fluent:
+      return 3;
+  }
+}
+
+Color masteryUiBandColor(MasteryUiBand band) {
+  switch (band) {
+    case MasteryUiBand.exploring:
+      return const Color(0xFFFF8A65);
+    case MasteryUiBand.advancing:
+      return const Color(0xFF42A5F5);
+    case MasteryUiBand.fluent:
+      return const Color(0xFF43A047);
+  }
 }

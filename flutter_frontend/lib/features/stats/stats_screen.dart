@@ -5,10 +5,9 @@
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import '../../core/providers/settings_provider.dart';
 import '../../core/network/api_client.dart';
 import '../../core/network/user_manager.dart';
-import '../topics/topic_browser_screen.dart' show TopicItem;
-
 // ── Provider ──────────────────────────────────────────────────────────────
 final statsProvider = FutureProvider<Map<String, dynamic>>((ref) async {
   final userId = await UserManager.getOrCreateUuid();
@@ -25,48 +24,43 @@ class StatsScreen extends ConsumerWidget {
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
-      appBar: AppBar(
-        title: const Text(
-          'My Progress',
-          style: TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
-        ),
-        backgroundColor: Colors.white,
-        elevation: 1,
-        centerTitle: true,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh_rounded, color: Colors.black54),
-            onPressed: () => ref.invalidate(statsProvider),
+      body: SafeArea(
+        child: statsAsync.when(
+          loading: () => const Center(child: CircularProgressIndicator()),
+          error: (e, _) => _buildError(ref, e),
+          data: (data) => RefreshIndicator(
+            onRefresh: () async {
+              ref.invalidate(statsProvider);
+              await ref.read(statsProvider.future);
+            },
+            child: _buildContent(context, ref, data),
           ),
-        ],
-      ),
-      body: statsAsync.when(
-        loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => _buildError(context, ref, e),
-        data: (data) => _buildContent(context, data),
+        ),
       ),
     );
   }
 
-  Widget _buildError(BuildContext context, WidgetRef ref, Object e) => Center(
+  Widget _buildError(WidgetRef ref, Object e) => Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.wifi_off_rounded, size: 48, color: Colors.grey),
             const SizedBox(height: 12),
-            Text('Could not load stats.\n$e',
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.grey)),
+            Text(
+              '${tr(ref, 'Could not load stats.', '统计数据加载失败。')}\n$e',
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: Colors.grey),
+            ),
             const SizedBox(height: 16),
             ElevatedButton(
               onPressed: () => ref.invalidate(statsProvider),
-              child: const Text('Retry'),
+              child: Text(tr(ref, 'Retry', '重试')),
             ),
           ],
         ),
       );
 
-  Widget _buildContent(BuildContext context, Map<String, dynamic> data) {
+  Widget _buildContent(BuildContext context, WidgetRef ref, Map<String, dynamic> data) {
     final sessions = data['total_sessions'] as int? ?? 0;
     final practiced = data['total_expressions_practiced'] as int? ?? 0;
     final mastered = data['total_expressions_mastered'] as int? ?? 0;
@@ -75,23 +69,30 @@ class StatsScreen extends ConsumerWidget {
     final recentSessions = (data['recent_sessions'] as List?)?.cast<Map<String, dynamic>>() ?? [];
     final topicsSummary = (data['topics_summary'] as List?)?.cast<Map<String, dynamic>>() ?? [];
 
+    final bottomInset = MediaQuery.paddingOf(context).bottom;
     return ListView(
-      padding: const EdgeInsets.all(16),
+      physics: const AlwaysScrollableScrollPhysics(),
+      padding: EdgeInsets.fromLTRB(16, 16, 16, 20 + bottomInset),
       children: [
         // Streak hero card
-        _buildStreakCard(streak),
+        _buildStreakCard(ref, streak),
         const SizedBox(height: 16),
         // 4-stat grid
-        _buildStatsGrid(sessions, practiced, mastered, topics),
+        _buildStatsGrid(context, ref, sessions, practiced, mastered, topics),
         const SizedBox(height: 20),
         // Topic progress
         if (topicsSummary.isNotEmpty) ...[
-          _sectionTitle('Topic Mastery'),
+          _sectionTitle(tr(ref, 'Topic Mastery', '话题掌握度')),
           const SizedBox(height: 10),
           ...topicsSummary.map((t) => Padding(
             padding: const EdgeInsets.only(bottom: 10),
             child: _TopicMasteryBar(
-              title: t['topic_title'] as String,
+              ref: ref,
+              title: chatTopicDisplayTitle(
+                ref,
+                t['topic_title'] as String,
+                titleZh: t['topic_title_zh'] as String?,
+              ),
               category: t['category'] as String? ?? '',
               avgMastery: (t['avg_mastery'] as num?)?.toDouble() ?? 0.0,
               nodesPracticed: t['nodes_practiced'] as int? ?? 0,
@@ -102,105 +103,161 @@ class StatsScreen extends ConsumerWidget {
         ],
         // Recent sessions
         if (recentSessions.isNotEmpty) ...[
-          _sectionTitle('Recent Sessions'),
+          _sectionTitle(tr(ref, 'Recent Sessions', '最近练习')),
           const SizedBox(height: 10),
           ...recentSessions.map((s) => Padding(
             padding: const EdgeInsets.only(bottom: 8),
-            child: _RecentSessionTile(session: s),
+            child: _RecentSessionTile(ref: ref, session: s),
           )),
         ],
-        if (sessions == 0)
-          _buildEmptyState(),
+        if (sessions == 0) _buildEmptyState(ref),
       ],
     );
   }
 
-  Widget _buildStreakCard(int streak) {
+  Widget _buildStreakCard(WidgetRef ref, int streak) {
     final hasStreak = streak > 0;
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.all(20),
-      decoration: BoxDecoration(
-        gradient: LinearGradient(
-          colors: hasStreak
-              ? [const Color(0xFFFF9800), const Color(0xFFFF5722)]
-              : [const Color(0xFF2196F3), const Color(0xFF7C3AED)],
-          begin: Alignment.topLeft,
-          end: Alignment.bottomRight,
-        ),
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Row(
-        children: [
-          Text(
-            hasStreak ? '🔥' : '📚',
-            style: const TextStyle(fontSize: 40),
-          ),
-          const SizedBox(width: 16),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  hasStreak ? '$streak-Day Streak!' : 'Start Your Streak',
-                  style: const TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                    color: Colors.white,
-                  ),
-                ),
-                Text(
-                  hasStreak
-                      ? 'Keep it up — practice again today!'
-                      : 'Practice every day to build a streak.',
-                  style: TextStyle(
-                    fontSize: 13,
-                    color: Colors.white.withValues(alpha: 0.85),
-                  ),
-                ),
-              ],
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final narrow = constraints.maxWidth < 340;
+        final titleSize = narrow ? 18.0 : 22.0;
+        final subSize = narrow ? 12.0 : 13.0;
+        return Container(
+          width: double.infinity,
+          padding: EdgeInsets.fromLTRB(narrow ? 14 : 20, 16, narrow ? 14 : 20, 16),
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: hasStreak
+                  ? [const Color(0xFFFF9800), const Color(0xFFFF5722)]
+                  : [const Color(0xFF2196F3), const Color(0xFF7C3AED)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
             ),
+            borderRadius: BorderRadius.circular(20),
           ),
-        ],
-      ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                hasStreak ? '🔥' : '📚',
+                style: TextStyle(fontSize: narrow ? 34 : 40),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      hasStreak
+                          ? tr(ref, '$streak-Day Streak!', '已连续 $streak 天！')
+                          : tr(ref, 'Start Your Streak', '开启连续打卡'),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: titleSize,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.white,
+                        height: 1.2,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      hasStreak
+                          ? tr(ref, 'Keep it up — practice again today!', '太棒了，今天也来练一局吧！')
+                          : tr(ref, 'Practice every day to build a streak.', '每天坚持练习即可累积打卡天数。'),
+                      maxLines: 3,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: subSize,
+                        height: 1.25,
+                        color: Colors.white.withValues(alpha: 0.9),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 
-  Widget _buildStatsGrid(int sessions, int practiced, int mastered, int topics) {
-    return GridView.count(
-      crossAxisCount: 2,
-      crossAxisSpacing: 10,
-      mainAxisSpacing: 10,
-      shrinkWrap: true,
-      physics: const NeverScrollableScrollPhysics(),
-      childAspectRatio: 1.6,
-      children: [
-        _StatCard(icon: Icons.play_circle_outline_rounded, color: Colors.blueAccent,
-            label: 'Sessions', value: '$sessions'),
-        _StatCard(icon: Icons.record_voice_over_rounded, color: Colors.teal,
-            label: 'Expressions tried', value: '$practiced'),
-        _StatCard(icon: Icons.star_rounded, color: Colors.orange,
-            label: 'Mastered (≥60%)', value: '$mastered'),
-        _StatCard(icon: Icons.topic_rounded, color: Colors.purple,
-            label: 'Topics touched', value: '$topics'),
-      ],
+  /// 四宫格用固定行高，避免 `childAspectRatio` 在窄屏/系统大字下出现几像素级纵向溢出。
+  Widget _buildStatsGrid(
+    BuildContext context,
+    WidgetRef ref,
+    int sessions,
+    int practiced,
+    int mastered,
+    int topics,
+  ) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final w = constraints.maxWidth;
+        final textScale = MediaQuery.textScalerOf(context).scale(1.0);
+        final cellWidth = (w - 10) / 2;
+        final baseH = cellWidth / 1.05;
+        final mainExtent = (baseH * textScale).clamp(92.0, 152.0);
+        return GridView(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: 2,
+            crossAxisSpacing: 10,
+            mainAxisSpacing: 10,
+            mainAxisExtent: mainExtent,
+          ),
+          children: [
+            _StatCard(
+              icon: Icons.play_circle_outline_rounded,
+              color: Colors.blueAccent,
+              label: tr(ref, 'Sessions', '练习局数'),
+              value: '$sessions',
+            ),
+            _StatCard(
+              icon: Icons.record_voice_over_rounded,
+              color: Colors.teal,
+              label: tr(ref, 'Expressions tried', '已练表达'),
+              value: '$practiced',
+            ),
+            _StatCard(
+              icon: Icons.star_rounded,
+              color: Colors.orange,
+              label: tr(ref, 'Expressions solid', '表达已较熟'),
+              value: '$mastered',
+            ),
+            _StatCard(
+              icon: Icons.topic_rounded,
+              color: Colors.purple,
+              label: tr(ref, 'Topics touched', '涉及话题'),
+              value: '$topics',
+            ),
+          ],
+        );
+      },
     );
   }
 
-  Widget _buildEmptyState() => Center(
+  Widget _buildEmptyState(WidgetRef ref) => Center(
         child: Padding(
           padding: const EdgeInsets.only(top: 40),
           child: Column(
             children: [
               const Text('🎯', style: TextStyle(fontSize: 56)),
               const SizedBox(height: 16),
-              const Text(
-                'No sessions yet',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+              Text(
+                tr(ref, 'No sessions yet', '还没有练习记录'),
+                style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
               ),
               const SizedBox(height: 8),
               Text(
-                'Go to the Chat tab and start your first practice session!',
+                tr(
+                  ref,
+                  'Go to the Chat tab and start your first practice session!',
+                  '打开「对练」标签，开始你的第一场练习吧！',
+                ),
                 textAlign: TextAlign.center,
                 style: TextStyle(fontSize: 14, color: Colors.grey[500]),
               ),
@@ -236,7 +293,7 @@ class _StatCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Container(
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.fromLTRB(12, 10, 12, 10),
         decoration: BoxDecoration(
           color: Colors.white,
           borderRadius: BorderRadius.circular(16),
@@ -248,34 +305,46 @@ class _StatCard extends StatelessWidget {
             ),
           ],
         ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Icon(icon, color: color, size: 22),
-            Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  value,
-                  style: TextStyle(
-                    fontSize: 24,
-                    fontWeight: FontWeight.bold,
-                    color: color,
-                  ),
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            return FittedBox(
+              fit: BoxFit.scaleDown,
+              alignment: Alignment.topLeft,
+              child: ConstrainedBox(
+                constraints: BoxConstraints(maxWidth: constraints.maxWidth),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(icon, color: color, size: 20),
+                    const SizedBox(height: 4),
+                    Text(
+                      value,
+                      style: TextStyle(
+                        fontSize: 22,
+                        fontWeight: FontWeight.bold,
+                        color: color,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    Text(
+                      label,
+                      style: TextStyle(fontSize: 10, color: Colors.grey[500], height: 1.2),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ],
                 ),
-                Text(
-                  label,
-                  style: TextStyle(fontSize: 11, color: Colors.grey[500]),
-                ),
-              ],
-            ),
-          ],
+              ),
+            );
+          },
         ),
       );
 }
 
 class _TopicMasteryBar extends StatelessWidget {
+  final WidgetRef ref;
   final String title;
   final String category;
   final double avgMastery;
@@ -283,6 +352,7 @@ class _TopicMasteryBar extends StatelessWidget {
   final int totalNodes;
 
   const _TopicMasteryBar({
+    required this.ref,
     required this.title,
     required this.category,
     required this.avgMastery,
@@ -293,7 +363,11 @@ class _TopicMasteryBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final ratio = (avgMastery / 100.0).clamp(0.0, 1.0);
-    final color = ratio >= 0.75 ? Colors.green : (ratio >= 0.4 ? Colors.blueAccent : Colors.orange);
+    final color = ratio >= (kMasteryAutoPickSoftCapPercent / 100.0)
+        ? Colors.green
+        : (ratio >= (kMasteryTierUpThresholdPercent / 100.0)
+            ? Colors.blueAccent
+            : Colors.orange);
 
     return Container(
       padding: const EdgeInsets.all(14),
@@ -305,12 +379,13 @@ class _TopicMasteryBar extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Expanded(
                 child: Text(
                   title,
                   style: const TextStyle(fontSize: 14, fontWeight: FontWeight.bold),
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -322,8 +397,10 @@ class _TopicMasteryBar extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            '$category · $nodesPracticed/$totalNodes expressions',
-            style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+            '$category · $nodesPracticed/$totalNodes ${tr(ref, 'expressions', '条表达')}',
+            style: TextStyle(fontSize: 11, color: Colors.grey[500], height: 1.2),
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
           ),
           const SizedBox(height: 8),
           ClipRRect(
@@ -332,7 +409,7 @@ class _TopicMasteryBar extends StatelessWidget {
               value: ratio,
               minHeight: 6,
               backgroundColor: Colors.grey.shade100,
-              valueColor: AlwaysStoppedAnimation(color),
+              valueColor: AlwaysStoppedAnimation<Color>(color),
             ),
           ),
         ],
@@ -342,13 +419,18 @@ class _TopicMasteryBar extends StatelessWidget {
 }
 
 class _RecentSessionTile extends StatelessWidget {
+  final WidgetRef ref;
   final Map<String, dynamic> session;
 
-  const _RecentSessionTile({required this.session});
+  const _RecentSessionTile({required this.ref, required this.session});
 
   @override
   Widget build(BuildContext context) {
-    final title = session['topic_title'] as String? ?? 'Unknown';
+    final title = chatTopicDisplayTitle(
+      ref,
+      session['topic_title'] as String? ?? tr(ref, 'Unknown', '未知'),
+      titleZh: session['topic_title_zh'] as String?,
+    );
     final tier = session['depth_tier'] as int? ?? 1;
     final mastered = session['nodes_mastered'] as int? ?? 0;
     final date = session['date'] as String?;
@@ -369,39 +451,61 @@ class _RecentSessionTile extends StatelessWidget {
               shape: BoxShape.circle,
             ),
             child: Center(
-              child: Text('T$tier', style: const TextStyle(
-                fontSize: 12, fontWeight: FontWeight.bold, color: Colors.blueAccent,
-              )),
+              child: Text(
+                tr(ref, 'T$tier', '第$tier层'),
+                style: const TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.blueAccent,
+                ),
+              ),
             ),
           ),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
               children: [
-                Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
-                    overflow: TextOverflow.ellipsis),
                 Text(
-                  '$mastered expressions mastered${quality != null ? ' · Quality: ${(quality * 100).toInt()}%' : ''}',
-                  style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+                  title,
+                  style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+                Text(
+                  '$mastered ${tr(ref, 'expressions mastered', '条表达已掌握')}'
+                  '${quality != null ? ' · ${tr(ref, 'Quality', '质量')}: ${(quality * 100).toInt()}%' : ''}',
+                  style: TextStyle(fontSize: 11, color: Colors.grey[500], height: 1.2),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
                 ),
               ],
             ),
           ),
           if (date != null)
-            Text(_formatDate(date), style: TextStyle(fontSize: 11, color: Colors.grey[400])),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 76),
+              child: Text(
+                _formatDate(ref, date),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.end,
+                style: TextStyle(fontSize: 11, color: Colors.grey[400]),
+              ),
+            ),
         ],
       ),
     );
   }
 
-  String _formatDate(String iso) {
+  String _formatDate(WidgetRef ref, String iso) {
     try {
       final d = DateTime.parse(iso);
       final diff = DateTime.now().difference(d).inDays;
-      if (diff == 0) return 'Today';
-      if (diff == 1) return 'Yesterday';
-      return '$diff days ago';
+      if (diff == 0) return tr(ref, 'Today', '今天');
+      if (diff == 1) return tr(ref, 'Yesterday', '昨天');
+      return tr(ref, '$diff days ago', '$diff 天前');
     } catch (_) {
       return '';
     }

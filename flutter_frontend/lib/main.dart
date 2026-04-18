@@ -29,13 +29,13 @@ class EnglishCoachApp extends ConsumerWidget {
 }
 
 // ── Entry: check onboarding status ───────────────────────────────────────
-class _AppEntry extends StatefulWidget {
+class _AppEntry extends ConsumerStatefulWidget {
   const _AppEntry();
   @override
-  State<_AppEntry> createState() => _AppEntryState();
+  ConsumerState<_AppEntry> createState() => _AppEntryState();
 }
 
-class _AppEntryState extends State<_AppEntry> {
+class _AppEntryState extends ConsumerState<_AppEntry> {
   bool? _onboardingDone;
 
   @override
@@ -46,7 +46,15 @@ class _AppEntryState extends State<_AppEntry> {
 
   Future<void> _checkOnboarding() async {
     final prefs = await SharedPreferences.getInstance();
+    final storedChinese = prefs.getBool('ui_is_chinese');
+    if (storedChinese != null) {
+      ref.read(settingsProvider.notifier).toggleLanguage(storedChinese);
+    }
     final done = prefs.getBool('onboarding_done') ?? false;
+    final savedLevel = prefs.getString('learner_level');
+    if (savedLevel != null && savedLevel.isNotEmpty) {
+      ref.read(settingsProvider.notifier).setLearnerLevel(savedLevel);
+    }
     if (mounted) setState(() => _onboardingDone = done);
   }
 
@@ -90,8 +98,9 @@ class _MainScreenState extends ConsumerState<MainScreen> {
     ref.listenManual<ChatState>(chatProvider, (prev, next) {
       // Show toast when topic title changes
       if (prev != null &&
-          prev.currentTopicTitle != next.currentTopicTitle &&
-          next.currentTopicTitle != 'Simulation Practice') {
+          next.currentTopicTitle != 'Simulation Practice' &&
+          (prev.currentTopicTitle != next.currentTopicTitle ||
+              prev.currentTopicTitleZh != next.currentTopicTitleZh)) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Row(
@@ -100,7 +109,8 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
-                    'Now practicing: ${next.currentTopicTitle}',
+                    '${tr(ref, 'Now practicing:', '正在练习：')}'
+                    '${chatTopicDisplayTitle(ref, next.currentTopicTitle, titleZh: next.currentTopicTitleZh.isEmpty ? null : next.currentTopicTitleZh)}',
                     style: const TextStyle(fontWeight: FontWeight.w500),
                   ),
                 ),

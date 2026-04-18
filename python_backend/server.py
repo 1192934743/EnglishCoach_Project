@@ -10,7 +10,16 @@ from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
 import openai
 
-from database import SessionLocal, User, Topic, TargetNode, UserProgress, LearningSession
+from database import (
+    SessionLocal,
+    User,
+    Topic,
+    TargetNode,
+    UserProgress,
+    LearningSession,
+    ensure_schema_upgrades,
+    effective_topic_title_zh,
+)
 from core.audio_service import run_volcengine_wss_asr, run_tts_to_ws
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
@@ -18,12 +27,25 @@ import uuid
 import application.services.session_planner as session_planner
 import application.services.assessment_engine as assessment_engine
 from application.services.report_builder import build_preliminary_report
-from database import UserProgress
 import infrastructure.topic_generator as topic_generator
 
 # ================= 0. 初始化与配置 =================
+_BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 logger = logging.getLogger("EnglishCoach")
+# 同时写入 python_backend/server_output.log，便于查找含 [Prompt] / [L1] 的调试日志
+try:
+    _log_path = os.path.join(_BACKEND_DIR, "server_output.log")
+    _fh = logging.FileHandler(_log_path, encoding="utf-8")
+    _fh.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    )
+    _coach = logging.getLogger("EnglishCoach")
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(_log_path) for h in _coach.handlers):
+        _coach.addHandler(_fh)
+    logger.info("EnglishCoach file log: %s", os.path.abspath(_log_path))
+except OSError as _e:
+    logging.getLogger("EnglishCoach").warning("Could not open server_output.log: %s", _e)
 
 load_dotenv("config.env")
 
@@ -56,7 +78,8 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def on_startup():
-    """服务启动时初始化 VectorStore，使 SessionPlanner 的相似度计算即刻可用"""
+    """服务启动时：SQLite 结构升级 → VectorStore 预热"""
+    await run_in_threadpool(ensure_schema_upgrades)
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
 
@@ -95,6 +118,7 @@ async def get_topics(user_id: Optional[str] = Query(default=None)):
                 result.append({
                     "id": t.id,
                     "title": t.title,
+                    "title_zh": effective_topic_title_zh(t),
                     "category": t.category or "General",
                     "learner_level": t.learner_level or "Intermediate",
                     "role_name": t.role_name or "Coach",
@@ -150,6 +174,7 @@ async def get_stats(user_id: str = Query(...)):
                 topic = db.query(Topic).filter(Topic.id == s.topic_id).first()
                 recent.append({
                     "topic_title": topic.title if topic else "Unknown",
+                    "topic_title_zh": (effective_topic_title_zh(topic) if topic else None),
                     "depth_tier": s.depth_tier_used or 1,
                     "nodes_mastered": len(s.nodes_mastered or []),
                     "date": s.start_time.isoformat() if s.start_time else None,
@@ -173,6 +198,7 @@ async def get_stats(user_id: str = Query(...)):
                 avg = sum(p.mastery_score for p in progs) / len(nodes)
                 topics_summary.append({
                     "topic_title": t.title,
+                    "topic_title_zh": effective_topic_title_zh(t),
                     "category": t.category or "General",
                     "avg_mastery": round(avg, 1),
                     "nodes_practiced": len(progs),
@@ -225,7 +251,18 @@ def init_or_get_user(user_id: str):
         db.expunge(user)  # 解绑：防止后续在 async 主程中使用其属性时触发 detached 异常
         return user
 
-def _update_lms_settings(user_id: str, depth_preference, new_topic_appetite):
+
+def _fetch_user_settings_dict(user_id: str) -> dict:
+    """供 WS 握手返回：当前用户在 DB 中的 settings JSON（LMS / learner_level 等）。"""
+    if not user_id:
+        return {}
+    with get_db() as db:
+        from database import User as UserModel
+        u = db.query(UserModel).filter(UserModel.id == user_id).first()
+        return dict(u.settings or {}) if u else {}
+
+
+def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite=None, learner_level=None):
     """Update LMS parameters in User.settings (thread-safe sync)."""
     if not user_id:
         return
@@ -238,9 +275,15 @@ def _update_lms_settings(user_id: str, depth_preference, new_topic_appetite):
                 settings["depth_preference"] = float(depth_preference)
             if new_topic_appetite is not None:
                 settings["new_topic_appetite"] = float(new_topic_appetite)
+            if learner_level is not None:
+                settings["learner_level"] = str(learner_level).strip()
             user.settings = settings
             db.commit()
-            logger.info(f"[LMS] Settings updated: depth={settings.get('depth_preference')}, appetite={settings.get('new_topic_appetite')}")
+            logger.info(
+                f"[LMS] Settings updated: depth={settings.get('depth_preference')}, "
+                f"appetite={settings.get('new_topic_appetite')}, "
+                f"learner_level={settings.get('learner_level')}"
+            )
 
 
 def update_user_politeness(user_id: str, level: int):
@@ -369,13 +412,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         else DEFAULT_TOPIC_ID
     )
 
-    initial_prompt = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
+    initial_prompt = build_dynamic_prompt(
+        current_user, is_flipped, session_ctx, current_task_packet, session_hits
+    )
     chat_history = [{"role": "system", "content": initial_prompt}]
 
     if current_user:
         with get_db() as db:
-            await evaluate_and_check_progress(db, current_user.id, topic_id_for_progress, "",
-                                              session_hits, session_ctx, websocket, ws_lock)
+            await evaluate_and_check_progress(
+                db, current_user.id, topic_id_for_progress, "",
+                session_hits, session_ctx, websocket, ws_lock,
+                task_packet=current_task_packet,
+            )
+            chat_history[0]["content"] = build_dynamic_prompt(
+                current_user, is_flipped, session_ctx, current_task_packet, session_hits
+            )
 
     try:
         while True:
@@ -411,13 +462,28 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     current_user = await run_in_threadpool(init_or_get_user, payload_user_id)
 
                 if action == "ping":
-                    await safe_send_ws(websocket, ws_lock, {"event": "warmup_success"})
+                    ws_payload: dict = {"event": "warmup_success"}
+                    uid = payload_user_id or (current_user.id if current_user else None)
+                    if uid:
+                        if not current_user:
+                            current_user = await run_in_threadpool(init_or_get_user, uid)
+                        st = await run_in_threadpool(_fetch_user_settings_dict, uid)
+                        if st:
+                            ws_payload["user_settings"] = st
+                            logger.info(
+                                "[WS] warmup_success + user_settings for %s keys=%s",
+                                uid[:8] if len(uid) > 8 else uid,
+                                list(st.keys()),
+                            )
+                    await safe_send_ws(websocket, ws_lock, ws_payload)
                     continue
 
                 if action == "swap_role":
                     is_flipped = not is_flipped
                     session_ctx["phase"], session_ctx["phase_turns"] = "ICE_BREAKING", 0
-                    chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
+                    chat_history[0]["content"] = build_dynamic_prompt(
+                        current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                    )
                     await safe_send_ws(websocket, ws_lock, {"event": "role_swapped", "is_flipped": is_flipped})
                     continue
 
@@ -425,8 +491,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     if current_user:
                         depth = data.get("depth_preference")
                         appetite = data.get("new_topic_appetite")
+                        learner_level = data.get("learner_level")
                         await run_in_threadpool(
-                            _update_lms_settings, current_user.id, depth, appetite
+                            _update_lms_settings, current_user.id, depth, appetite, learner_level
+                        )
+                        current_user = await run_in_threadpool(init_or_get_user, current_user.id)
+                        chat_history[0]["content"] = build_dynamic_prompt(
+                            current_user, is_flipped, session_ctx, current_task_packet, session_hits
                         )
                     continue
 
@@ -435,7 +506,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         level = data.get("level", 1)
                         await run_in_threadpool(update_user_politeness, current_user.id, level)
                         current_user.politeness_level = level
-                        chat_history[0]["content"] = build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet)
+                        chat_history[0]["content"] = build_dynamic_prompt(
+                            current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                        )
                     continue
 
                 if action == "request_topic":
@@ -446,6 +519,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         await safe_send_ws(websocket, ws_lock, {
                             "event": "topic_generating",
                             "message": f"Finding the best match for: {description}",
+                            "message_zh": f"正在为你匹配练习场景：{description}",
                         })
                         try:
                             new_topic = await topic_generator.get_or_generate_topic(
@@ -470,12 +544,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             session_ctx = SessionContext()
                             chat_history = [{
                                 "role": "system",
-                                "content": build_dynamic_prompt(current_user, is_flipped, session_ctx, current_task_packet),
+                                "content": build_dynamic_prompt(
+                                    current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                                ),
                             }]
                             await safe_send_ws(websocket, ws_lock, {
                                 "event": "topic_changed",
                                 "topic_id": current_task_packet.topic_id,
                                 "topic_title": current_task_packet.topic_title,
+                                "topic_title_zh": getattr(
+                                    current_task_packet, "topic_title_zh", None
+                                ),
                                 "role_name": current_task_packet.role_name,
                                 "depth_tier": current_task_packet.depth_tier,
                                 "session_id": session_id,
@@ -487,6 +566,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 "event": "error",
                                 "code": "TOPIC_GENERATION_FAILED",
                                 "message": "Could not generate topic. Please try again.",
+                                "message_zh": "暂时无法生成话题，请稍后再试。",
                             })
                     continue
                 
@@ -547,8 +627,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     # 2. 状态机评估 (开启新 DB 会话，避免跨会话 Detached 错误)
                     if current_user:
                         with get_db() as db:
-                            await evaluate_and_check_progress(db, current_user.id, topic_id_for_progress, user_text,
-                                                              session_hits, session_ctx, websocket, ws_lock)
+                            await evaluate_and_check_progress(
+                                db, current_user.id, topic_id_for_progress, user_text,
+                                session_hits, session_ctx, websocket, ws_lock,
+                                task_packet=current_task_packet,
+                            )
 
                             fresh_topic = db.query(Topic).filter(Topic.id == topic_id_for_progress).first()
                             did_transition = advance_state_machine(
@@ -597,7 +680,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     logger.info(f"[LMS] New session '{current_task_packet.topic_title}' tier={current_task_packet.depth_tier} id={session_id[:8]}")
 
                                 chat_history[0]["content"] = build_dynamic_prompt(
-                                    current_user, is_flipped, session_ctx, current_task_packet
+                                    current_user, is_flipped, session_ctx, current_task_packet, session_hits
                                 )
 
                     chat_history.append({"role": "user", "content": f"[{user_emotion} tone] {user_text}"})

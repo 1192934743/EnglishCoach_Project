@@ -37,7 +37,11 @@ from sqlalchemy.orm import Session
 from fastapi import WebSocket
 
 from database import User, Topic, TargetNode, UserProgress
-from domain.entities.task_packet import TaskPacket, compute_max_reply_sentences
+from domain.entities.task_packet import (
+    TaskPacket,
+    compute_max_reply_sentences,
+    effective_learner_label,
+)
 from application.services.mastery_scorer import (
     update_mastery, L1_EXACT_QUALITY, L1_STEM_QUALITY,
     normalize_text, simple_stem,
@@ -110,6 +114,61 @@ def clean_llm_json(raw_text: str) -> dict:
 
     raise ValueError("LLM returned malformed JSON that could not be parsed.")
 
+
+def _cognitive_load_line(rules: dict, canonical: str) -> Optional[str]:
+    cog = rules.get("cognitive_load_levels") or {}
+    line = cog.get(canonical)
+    if line is not None:
+        return str(line)
+    return None
+
+
+def _preload_new_targets_if_empty(
+    db: Session,
+    session_ctx: dict,
+    task_packet: Optional[TaskPacket],
+    topic_id: int,
+) -> None:
+    """本局 new_targets 为空时，从 TaskPacket 或 DB 预取最多 3 个节点（排除已在 history 中的 id）。"""
+    if session_ctx.get("new_targets"):
+        return
+    used_ids = {n.get("id") for n in session_ctx.get("history_targets", []) if n.get("id") is not None}
+    if task_packet is not None:
+        available = [
+            n for n in task_packet.all_practice_nodes
+            if n.get("id") is not None and n.get("id") not in used_ids
+        ]
+        available.sort(key=lambda n: (int(n.get("depth_level") or 1), int(n.get("id") or 0)))
+        session_ctx["new_targets"] = available[:3]
+        if session_ctx["new_targets"]:
+            logger.info(
+                f"[L1] Preloaded new_targets from TaskPacket: "
+                f"{[n.get('node_text') for n in session_ctx['new_targets']]}"
+            )
+        return
+    if not topic_id:
+        session_ctx["new_targets"] = []
+        return
+    all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic_id).all()
+    candidates = [n for n in all_nodes if n.id not in used_ids]
+    candidates.sort(key=lambda n: (n.depth_level or 1, n.id))
+    selected = candidates[:3]
+    session_ctx["new_targets"] = [
+        {
+            "id": n.id,
+            "node_text": n.node_text,
+            "node_type": n.node_type,
+            "depth_level": n.depth_level,
+        }
+        for n in selected
+    ]
+    if session_ctx["new_targets"]:
+        logger.info(
+            f"[L1] Preloaded new_targets from DB: "
+            f"{[n.get('node_text') for n in session_ctx['new_targets']]}"
+        )
+
+
 # ================= 核心提示词构建 =================
 
 def build_dynamic_prompt(
@@ -117,6 +176,7 @@ def build_dynamic_prompt(
     is_flipped: bool,
     session_ctx: dict,
     task_packet: Optional[TaskPacket] = None,
+    session_hits: Optional[set] = None,
 ):
     """
     Prompt 组装入口。
@@ -126,8 +186,12 @@ def build_dynamic_prompt(
     2. task_packet 为 None  → 降级到 scenes.json（兼容模式，用于测试/迁移期）
 
     所有英文文案模板仍从 global_rules.json 加载，本函数只负责结构拼接与变量注入。
+
+    session_hits: 当前局已命中的节点 id，用于 CORE_TASK 下拆分必做/复习目标。
     """
     rules = load_global_rules()
+    if session_hits is None:
+        session_hits = set()
 
     if task_packet is not None:
         # ── LMS 主导模式：从 TaskPacket 读取场景三元组 ──────────────────────
@@ -136,9 +200,7 @@ def build_dynamic_prompt(
         user_level = task_packet.learner_level
         scene_specific_rules = task_packet.scene_specific_rules
         depth_tier_val = int(task_packet.depth_tier or 1)
-        max_reply_sentences = int(task_packet.max_reply_sentences or 0) or compute_max_reply_sentences(
-            user_level, depth_tier_val
-        )
+        # max_reply_sentences 在 canonical 计算后统一赋值（忽略组包快照，避免与 user.settings 分叉）
 
         # 将 session_goal 注入 prompt（帮助 AI 理解本次练习意图）
         session_goal_line = (
@@ -153,7 +215,21 @@ def build_dynamic_prompt(
         scene_specific_rules = active_scene.get("scene_specific_rules", [])
         session_goal_line = ""
         depth_tier_val = 1
-        max_reply_sentences = compute_max_reply_sentences(user_level, depth_tier_val)
+
+    # 单一权威等级带：用户 settings > TaskPacket / 场景默认；句数 cap 始终由此 + tier 推导
+    settings_dict = (user.settings or {}) if user and getattr(user, "settings", None) else None
+    canonical_level = effective_learner_label(
+        settings_dict,
+        task_packet.learner_level if task_packet else None,
+        user_level,
+    )
+    user_level = canonical_level
+    max_reply_sentences = compute_max_reply_sentences(canonical_level, depth_tier_val)
+
+    logger.info(
+        f"[Prompt] canonical_level={canonical_level} tier={depth_tier_val} "
+        f"max_reply={max_reply_sentences} phase={session_ctx.get('phase', 'ICE_BREAKING')}"
+    )
 
     phase = session_ctx.get("phase", "ICE_BREAKING")
     loop_count = session_ctx.get("loop_count", 1)
@@ -183,8 +259,22 @@ def build_dynamic_prompt(
         "",
     ]
 
-    # ── 通用规则 ────────────────────────────────────────────────────────────
-    universal_rules = rules.get("universal_rules", [])
+    # ── 认知负荷（canonical 键直查 cognitive_load_levels）────────────────────
+    cog_line = _cognitive_load_line(rules, canonical_level)
+    if not cog_line:
+        cog_line = _cognitive_load_line(rules, "Intermediate")
+        logger.warning(
+            f"[Prompt] No cognitive_load_levels entry for '{canonical_level}', "
+            f"falling back to Intermediate text."
+        )
+    if cog_line:
+        prompt_blocks.append("[COGNITIVE LOAD GUIDELINE]")
+        prompt_blocks.append(str(cog_line))
+        prompt_blocks.append("")
+
+    # ── 通用规则（按等级分档；缺省回退 universal_rules）────────────────────────
+    by_level = rules.get("universal_rules_by_level") or {}
+    universal_rules = by_level.get(canonical_level) or rules.get("universal_rules", [])
     if universal_rules:
         prompt_blocks.append("[UNIVERSAL COACHING RULES]")
         for i, rule in enumerate(universal_rules, 1):
@@ -221,27 +311,37 @@ def build_dynamic_prompt(
     if phase == "ICE_BREAKING":
         prompt_blocks.append(directive.get("header", "PHASE 1: ICE BREAKING (Small Talk)"))
         prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
-        prompt_blocks.append(directive.get("firewall", ""))
+        fw = directive.get("firewall", "")
+        if fw:
+            prompt_blocks.append(fw)
         prompt_blocks.append(directive.get("advance", ""))
 
     elif phase == "CORE_TASK":
-        new_targets_list = [n.get("node_text") for n in session_ctx.get("new_targets", []) if n.get("node_text")]
-        history_targets_list = [n.get("node_text") for n in session_ctx.get("history_targets", []) if n.get("node_text")]
-        new_targets = ", ".join([f"'{t}'" for t in new_targets_list])
-        history_targets = ", ".join([f"'{t}'" for t in history_targets_list])
+        new_targets_list = session_ctx.get("new_targets", [])
+        history_targets_list = session_ctx.get("history_targets", [])
+        all_active = new_targets_list + history_targets_list
+        unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
+        hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
+        unhit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]) or "(none — great job)"
+        hit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]) or "(none yet)"
 
         prompt_blocks.append(directive.get("header", "PHASE 2: CORE TASK (Language Practice)"))
         prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
-        prompt_blocks.append(directive.get("directive", "").format(new_targets=new_targets))
-        if history_targets:
-            prompt_blocks.append(directive.get("history", "").format(history_targets=history_targets))
+        prompt_blocks.append(
+            directive.get("directive", "").format(unhit_targets=unhit_targets)
+        )
+        prompt_blocks.append(directive.get("history", "").format(hit_targets=hit_targets))
         prompt_blocks.append(directive.get("coaching", "").format(role_name=role_name))
         prompt_blocks.append(directive.get("advance", ""))
 
     elif phase == "EVENT_EXTENSION":
         current_event = session_ctx.get("current_event", "There is a small problem with your request.")
         prompt_blocks.append(directive.get("header", "PHASE 3: EVENT EXTENSION (The Twist)"))
-        prompt_blocks.append(directive.get("goal", ""))
+        goal_tmpl = directive.get("goal", "")
+        try:
+            prompt_blocks.append(goal_tmpl.format(current_event=current_event))
+        except (KeyError, ValueError):
+            prompt_blocks.append(goal_tmpl)
         prompt_blocks.append(directive.get("override", "").format(current_event=current_event))
         prompt_blocks.append(directive.get("coach_role", ""))
         prompt_blocks.append(directive.get("advance", ""))
@@ -251,10 +351,13 @@ def build_dynamic_prompt(
         prompt_blocks.append(directive.get("goal", ""))
         prompt_blocks.append(directive.get("advance", ""))
 
-    if phase == "ICE_BREAKING" and max_reply_sentences <= 2:
+    # 初学者：禁止一句里连问两个要回答的点；但不等于整轮只能说一句话（见 OUTPUT BUDGET 句数）
+    if canonical_level in ("Beginner", "Elementary") or max_reply_sentences <= 3:
         prompt_blocks.append(
-            "SESSION TIGHT BUDGET: In ICE BREAKING, use at most ONE open-ended question in this turn "
-            "(a greeting plus one question still counts as ≤2 sentences)."
+            "[QUESTION BUDGET] Within your [OUTPUT BUDGET] sentence allowance: at most **one** question "
+            "that expects an answer from the learner this turn. You may use other short sentences for "
+            "greeting or acknowledgment. Do NOT put two answerable questions in the same sentence "
+            "(e.g. avoid 'Would you like a drink, and what size?'). If you need two details, split across turns."
         )
 
     # Recency: models often overweight later instructions; repeat length cap after phase text.
@@ -269,7 +372,8 @@ def build_dynamic_prompt(
 # ================= 核心计分与状态机 =================
 
 async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int, user_text: str, session_hits: set,
-                                      session_ctx: dict, websocket: WebSocket, ws_lock: asyncio.Lock):
+                                      session_ctx: dict, websocket: WebSocket, ws_lock: asyncio.Lock,
+                                      task_packet: Optional[TaskPacket] = None):
     """
     L1 评估层：轻量同步，每轮对话触发。
 
@@ -280,8 +384,11 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
     4. 更新 last_practiced_at（之前从未更新）
 
     @param _topic_id: 保留作备用，供后续话题维度细粒度统计。
+    @param task_packet: 用于在 new_targets 为空时从 LMS 预加载节点。
     """
     try:
+        _preload_new_targets_if_empty(db, session_ctx, task_packet, _topic_id)
+
         phase = session_ctx.get("phase", "ICE_BREAKING")
 
         # --- 计分模块 1：闲聊分 (40%) ---
@@ -294,14 +401,14 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                     session_ctx["chat_interaction_count"] = chat_idx + 1
                     logger.info(f"[L1] Chat curve step {chat_idx+1} (+{added_score:.1f}) | total={session_ctx['chat_score']:.1f}/40")
 
-        # --- 计分模块 2：核心任务 L1 命中检测 (60%) ---
-        is_core_task = (phase == "CORE_TASK")
+        # --- 计分模块 2：核心任务 L1 命中检测 (60%) — 全阶段（含 ICE）扫描 active 词表 ---
         new_targets = session_ctx.get("new_targets", [])
         history_targets = session_ctx.get("history_targets", [])
         all_active_targets = new_targets + history_targets
 
-        if is_core_task and all_active_targets:
-            points_per_new_word = 60.0 / len(new_targets) if new_targets else 10.0
+        if user_text.strip() and all_active_targets:
+            denom = max(1, len(new_targets) if new_targets else len(all_active_targets))
+            points_per_new_word = 60.0 / denom
 
             # 规范化用户输入（缩写展开，仅做一次）
             user_normalized = normalize_text(user_text)
@@ -357,14 +464,23 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
         current_round_score = session_ctx.get("chat_score", 0.0) + session_ctx.get("task_score", 0.0)
         overall_progress = min(100.0, ((completed_rounds * 100.0) + current_round_score) / float(ROUNDS_PER_LEVEL))
 
+        last_sent = session_ctx.get("_ws_last_progress")
+        skip_ws = (
+            phase == "ICE_BREAKING"
+            and last_sent is not None
+            and abs(overall_progress - float(last_sent)) < 2.5
+        )
+
         try:
-            async with ws_lock:
-                await websocket.send_text(json.dumps({
-                    "event": "topic_mastery_reached",
-                    "progress": overall_progress,
-                    "level": session_ctx.get("current_level", 1),
-                    "next_topic_suggestion": ""
-                }))
+            if not skip_ws:
+                async with ws_lock:
+                    await websocket.send_text(json.dumps({
+                        "event": "topic_mastery_reached",
+                        "progress": overall_progress,
+                        "level": session_ctx.get("current_level", 1),
+                        "next_topic_suggestion": ""
+                    }))
+                session_ctx["_ws_last_progress"] = overall_progress
         except Exception as e:
             logger.error(f"Ws send progress error: {e}")
 
@@ -426,30 +542,11 @@ def advance_state_machine(
         session_ctx["phase"] = "CORE_TASK"
         session_ctx["phase_turns"] = 0
         session_ctx["llm_wants_to_advance"] = False
-
-        old_new = session_ctx.get("new_targets", [])
-        session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
-        used_ids = {n.get("id") for n in session_ctx["history_targets"] if n.get("id") is not None}
-
-        if task_packet is not None:
-            # ── LMS 主导：使用 TaskPacket 中的节点 ─────────────────────────
-            available = [n for n in task_packet.all_practice_nodes if n.get("id") not in used_ids]
-            session_ctx["new_targets"] = available[:3]  # 每轮最多 3 个新节点
-            if not available:
-                logger.warning("⚠️ TaskPacket 无可用目标节点，CORE_TASK 将作为普通对话进行。")
-            else:
-                logger.info(f"🔄 [推进] 进入核心考核（TaskPacket 模式）！本轮词: {[n.get('node_text') for n in session_ctx['new_targets']]}")
-        else:
-            # ── 兼容模式：从 DB 随机采样 ────────────────────────────────────
-            all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == current_topic.id).all() if current_topic else []
-            available_db = [n for n in all_nodes if n.id not in used_ids]
-            selected_nodes = random.sample(available_db, min(2, len(available_db))) if available_db else []
-            session_ctx["new_targets"] = [{"id": n.id, "node_text": n.node_text} for n in selected_nodes]
-            if not all_nodes:
-                logger.warning("⚠️ Topic 无目标词，CORE_TASK 将作为普通聊天进行。")
-            else:
-                logger.info(f"🔄 [推进] 进入核心考核（兼容模式）！本轮新词: {[n.get('node_text') for n in session_ctx['new_targets']]}")
-
+        # new_targets 已在 evaluate 阶段预加载，此处不再合并 history / 重新抽词
+        logger.info(
+            "🔄 [推进] ICE_BREAKING -> CORE_TASK（沿用预加载词表）: "
+            f"{[n.get('node_text') for n in session_ctx.get('new_targets', [])]}"
+        )
         transitioned = True
 
     elif phase == "CORE_TASK" and (llm_signal or force_advance):
@@ -491,7 +588,14 @@ def advance_state_machine(
 
             logger.info(f"🎉🎉🎉 [状态机结算] 恭喜突破！成功晋级至 Lv.{session_ctx['current_level']}，词表重置 🎉🎉🎉")
         else:
-            logger.info(f"🔄 [状态机结算] 进入本段位第 {session_ctx['completed_rounds_in_level'] + 1} 轮！词汇继续滚雪球。")
+            # 未满 3 局晋级：本局词并入 history，清空 new_targets 以便下一轮 evaluate 重新预加载
+            old_new = session_ctx.get("new_targets", [])
+            session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
+            session_ctx["new_targets"] = []
+            logger.info(
+                f"🔄 [状态机结算] 进入本段位第 {session_ctx['completed_rounds_in_level'] + 1} 轮；"
+                f"已合并 {len(old_new)} 个节点到 history，等待预加载新词。"
+            )
 
         transitioned = True
 

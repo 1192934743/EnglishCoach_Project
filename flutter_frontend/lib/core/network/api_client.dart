@@ -6,9 +6,13 @@
 import 'dart:convert';
 import 'package:http/http.dart' as http;
 
+import 'backend_config.dart';
+
 class ApiClient {
-  // Keep in sync with WebSocketClient._url
-  static const String _baseUrl = "http://172.20.10.4:8000";
+  static String get _baseUrl => kBackendHttpBase;
+
+  /// 调试：当前请求所用的根地址（与 WebSocket 同源配置）。
+  static String get resolvedBaseUrl => kBackendHttpBase;
 
   static Future<Map<String, dynamic>> getTopics({String? userId}) async {
     final uri = Uri.parse('$_baseUrl/api/topics').replace(

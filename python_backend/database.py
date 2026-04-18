@@ -1,5 +1,7 @@
 import uuid
 import datetime
+from typing import Optional
+
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -16,7 +18,8 @@ class User(Base):
     level = Column(Integer, default=1)
     politeness_level = Column(Integer, default=1)
     assessment_done = Column(Boolean, default=False)
-    # depth_preference (1.0~5.0), new_topic_appetite (0.0~1.0), learning_mode ("freeform"/"curriculum")
+    # depth_preference (1.0~5.0), new_topic_appetite (0.0~1.0), learning_mode ("freeform"/"curriculum"),
+    # learner_level (str, e.g. Beginner/Intermediate) — synced from app for cognitive-load prompts
     settings = Column(JSON, default=lambda: {
         "depth_preference": 1.0,
         "new_topic_appetite": 0.2,
@@ -28,6 +31,8 @@ class Topic(Base):
     __tablename__ = 'topics'
     id = Column(Integer, primary_key=True, autoincrement=True)
     title = Column(String, nullable=False)
+    # 中文界面展示用；与 title（英文 canonical）对应，可为空（旧数据 / 未回填）
+    title_zh = Column(String, nullable=True)
     category = Column(String)
     difficulty_base = Column(Integer, default=1)
     system_prompt = Column(String)
@@ -119,6 +124,7 @@ def init_db():
     # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
     mcdonalds = Topic(
         title="McDonald's Ordering",
+        title_zh="麦当劳点餐",
         category="Food & Drink",
         role_name="Fast-food Server",
         learner_level="Beginner",
@@ -169,6 +175,7 @@ def init_db():
     # ── 话题2：技术面试（专业级）────────────────────────────────────────────
     interview = Topic(
         title="Technical Job Interview",
+        title_zh="技术岗位面试",
         category="Career & Professional",
         role_name="Senior Tech Lead",
         learner_level="Professional",
@@ -214,6 +221,7 @@ def init_db():
     # ── 话题3：日常闲聊（中级）──────────────────────────────────────────────
     casual = Topic(
         title="Daily Casual Conversation",
+        title_zh="日常闲聊",
         category="Daily Life",
         role_name="Language Partner",
         learner_level="Intermediate",
@@ -257,6 +265,72 @@ def init_db():
     db.commit()
     db.close()
     print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
+
+
+# 旧库升级 / API 展示：英文 canonical 标题 → 中文名（与 Flutter `_kTopicTitleZh` 对齐）
+_TITLE_ZH_SEED = {
+    "McDonald's Ordering": "麦当劳点餐",
+    "Technical Job Interview": "技术岗位面试",
+    "Daily Casual Conversation": "日常闲聊",
+    "General English Conversation": "通用英语对话",
+    "Daily Conversation": "日常对话",
+    "Simulation Practice": "场景模拟对练",
+}
+
+
+def _normalize_topic_title_key(title: Optional[str]) -> str:
+    """统一弯引号、首尾空格，便于与种子表匹配。"""
+    if not title:
+        return ""
+    s = str(title).strip().replace("\u2019", "'").replace("\u2018", "'")
+    return s
+
+
+def topic_title_zh_fallback(english_title: Optional[str]) -> Optional[str]:
+    """仅 DB 未存 title_zh 时使用：按英文标题查内置映射（大小写不敏感）。"""
+    key = _normalize_topic_title_key(english_title)
+    if not key:
+        return None
+    if key in _TITLE_ZH_SEED:
+        return _TITLE_ZH_SEED[key]
+    lower = key.lower()
+    for k, v in _TITLE_ZH_SEED.items():
+        if k.lower() == lower:
+            return v
+    return None
+
+
+def effective_topic_title_zh(topic: Topic) -> Optional[str]:
+    """展示用中文标题：优先 DB `title_zh`，否则内置英文→中文表。"""
+    raw = getattr(topic, "title_zh", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return topic_title_zh_fallback(getattr(topic, "title", None))
+
+
+def ensure_schema_upgrades() -> None:
+    """在 ORM 访问前调用：为已有 english_coach.db 追加 topics.title_zh 并尽量回填。"""
+    from sqlalchemy import text
+
+    if engine.dialect.name != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.execute(text("PRAGMA table_info(topics)")).fetchall()
+        colnames = {r[1] for r in rows}
+        if "title_zh" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN title_zh VARCHAR"))
+
+    db = SessionLocal()
+    try:
+        for t in db.query(Topic).all():
+            if (getattr(t, "title_zh", None) or "").strip():
+                continue
+            zh = topic_title_zh_fallback(getattr(t, "title", None))
+            if zh:
+                t.title_zh = zh
+        db.commit()
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
