@@ -293,11 +293,11 @@ async def get_stats(user_id: str = Query(...)):
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 音频防爆限制：5MB
-MAX_BUFFER_CHARS = 38              # 无标点时略缩短，更快送入 TTS
+MAX_BUFFER_CHARS = 32              # 无标点时更快 flush，略减首包 TTS 等待
 # 首段语音：不等长句标点也可提前合成（避免首句卡在句号前）
-FIRST_TTS_EARLY_FLUSH_CHARS = 22
-# chat_history token 预算：4 chars ≈ 1 token（粗估），给模型上下文留足余量
-MAX_CONTEXT_TOKENS = 2000          # 进入 LLM 前历史消息的 token 上限（含 system prompt）
+FIRST_TTS_EARLY_FLUSH_CHARS = 18
+# chat_history token 预算：4 chars ≈ 1 token（粗估）；略收紧以缩短 LLM 首包与总耗时
+MAX_CONTEXT_TOKENS = 1700        # 进入 LLM 前历史消息的 token 上限（含 system prompt）
 
 
 def _latency_log(lat: dict, stage: str, **kwargs) -> None:
@@ -309,6 +309,31 @@ def _latency_log(lat: dict, stage: str, **kwargs) -> None:
     ms = (time.perf_counter() - float(t0)) * 1000.0
     extra = (" " + " ".join(f"{k}={v!r}" for k, v in kwargs.items())) if kwargs else ""
     logger.info("[LATENCY] turn=%s stage=%-28s cum=%8.1fms%s", tid, stage, ms, extra)
+
+
+def _coerce_turn_trace_id(raw) -> str:
+    """与客户端 trace_id 对齐；合法则用作 turn_id，否则服务端生成短 id。"""
+    if not isinstance(raw, str):
+        return uuid.uuid4().hex[:8]
+    s = raw.strip().replace("-", "")
+    if 4 <= len(s) <= 32 and s.isalnum():
+        return s.lower()
+    return uuid.uuid4().hex[:8]
+
+
+def _e2e_log_client_report(data: dict) -> None:
+    """客户端在 tts_finished 后上报的纯端上耗时，便于与 [LATENCY] 同 turn 对照。"""
+    tid_raw = data.get("trace_id")
+    tid = tid_raw.strip()[:32].lower() if isinstance(tid_raw, str) and tid_raw.strip() else "?"
+    logger.info(
+        "[E2E] turn=%s client_submit_to_first_pcm_ms=%r client_submit_to_tts_finished_ms=%r "
+        "had_first_pcm=%r client_report_wall_ms=%r",
+        tid,
+        data.get("submit_to_first_pcm_ms"),
+        data.get("submit_to_tts_finished_ms"),
+        data.get("had_first_pcm"),
+        data.get("client_report_wall_ms"),
+    )
 
 
 # ================= 数据库上下文 =================
@@ -597,6 +622,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 if payload_user_id and not current_user:
                     current_user = await run_in_threadpool(init_or_get_user, payload_user_id)
 
+                if action == "client_latency_report":
+                    _e2e_log_client_report(data)
+                    continue
+
                 if action == "ping":
                     ws_payload: dict = {"event": "warmup_success"}
                     uid = payload_user_id or (current_user.id if current_user else None)
@@ -745,16 +774,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 if action in ["user_finish_speaking", "test_text_input"]:
                     is_test_mode = (action == "test_text_input")
                     asr_partial_last_mono = 0.0
+                    turn_id = _coerce_turn_trace_id(data.get("trace_id"))
+                    wall_recv_ms = int(time.time() * 1000)
+                    csw = data.get("client_submit_wall_ms")
+                    client_wall_ok = isinstance(csw, int) and csw > 0
                     lat: dict = {
-                        "turn_id": uuid.uuid4().hex[:8],
+                        "turn_id": turn_id,
                         "t0": time.perf_counter(),
                     }
-                    _latency_log(
-                        lat,
-                        "01_turn_accepted",
-                        action=action,
-                        test_mode=is_test_mode,
-                    )
+                    if client_wall_ok:
+                        lat["client_submit_wall_ms"] = int(csw)
+                    _kwargs_01: dict = {
+                        "action": action,
+                        "test_mode": is_test_mode,
+                        "wall_recv_ms": wall_recv_ms,
+                    }
+                    if client_wall_ok:
+                        _kwargs_01["client_submit_wall_ms"] = int(csw)
+                        skew_hint_ms = wall_recv_ms - int(csw)
+                        _kwargs_01["wall_skew_hint_ms"] = skew_hint_ms
+                    _latency_log(lat, "01_turn_accepted", **_kwargs_01)
 
                     # 1. 语音转文本
                     if is_test_mode:
@@ -870,6 +909,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     _latency_log(lat, "03_l1_and_prompt_ready", logged_in=bool(current_user))
 
                     chat_history.append({"role": "user", "content": f"[{user_emotion} tone] {user_text}"})
+                    # 本轮请求发出前就裁剪，降低 prompt 体积、改善 04b～05 延迟（末尾 user 保留）
+                    chat_history = trim_chat_history(chat_history)
 
                     # 3. 准备并发 TTS 任务
                     if not is_test_mode:
@@ -899,7 +940,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     # 4. LLM 流式对话（包含首包连接 + 全量 chunk 消费，统一超时保护）
                     raw_full_reply = ""
                     sentence_buffer = ""
-                    punctuation_marks = ['.', '!', '?', ',', '。', '！', '？', '，', '\n']
+                    punctuation_marks = [
+                        '.', '!', '?', ',', ';', '。', '！', '？', '，', '；', '\n',
+                    ]
                     early_head_flush_used = False
                     _lat_flags = {"llm_first": False, "tts_enqueue": False}
 
@@ -912,8 +955,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             chat_messages=len(chat_history),
                         )
                         response = await client.chat.completions.create(
-                            model="deepseek-chat", messages=chat_history,
-                            max_tokens=LLM_MAX_TOKENS, stream=True
+                            model="deepseek-chat",
+                            messages=chat_history,
+                            max_tokens=LLM_MAX_TOKENS,
+                            stream=True,
                         )
                         _latency_log(lat, "04b_llm_stream_iterable_ready")
                         async for chunk in response:

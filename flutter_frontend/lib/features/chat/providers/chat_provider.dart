@@ -7,6 +7,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:record/record.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:audio_session/audio_session.dart';
+import 'package:uuid/uuid.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/network/user_manager.dart';
@@ -125,13 +126,18 @@ class ChatNotifier extends Notifier<ChatState> {
   /// 端到端延迟排查：从 stopListeningAndSubmit 到首包 PCM 的客户端阶段
   Stopwatch? _latencySw;
   bool _latencyLoggedFirstPcm = false;
+  /// 与后端 [LATENCY]/[E2E] 对齐的轮次 id（随 user_finish_speaking 上报）
+  String? _latencyTurnId;
+  int? _latencyFirstPcmMs;
 
   void _latencyLogClient(String stage, [String extra = '']) {
     final sw = _latencySw;
     if (sw == null) return;
     final ms = sw.elapsedMilliseconds;
     final tail = extra.isEmpty ? '' : ' $extra';
-    debugPrint('[LATENCY][client] $stage +${ms}ms$tail');
+    final tid = _latencyTurnId;
+    final turnSeg = (tid != null && tid.isNotEmpty) ? 'turn=$tid ' : '';
+    debugPrint('[LATENCY][client] $turnSeg$stage +${ms}ms$tail');
   }
 
   @override
@@ -349,6 +355,7 @@ class ChatNotifier extends Notifier<ChatState> {
       if (state.status == ChatStatus.speaking && _player.isPlaying) {
         if (!_latencyLoggedFirstPcm) {
           _latencyLoggedFirstPcm = true;
+          _latencyFirstPcmMs = _latencySw?.elapsedMilliseconds;
           _latencyLogClient(
             '05_first_pcm_chunk',
             'len=${audioBytes.length}',
@@ -371,6 +378,18 @@ class ChatNotifier extends Notifier<ChatState> {
     _isAutoLooping = true;
     _latencyLogClient('06_tts_finished_event');
 
+    final tid = _latencyTurnId;
+    final sw = _latencySw;
+    if (tid != null && tid.isNotEmpty && sw != null) {
+      ref.read(websocketProvider).sendCommand('client_latency_report', {
+        'trace_id': tid,
+        'submit_to_first_pcm_ms': _latencyFirstPcmMs,
+        'submit_to_tts_finished_ms': sw.elapsedMilliseconds,
+        'had_first_pcm': _latencyFirstPcmMs != null,
+        'client_report_wall_ms': DateTime.now().millisecondsSinceEpoch,
+      });
+    }
+
     if (_playbackStartTime != null && _totalBytesReceived > 0) {
       int durationMs = (_totalBytesReceived / 48.0).ceil();
       int elapsedMs = DateTime.now()
@@ -388,6 +407,8 @@ class ChatNotifier extends Notifier<ChatState> {
     _playbackStartTime = null;
     _totalBytesReceived = 0;
     _latencySw = null;
+    _latencyTurnId = null;
+    _latencyFirstPcmMs = null;
 
     // Fix B7: do not auto-start while the session report card is visible
     if (ref.read(settingsProvider).autoMode && !_reportShowing) {
@@ -449,11 +470,10 @@ class ChatNotifier extends Notifier<ChatState> {
           .listen((amp) {
             if (state.status != ChatStatus.listening) return;
             final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-            // Fix B3: raised threshold -25 → -35 dBFS; min frames 5 → 4（约 400ms 有声）再判「已开口」，
-            // 略缩有效句长、更快进入静默计时。
+            // Fix B3: raised threshold -25 → -35 dBFS；连续 3 帧有声（~300ms）即判已开口，更快进入静默计时。
             if (amp.current > -35.0) {
               _noiseFrames++;
-              if (_noiseFrames > 3) {
+              if (_noiseFrames > 2) {
                 _hasSpoken = true;
                 _silenceTimer?.cancel();
               }
@@ -482,8 +502,10 @@ class ChatNotifier extends Notifier<ChatState> {
 
   Future<void> stopListeningAndSubmit() async {
     if (state.status != ChatStatus.listening) return;
-    _latencySw = Stopwatch()..start();
+    _latencyTurnId = const Uuid().v4().replaceAll('-', '');
+    _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
+    _latencySw = Stopwatch()..start();
     _latencyLogClient('01_stopListening_submit_start');
     try {
       await _recorder.stop();
@@ -501,18 +523,27 @@ class ChatNotifier extends Notifier<ChatState> {
       );
       _latencyLogClient('03_player_stream_ready');
       final userId = await UserManager.getOrCreateUuid();
+      final wallMs = DateTime.now().millisecondsSinceEpoch;
       ref.read(websocketProvider).sendCommand("user_finish_speaking", {
         "user_id": userId,
+        "trace_id": _latencyTurnId,
+        "client_submit_wall_ms": wallMs,
       });
       _latencyLogClient('04_ws_user_finish_sent');
     } catch (_) {
       _latencySw = null;
+      _latencyTurnId = null;
+      _latencyFirstPcmMs = null;
+      _latencyLoggedFirstPcm = false;
       forceIdle();
     }
   }
 
   Future<void> forceIdle() async {
     _latencySw = null;
+    _latencyTurnId = null;
+    _latencyFirstPcmMs = null;
+    _latencyLoggedFirstPcm = false;
     _isAutoLooping = false;
     _isStartingListen =
         false; // Fix B4: release mutex if we force-idle mid-start
@@ -554,6 +585,11 @@ class ChatNotifier extends Notifier<ChatState> {
 
     // ── 5. 通知后端取消 TTS，同时清空后端 audio_buffer ────────────────────
     ref.read(websocketProvider).sendCommand("cancel_tts", {});
+
+    _latencySw = null;
+    _latencyTurnId = null;
+    _latencyFirstPcmMs = null;
+    _latencyLoggedFirstPcm = false;
 
     // ── 6. 解除打断标志，切换到录音状态 ──────────────────────────────────
     _isInterrupting = false;
