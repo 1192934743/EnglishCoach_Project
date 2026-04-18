@@ -2,12 +2,14 @@ import os
 import json
 import asyncio
 import logging
+import time
 from typing import Optional
 from contextlib import contextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
 from dotenv import load_dotenv
+import httpx
 import openai
 
 from database import (
@@ -20,7 +22,14 @@ from database import (
     ensure_schema_upgrades,
     effective_topic_title_zh,
 )
-from core.audio_service import run_volcengine_wss_asr, run_tts_to_ws
+from core.audio_service import (
+    MIN_AUDIO_BYTES,
+    ASR_STREAM_START_BYTES,
+    run_volcengine_wss_asr,
+    run_volc_streaming_asr_worker,
+    run_tts_to_ws,
+    run_tts_turn_reused_from_queue,
+)
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
 import uuid
@@ -71,17 +80,78 @@ if not CONFIG.get("VOLC_RESOURCE_ID_TTS"):
     logger.warning("⚠️ 未设置 VOLC_RESOURCE_ID_TTS：合成语音将在调用时失败，请检查 config.env。")
 
 TEACHING_CONFIG = {"enable_correction": False, "enable_translation": True, "enable_hints": True}
-client = openai.AsyncOpenAI(api_key=CONFIG["DEEPSEEK_KEY"], base_url=CONFIG["DEEPSEEK_BASE"])
+
+# 共享 httpx 连接池：避免默认「懒连接」导致用户首轮 chat.completions 承担完整 TLS + 建连。
+_deepseek_http = httpx.AsyncClient(
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+    timeout=httpx.Timeout(connect=25.0, read=180.0, write=60.0, pool=10.0),
+)
+client = openai.AsyncOpenAI(
+    api_key=CONFIG["DEEPSEEK_KEY"],
+    base_url=CONFIG["DEEPSEEK_BASE"],
+    http_client=_deepseek_http,
+)
+
+# DeepSeek 首轮偏慢：此前仅有 VectorStore warm_up，无 LLM 侧预热；首条 HTTPS 冷启动 ~0.5–1s+。
+_llm_warm_lock = asyncio.Lock()
+_last_llm_warm_ok_mono: float = -1e12
+LLM_WARM_COOLDOWN_SEC = 45.0
+
+
+async def warm_deepseek_connection(reason: str = "") -> None:
+    """
+    发一条极小的流式请求，建立 TLS + 连接池。带冷却与互斥，避免多 WS 同时重复预热。
+    在 server_startup 与 websocket accept 各打一次（间隔够长时），减轻 [LATENCY] 04→04b 首轮尖刺。
+    """
+    global _last_llm_warm_ok_mono
+    async with _llm_warm_lock:
+        now = time.monotonic()
+        if now - _last_llm_warm_ok_mono < LLM_WARM_COOLDOWN_SEC:
+            logger.debug("[LLM] skip DeepSeek warm (cooldown) reason=%s", reason or "?")
+            return
+        t0 = time.perf_counter()
+        try:
+            stream = await client.chat.completions.create(
+                model="deepseek-chat",
+                messages=[{"role": "user", "content": "."}],
+                max_tokens=1,
+                stream=True,
+            )
+            n = 0
+            async for chunk in stream:
+                n += 1
+                if chunk.choices:
+                    d = chunk.choices[0].delta
+                    if d and getattr(d, "content", None):
+                        break
+                if n > 48:
+                    break
+        except Exception as e:
+            logger.warning("[LLM] DeepSeek 预热失败 reason=%s: %s", reason or "?", e)
+            return
+        _last_llm_warm_ok_mono = time.monotonic()
+        ms = (time.perf_counter() - t0) * 1000.0
+        logger.info("[LLM] DeepSeek 连接预热完成 reason=%s wall=%.0fms", reason or "?", ms)
+
 
 app = FastAPI()
 
 
 @app.on_event("startup")
 async def on_startup():
-    """服务启动时：SQLite 结构升级 → VectorStore 预热"""
+    """服务启动时：SQLite 结构升级 → VectorStore 预热 → DeepSeek HTTP 预热"""
     await run_in_threadpool(ensure_schema_upgrades)
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
+    await warm_deepseek_connection("server_startup")
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    try:
+        await client.close()
+    except Exception as e:
+        logger.warning("[LLM] AsyncOpenAI close: %s", e)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -223,9 +293,23 @@ async def get_stats(user_id: str = Query(...)):
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 音频防爆限制：5MB
-MAX_BUFFER_CHARS = 50              # 流式处理中，无标点字符超过此长度强制截断发送 TTS
+MAX_BUFFER_CHARS = 38              # 无标点时略缩短，更快送入 TTS
+# 首段语音：不等长句标点也可提前合成（避免首句卡在句号前）
+FIRST_TTS_EARLY_FLUSH_CHARS = 22
 # chat_history token 预算：4 chars ≈ 1 token（粗估），给模型上下文留足余量
 MAX_CONTEXT_TOKENS = 2000          # 进入 LLM 前历史消息的 token 上限（含 system prompt）
+
+
+def _latency_log(lat: dict, stage: str, **kwargs) -> None:
+    """同一轮 user_finish_speaking / test_text_input 内各阶段相对 t0 的累计毫秒（服务端）。"""
+    t0 = lat.get("t0")
+    if not isinstance(t0, (int, float)):
+        return
+    tid = lat.get("turn_id", "?")
+    ms = (time.perf_counter() - float(t0)) * 1000.0
+    extra = (" " + " ".join(f"{k}={v!r}" for k, v in kwargs.items())) if kwargs else ""
+    logger.info("[LATENCY] turn=%s stage=%-28s cum=%8.1fms%s", tid, stage, ms, extra)
+
 
 # ================= 数据库上下文 =================
 @contextmanager
@@ -379,9 +463,37 @@ async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dic
 async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None):
     await websocket.accept()
     logger.info(f"📱 客户端已连接: {websocket.client.host}")
+    # 长间隔后重连时连接池可能已过期；不阻塞握手，后台预热下一轮对话的首包 LLM。
+    asyncio.create_task(warm_deepseek_connection(f"ws_accept:{websocket.client.host}"))
 
     ws_lock = asyncio.Lock()
     audio_buffer = bytearray()
+    asr_stream_queue: Optional[asyncio.Queue] = None
+    asr_stream_task: Optional[asyncio.Task] = None
+    asr_partial_last_mono = 0.0
+
+    async def _emit_asr_partial(txt: str):
+        """流式 ASR 中间结果：仅展示用，节流避免刷屏。"""
+        nonlocal asr_partial_last_mono
+        if not txt:
+            return
+        now = time.monotonic()
+        if now - asr_partial_last_mono < 0.22:
+            return
+        asr_partial_last_mono = now
+        await safe_send_ws(websocket, ws_lock, {"event": "asr_partial", "text": txt})
+
+    async def _abort_streaming_asr():
+        nonlocal asr_stream_queue, asr_stream_task
+        if asr_stream_task and not asr_stream_task.done():
+            asr_stream_task.cancel()
+            try:
+                await asr_stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        asr_stream_task = None
+        asr_stream_queue = None
+
     consumer_task = None
     tts_queue = None
 
@@ -441,8 +553,32 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 audio_buffer.extend(message["bytes"])
                 if len(audio_buffer) > MAX_AUDIO_BYTES:
                     logger.warning("⚠️ 警告：音频缓冲区超限，强制清空以防止内存溢出。")
+                    await _abort_streaming_asr()
                     audio_buffer.clear()
                     await safe_send_ws(websocket, ws_lock, {"event": "error", "message": "Audio buffer overflow"})
+                    continue
+                # 流式 ASR：缓冲达到阈值后建连并开始上传（与整段模式共用 MIN_AUDIO_BYTES）
+                if asr_stream_task is not None and asr_stream_task.done():
+                    try:
+                        exc = asr_stream_task.exception()
+                        if exc:
+                            logger.warning("流式 ASR 任务异常结束: %s", exc)
+                    except asyncio.CancelledError:
+                        pass
+                    except asyncio.InvalidStateError:
+                        pass
+                    asr_stream_task = None
+                    asr_stream_queue = None
+                if asr_stream_task is None and len(audio_buffer) >= ASR_STREAM_START_BYTES:
+                    asr_stream_queue = asyncio.Queue(maxsize=0)
+                    asr_stream_task = asyncio.create_task(
+                        run_volc_streaming_asr_worker(
+                            asr_stream_queue, CONFIG, on_partial=_emit_asr_partial
+                        )
+                    )
+                    await asr_stream_queue.put(bytes(audio_buffer))
+                elif asr_stream_queue is not None and asr_stream_task is not None and not asr_stream_task.done():
+                    await asr_stream_queue.put(message["bytes"])
                 continue
                 
             # --- 文本指令处理 ---
@@ -601,22 +737,70 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 break
                     tts_queue = None
                     # 3. 清空音频接收缓冲区，防止旧 PCM 混入下一轮 ASR
+                    await _abort_streaming_asr()
                     audio_buffer.clear()
                     logger.info("🛑 [打断] 用户打断 TTS，已取消合成任务并清空缓冲区。")
                     continue
 
                 if action in ["user_finish_speaking", "test_text_input"]:
                     is_test_mode = (action == "test_text_input")
+                    asr_partial_last_mono = 0.0
+                    lat: dict = {
+                        "turn_id": uuid.uuid4().hex[:8],
+                        "t0": time.perf_counter(),
+                    }
+                    _latency_log(
+                        lat,
+                        "01_turn_accepted",
+                        action=action,
+                        test_mode=is_test_mode,
+                    )
 
                     # 1. 语音转文本
                     if is_test_mode:
                         user_text, user_emotion = data.get("text", ""), "neutral"
+                        _latency_log(lat, "02_skip_asr_test_text")
                     else:
-                        user_text, user_emotion = await run_volcengine_wss_asr(audio_buffer, CONFIG)
-                        audio_buffer.clear()
+                        used_streaming_asr = False
+                        if (
+                            asr_stream_task is not None
+                            and not asr_stream_task.done()
+                            and asr_stream_queue is not None
+                        ):
+                            used_streaming_asr = True
+                            _latency_log(lat, "02_asr_stream_finish")
+                            await asr_stream_queue.put(None)
+                            try:
+                                user_text, user_emotion = await asr_stream_task
+                            except asyncio.CancelledError:
+                                user_text, user_emotion = "", "neutral"
+                            except Exception as e:
+                                logger.warning("流式 ASR 收束失败，回退整包 ASR: %s", e)
+                                asr_stream_task = None
+                                asr_stream_queue = None
+                                user_text, user_emotion = await run_volcengine_wss_asr(
+                                    audio_buffer, CONFIG
+                                )
+                            asr_stream_task = None
+                            asr_stream_queue = None
+                            audio_buffer.clear()
+                        else:
+                            user_text, user_emotion = await run_volcengine_wss_asr(
+                                audio_buffer, CONFIG
+                            )
+                            audio_buffer.clear()
+                            if asr_stream_task is not None or asr_stream_queue is not None:
+                                await _abort_streaming_asr()
+                        _latency_log(
+                            lat,
+                            "02_asr_done",
+                            user_chars=len(user_text or ""),
+                            streaming_asr=used_streaming_asr,
+                        )
 
                     if not user_text:
-                        if not is_test_mode: 
+                        _latency_log(lat, "02b_empty_after_asr_skip_rest")
+                        if not is_test_mode:
                             await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
                         continue
 
@@ -683,25 +867,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     current_user, is_flipped, session_ctx, current_task_packet, session_hits
                                 )
 
+                    _latency_log(lat, "03_l1_and_prompt_ready", logged_in=bool(current_user))
+
                     chat_history.append({"role": "user", "content": f"[{user_emotion} tone] {user_text}"})
 
                     # 3. 准备并发 TTS 任务
                     if not is_test_mode:
                         tts_queue = asyncio.Queue()
                         
+                        # 单 WebSocket 顺序多 session（官方链接复用）；句间在 152 后不发 event 2，
+                        # 仅队列结束后 finish connection。点读仍用 run_tts_to_ws。
                         async def tts_consumer(queue: asyncio.Queue):
-                            while True:
-                                text_to_speak = await queue.get()
-                                if text_to_speak is None:
-                                    queue.task_done()
-                                    break
-                                try:
-                                    await run_tts_to_ws(text_to_speak, websocket, ws_lock, CONFIG)
-                                except Exception:
-                                    logger.exception("TTS 流式播放期间发生异常")
-                                finally:
-                                    queue.task_done()
+                            try:
+                                await run_tts_turn_reused_from_queue(
+                                    websocket,
+                                    ws_lock,
+                                    CONFIG,
+                                    queue,
+                                    latency_hooks=lat,
+                                )
+                            except Exception:
+                                logger.exception("TTS 流式播放期间发生异常")
                             await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
+                            _latency_log(lat, "10_ws_tts_finished_event_sent")
 
                         # 终止上一轮仍未处理完的 TTS
                         if consumer_task and not consumer_task.done():
@@ -712,24 +900,55 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     raw_full_reply = ""
                     sentence_buffer = ""
                     punctuation_marks = ['.', '!', '?', ',', '。', '！', '？', '，', '\n']
+                    early_head_flush_used = False
+                    _lat_flags = {"llm_first": False, "tts_enqueue": False}
 
                     async def _stream_llm_to_queue():
                         """将 create + async for 封装为单协程，便于 wait_for 统一超时"""
-                        nonlocal raw_full_reply, sentence_buffer
+                        nonlocal raw_full_reply, sentence_buffer, early_head_flush_used
+                        _latency_log(
+                            lat,
+                            "04_llm_api_request_start",
+                            chat_messages=len(chat_history),
+                        )
                         response = await client.chat.completions.create(
                             model="deepseek-chat", messages=chat_history,
                             max_tokens=LLM_MAX_TOKENS, stream=True
                         )
+                        _latency_log(lat, "04b_llm_stream_iterable_ready")
                         async for chunk in response:
                             if chunk.choices and chunk.choices[0].delta.content:
                                 delta = chunk.choices[0].delta.content
+                                if not _lat_flags["llm_first"]:
+                                    _lat_flags["llm_first"] = True
+                                    pv = delta[:72] + ("…" if len(delta) > 72 else "")
+                                    _latency_log(lat, "05_llm_first_content_delta", preview=pv)
                                 raw_full_reply += delta
                                 if not is_test_mode and tts_queue:
                                     sentence_buffer += delta
-                                    if any(p in delta for p in punctuation_marks) or len(sentence_buffer) > MAX_BUFFER_CHARS:
+                                    want_flush = (
+                                        any(p in delta for p in punctuation_marks)
+                                        or len(sentence_buffer) > MAX_BUFFER_CHARS
+                                    )
+                                    if (
+                                        not want_flush
+                                        and not early_head_flush_used
+                                        and len(sentence_buffer) >= FIRST_TTS_EARLY_FLUSH_CHARS
+                                    ):
+                                        want_flush = True
+                                    if want_flush:
                                         chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
                                         if chunk_text:
+                                            if not _lat_flags["tts_enqueue"]:
+                                                _lat_flags["tts_enqueue"] = True
+                                                cq = chunk_text[:72] + ("…" if len(chunk_text) > 72 else "")
+                                                _latency_log(
+                                                    lat,
+                                                    "06_tts_first_text_enqueued",
+                                                    preview=cq,
+                                                )
                                             await tts_queue.put(chunk_text)
+                                            early_head_flush_used = True
                                         sentence_buffer = ""
 
                     async def _abort_tts():
@@ -747,6 +966,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     try:
                         await asyncio.wait_for(_stream_llm_to_queue(), timeout=20.0)
                     except asyncio.TimeoutError:
+                        _latency_log(lat, "ERR_llm_wait_timeout")
                         logger.error("⏱️ LLM 响应超时（>20s），本轮中止。")
                         await _abort_tts()
                         await safe_send_ws(websocket, ws_lock, {
@@ -756,6 +976,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         })
                         continue  # 回到 while 循环等待下一帧，连接不断
                     except Exception as e:
+                        _latency_log(lat, "ERR_llm_stream_exception", err_type=type(e).__name__)
                         logger.error(f"💥 LLM 调用异常: {e}", exc_info=True)
                         await _abort_tts()
                         await safe_send_ws(websocket, ws_lock, {
@@ -769,6 +990,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     if not is_test_mode and tts_queue:
                         final_chunk = sentence_buffer.replace("[ADVANCE]", "").strip()
                         if final_chunk:
+                            if not _lat_flags["tts_enqueue"]:
+                                _lat_flags["tts_enqueue"] = True
+                                fq = final_chunk[:72] + ("…" if len(final_chunk) > 72 else "")
+                                _latency_log(
+                                    lat,
+                                    "06_tts_first_text_enqueued",
+                                    preview=fq,
+                                    tail_flush=True,
+                                )
                             await tts_queue.put(final_chunk)
                         await tts_queue.put(None)
 
@@ -785,6 +1015,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     session_transcript.append({"role": "assistant", "text": clean_full_reply})
 
                     logger.info(f"🤖 AI: {clean_full_reply}")
+                    _latency_log(
+                        lat,
+                        "98_assistant_reply_ready",
+                        ai_chars=len(clean_full_reply),
+                    )
 
                     # 6. 后置辅导服务
                     if is_test_mode:
@@ -797,6 +1032,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
     except Exception as e:
         logger.error(f"💥 意外异常: {e}", exc_info=True)
     finally:
+        await _abort_streaming_asr()
         audio_buffer.clear()
         # 确保彻底结束正在运行的 TTS 消费任务
         if consumer_task and not consumer_task.done():

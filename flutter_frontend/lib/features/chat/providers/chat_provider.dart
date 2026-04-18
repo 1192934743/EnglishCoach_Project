@@ -122,6 +122,18 @@ class ChatNotifier extends Notifier<ChatState> {
   /// Fix B7: 报告卡展示期间暂停 autoMode 自动开始录音
   bool _reportShowing = false;
 
+  /// 端到端延迟排查：从 stopListeningAndSubmit 到首包 PCM 的客户端阶段
+  Stopwatch? _latencySw;
+  bool _latencyLoggedFirstPcm = false;
+
+  void _latencyLogClient(String stage, [String extra = '']) {
+    final sw = _latencySw;
+    if (sw == null) return;
+    final ms = sw.elapsedMilliseconds;
+    final tail = extra.isEmpty ? '' : ' $extra';
+    debugPrint('[LATENCY][client] $stage +${ms}ms$tail');
+  }
+
   @override
   ChatState build() {
     _recorder = AudioRecorder();
@@ -335,6 +347,13 @@ class ChatNotifier extends Notifier<ChatState> {
       // 打断期间或非播放状态时，丢弃网络中残留的 PCM 包
       if (_isInterrupting) return;
       if (state.status == ChatStatus.speaking && _player.isPlaying) {
+        if (!_latencyLoggedFirstPcm) {
+          _latencyLoggedFirstPcm = true;
+          _latencyLogClient(
+            '05_first_pcm_chunk',
+            'len=${audioBytes.length}',
+          );
+        }
         _playbackStartTime ??= DateTime.now();
         _totalBytesReceived += audioBytes.length;
         try {
@@ -350,6 +369,7 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
     if (_isAutoLooping) return;
     _isAutoLooping = true;
+    _latencyLogClient('06_tts_finished_event');
 
     if (_playbackStartTime != null && _totalBytesReceived > 0) {
       int durationMs = (_totalBytesReceived / 48.0).ceil();
@@ -367,6 +387,7 @@ class ChatNotifier extends Notifier<ChatState> {
     _isAutoLooping = false;
     _playbackStartTime = null;
     _totalBytesReceived = 0;
+    _latencySw = null;
 
     // Fix B7: do not auto-start while the session report card is visible
     if (ref.read(settingsProvider).autoMode && !_reportShowing) {
@@ -428,12 +449,11 @@ class ChatNotifier extends Notifier<ChatState> {
           .listen((amp) {
             if (state.status != ChatStatus.listening) return;
             final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-            // Fix B3: raised threshold -25 → -35 dBFS, and min frames 3 → 5 (500ms).
-            // Android's AGC easily pushes ambient noise above -25 dBFS causing false
-            // "has spoken" detections within 300ms of starting.
+            // Fix B3: raised threshold -25 → -35 dBFS; min frames 5 → 4（约 400ms 有声）再判「已开口」，
+            // 略缩有效句长、更快进入静默计时。
             if (amp.current > -35.0) {
               _noiseFrames++;
-              if (_noiseFrames > 4) {
+              if (_noiseFrames > 3) {
                 _hasSpoken = true;
                 _silenceTimer?.cancel();
               }
@@ -462,8 +482,12 @@ class ChatNotifier extends Notifier<ChatState> {
 
   Future<void> stopListeningAndSubmit() async {
     if (state.status != ChatStatus.listening) return;
+    _latencySw = Stopwatch()..start();
+    _latencyLoggedFirstPcm = false;
+    _latencyLogClient('01_stopListening_submit_start');
     try {
       await _recorder.stop();
+      _latencyLogClient('02_recorder_stopped');
       _ampSubscription?.cancel();
       _silenceTimer?.cancel();
       _maxListenTimer?.cancel(); // Fix B5
@@ -475,16 +499,20 @@ class ChatNotifier extends Notifier<ChatState> {
         interleaved: true,
         bufferSize: 8192,
       );
+      _latencyLogClient('03_player_stream_ready');
       final userId = await UserManager.getOrCreateUuid();
       ref.read(websocketProvider).sendCommand("user_finish_speaking", {
         "user_id": userId,
       });
+      _latencyLogClient('04_ws_user_finish_sent');
     } catch (_) {
+      _latencySw = null;
       forceIdle();
     }
   }
 
   Future<void> forceIdle() async {
+    _latencySw = null;
     _isAutoLooping = false;
     _isStartingListen =
         false; // Fix B4: release mutex if we force-idle mid-start
