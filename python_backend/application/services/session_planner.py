@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 from typing import Optional
 
 from sqlalchemy.orm import Session
@@ -432,10 +433,7 @@ def _score_topic(
 
 def _get_topic_vector(topic_id: int) -> list[float] | None:
     """从 VectorStore 取话题向量（仅用于相似度计算，不暴露给外部）"""
-    if not _store.has_topic(topic_id):
-        return None
-    idx = _store._ids.index(topic_id)
-    return _store._vectors[idx]
+    return _store.get_vector(topic_id)
 
 
 def _compute_review_urgency(topic_id: int, user_id: str, db: Session) -> float:
@@ -455,7 +453,6 @@ def _compute_review_urgency(topic_id: int, user_id: str, db: Session) -> float:
 
     elapsed = datetime.datetime.utcnow() - last_session.start_time
     elapsed_days = elapsed.total_seconds() / 86400.0
-    import math
     urgency = 1.0 - math.exp(-elapsed_days / REVIEW_URGENCY_HALF_LIFE_DAYS)
     return min(1.0, urgency)
 

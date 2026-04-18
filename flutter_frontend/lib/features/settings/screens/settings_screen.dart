@@ -86,9 +86,9 @@ class SettingsScreen extends ConsumerWidget {
                 ),
                 Slider(
                   value: settings.vadTimeout.toDouble(),
-                  min: 500,
+                  min: 800,
                   max: 2500,
-                  divisions: 20,
+                  divisions: 17,
                   activeColor: Colors.blueAccent,
                   onChanged: (val) => notifier.setVadTimeout(val.toInt()),
                 ),

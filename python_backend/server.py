@@ -49,12 +49,11 @@ try:
     _fh.setFormatter(
         logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     )
-    _coach = logging.getLogger("EnglishCoach")
-    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(_log_path) for h in _coach.handlers):
-        _coach.addHandler(_fh)
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(_log_path) for h in logger.handlers):
+        logger.addHandler(_fh)
     logger.info("EnglishCoach file log: %s", os.path.abspath(_log_path))
 except OSError as _e:
-    logging.getLogger("EnglishCoach").warning("Could not open server_output.log: %s", _e)
+    logger.warning("Could not open server_output.log: %s", _e)
 
 load_dotenv("config.env")
 
@@ -670,7 +669,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     if current_user:
                         level = data.get("level", 1)
                         await run_in_threadpool(update_user_politeness, current_user.id, level)
-                        current_user.politeness_level = level
+                        # rebuild prompt (politeness_level read from fresh DB fetch on next build_dynamic_prompt call)
+                        current_user = await run_in_threadpool(init_or_get_user, current_user.id)
                         chat_history[0]["content"] = build_dynamic_prompt(
                             current_user, is_flipped, session_ctx, current_task_packet, session_hits
                         )

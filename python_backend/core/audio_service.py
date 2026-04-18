@@ -535,7 +535,7 @@ async def iter_tts_pcm_chunks(
     voice_type = config.get("VOICE", "BV001_streaming")
 
     if not volc_api_key or not volc_resource_id:
-        logger.error("🚨 TTS 启动失败: 缺失配置信息")
+        logger.error("TTS 启动失败: 缺失配置信息")
         return
 
     headers = {
@@ -547,6 +547,7 @@ async def iter_tts_pcm_chunks(
 
     pcm_queue: asyncio.Queue = asyncio.Queue()
     stream_ended = False
+    session_started_event = asyncio.Event()
 
     async def mark_stream_end():
         nonlocal stream_ended
@@ -555,126 +556,121 @@ async def iter_tts_pcm_chunks(
         stream_ended = True
         await pcm_queue.put(_PCM_STREAM_END)
 
+    async def receiver():
+        try:
+            async for message in ws:
+                if isinstance(message, str) or len(message) < 4:
+                    continue
+                header_size = (message[0] & 0x0F) * 4
+                msg_type = (message[1] >> 4) & 0x0F
+                flags = message[1] & 0x0F
+
+                if msg_type == 15:
+                    err_raw = message[header_size:]
+                    try:
+                        err_str = err_raw.decode("utf-8", errors="ignore")
+                        if "{" in err_str:
+                            err_str = json.loads(err_str).get("message", err_str)
+                    except Exception:
+                        err_str = f"RawHex: {err_raw.hex()[:50]}"
+                    logger.error(f"TTS 服务端返回错误: {err_str}")
+                    break
+
+                if msg_type not in [9, 11]:
+                    continue
+
+                offset = header_size
+                if flags == 4:
+                    if offset + 4 > len(message):
+                        continue
+                    event_type = struct.unpack(">i", message[offset : offset + 4])[0]
+                    offset += 4
+
+                    if offset + 4 > len(message):
+                        continue
+                    id_len = struct.unpack(">I", message[offset : offset + 4])[0]
+
+                    if id_len > MAX_ID_LEN or offset + 4 + id_len > len(message):
+                        logger.warning(f"TTS 抛弃异常包: id_len={id_len}")
+                        continue
+                    offset += 4 + id_len
+                else:
+                    event_type = None
+
+                if offset + 4 > len(message):
+                    continue
+                payload_size = struct.unpack(">I", message[offset : offset + 4])[0]
+                offset += 4
+
+                pl_limit = (
+                    MAX_TTS_PAYLOAD_LEN
+                    if event_type == 352
+                    else MAX_TTS_CONTROL_PAYLOAD_LEN
+                )
+                if payload_size > pl_limit or offset + payload_size > len(message):
+                    logger.warning(
+                        f"TTS 抛弃异常包: payload_size={payload_size}, limit={pl_limit}"
+                    )
+                    continue
+
+                payload = message[offset : offset + payload_size]
+
+                if event_type == 50:
+                    req = {
+                        "user": {"uid": "english_coach"},
+                        "namespace": "BidirectionalTTS",
+                        "req_params": {
+                            "speaker": voice_type,
+                            "audio_params": {
+                                "format": "pcm",
+                                "sample_rate": 24000,
+                            },
+                        },
+                    }
+                    await ws.send(pack_tts_request(100, session_id, req))
+
+                elif event_type == 150:
+                    session_started_event.set()
+
+                elif event_type == 352:
+                    if latency_hooks is not None and not latency_hooks.get(
+                        "_tts_first_pcm_logged"
+                    ):
+                        latency_hooks["_tts_first_pcm_logged"] = True
+                        t0 = latency_hooks.get("t0")
+                        tid = latency_hooks.get("turn_id", "?")
+                        if isinstance(t0, (int, float)):
+                            ms = (time.perf_counter() - float(t0)) * 1000.0
+                            logger.info(
+                                "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
+                                tid,
+                                "07_first_pcm_to_client",
+                                ms,
+                                len(payload),
+                            )
+                    await pcm_queue.put(payload)
+
+                elif event_type == 152:
+                    await ws.send(pack_tts_request(2))
+
+                elif event_type == 52:
+                    break
+        finally:
+            await mark_stream_end()
+
     try:
         async with websockets.connect(
             WSS_URL, additional_headers=headers, open_timeout=10
         ) as ws:
             await ws.send(pack_tts_request(1))
             session_id = str(uuid.uuid4())
-            is_session_started = False
-
-            async def receiver():
-                nonlocal is_session_started
-                try:
-                    async for message in ws:
-                        if isinstance(message, str) or len(message) < 4:
-                            continue
-                        header_size = (message[0] & 0x0F) * 4
-                        msg_type = (message[1] >> 4) & 0x0F
-                        flags = message[1] & 0x0F
-
-                        if msg_type == 15:
-                            err_raw = message[header_size:]
-                            try:
-                                err_str = err_raw.decode("utf-8", errors="ignore")
-                                if "{" in err_str:
-                                    err_str = json.loads(err_str).get("message", err_str)
-                            except Exception:
-                                err_str = f"RawHex: {err_raw.hex()[:50]}"
-                            logger.error(f"TTS 服务端返回错误: {err_str}")
-                            break
-
-                        if msg_type not in [9, 11]:
-                            continue
-
-                        offset = header_size
-                        if flags == 4:
-                            if offset + 4 > len(message):
-                                continue
-                            event_type = struct.unpack(">i", message[offset : offset + 4])[0]
-                            offset += 4
-
-                            if offset + 4 > len(message):
-                                continue
-                            id_len = struct.unpack(">I", message[offset : offset + 4])[0]
-
-                            if id_len > MAX_ID_LEN or offset + 4 + id_len > len(message):
-                                logger.warning(f"TTS 抛弃异常包: id_len={id_len}")
-                                continue
-                            offset += 4 + id_len
-                        else:
-                            event_type = None
-
-                        if offset + 4 > len(message):
-                            continue
-                        payload_size = struct.unpack(">I", message[offset : offset + 4])[0]
-                        offset += 4
-
-                        pl_limit = (
-                            MAX_TTS_PAYLOAD_LEN
-                            if event_type == 352
-                            else MAX_TTS_CONTROL_PAYLOAD_LEN
-                        )
-                        if payload_size > pl_limit or offset + payload_size > len(message):
-                            logger.warning(
-                                f"TTS 抛弃异常包: payload_size={payload_size}, limit={pl_limit}"
-                            )
-                            continue
-
-                        payload = message[offset : offset + payload_size]
-
-                        if event_type == 50:
-                            req = {
-                                "user": {"uid": "english_coach"},
-                                "namespace": "BidirectionalTTS",
-                                "req_params": {
-                                    "speaker": voice_type,
-                                    "audio_params": {
-                                        "format": "pcm",
-                                        "sample_rate": 24000,
-                                    },
-                                },
-                            }
-                            await ws.send(pack_tts_request(100, session_id, req))
-
-                        elif event_type == 150:
-                            is_session_started = True
-
-                        elif event_type == 352:
-                            if latency_hooks is not None and not latency_hooks.get(
-                                "_tts_first_pcm_logged"
-                            ):
-                                latency_hooks["_tts_first_pcm_logged"] = True
-                                t0 = latency_hooks.get("t0")
-                                tid = latency_hooks.get("turn_id", "?")
-                                if isinstance(t0, (int, float)):
-                                    ms = (time.perf_counter() - float(t0)) * 1000.0
-                                    logger.info(
-                                        "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
-                                        tid,
-                                        "07_first_pcm_to_client",
-                                        ms,
-                                        len(payload),
-                                    )
-                            await pcm_queue.put(payload)
-
-                        elif event_type == 152:
-                            await ws.send(pack_tts_request(2))
-
-                        elif event_type == 52:
-                            break
-                finally:
-                    await mark_stream_end()
 
             recv_task = asyncio.create_task(receiver())
 
             try:
-                wait_cycles = 0
-                while not is_session_started and wait_cycles < 500:
-                    await asyncio.sleep(0.01)
-                    wait_cycles += 1
-
-                if not is_session_started:
+                try:
+                    await asyncio.wait_for(session_started_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
                     raise TimeoutError("火山引擎 TTS 建连超时")
 
                 await ws.send(
@@ -707,11 +703,9 @@ async def iter_tts_pcm_chunks(
                 await mark_stream_end()
 
     except websockets.exceptions.ConnectionClosed:
-        logger.warning("🌋 TTS WebSocket 意外断开")
+        logger.warning("TTS WebSocket 意外断开")
     except Exception as e:
-        logger.error(f"❌ TTS 全局异常: {e}")
-
-
+        logger.error(f"TTS 全局异常: {e}")
 async def run_tts_to_ws(
     text: str,
     client_ws: WebSocket,

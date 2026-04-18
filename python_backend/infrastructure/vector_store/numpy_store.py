@@ -55,6 +55,13 @@ class NumpyVectorStore(VectorStore):
     def has_topic(self, topic_id: int) -> bool:
         return topic_id in self._ids
 
+    def get_vector(self, topic_id: int) -> list[float] | None:
+        """公开 API：按 topic_id 取向量，避免直接访问内部 _ids/_vectors。"""
+        if topic_id not in self._ids:
+            return None
+        idx = self._ids.index(topic_id)
+        return self._vectors[idx]
+
     # ── 检索 ─────────────────────────────────────────────────────────────
     def get_similar(self, query_vector: list[float], top_k: int = 5) -> list[tuple[int, float]]:
         if not self._ids:

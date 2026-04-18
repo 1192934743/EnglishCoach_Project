@@ -6,9 +6,9 @@ import subprocess
 import sys
 import logging
 import socket
-import ast  # 🌟 引入 AST 模块进行代码语法检测
-import shutil      # 🌟 新增：用于复制文件保存快照
-import datetime    # 🌟 新增：用于生成时间戳后缀
+import ast  # 引入 AST 模块进行代码语法检测
+import shutil      # 用于复制文件保存快照
+import datetime    # 用于生成时间戳后缀
 from dotenv import load_dotenv
 
 # ==========================================
@@ -16,8 +16,10 @@ from dotenv import load_dotenv
 # ==========================================
 load_dotenv("config.env")
 
-# 🌟 强制注入网络代理，防止国内直连 Google API 导致无尽卡死
-proxy_url = os.getenv("HTTP_PROXY", "http://127.0.0.1:7890")
+# 强制注入网络代理，防止国内直连 Google API 导致无尽卡死
+proxy_url = os.getenv("HTTP_PROXY")
+if not proxy_url:
+    raise RuntimeError("HTTP_PROXY environment variable is not set. Please configure it in config.env.")
 os.environ['http_proxy'] = proxy_url
 os.environ['https_proxy'] = proxy_url
 os.environ['HTTP_PROXY'] = proxy_url
@@ -51,6 +53,9 @@ logger.info(f"🌐 系统网络代理已自动配置为: {proxy_url}")
 # ==========================================
 TARGET_SCORE = 90                # 满意度：达到此分数则判定为该轮“合格”
 REQUIRED_STABLE_ROUNDS = 3       # 满意轮数：需要连续 N 轮达标才停止优化
+REPORT_CONTEXT_TRUNCATE_CHARS = 3000  # 注入 LLM 的报告最大字符数
+SNAPSHOT_ARCHIVE_MIN_SCORE = 75  # 快照存档最低分数门槛
+TEST_SUBPROCESS_TIMEOUT_SEC = 180  # 测试脚本 subprocess 超时（秒），防止永久阻塞
 # ==========================================
 
 ENGINE_FILE = "core/dialogue_engine.py"
@@ -111,9 +116,17 @@ def read_engine_code():
         return f.read()
 
 def write_engine_code(new_code):
-    os.makedirs(os.path.dirname(ENGINE_FILE), exist_ok=True)
-    with open(ENGINE_FILE, "w", encoding="utf-8") as f:
-        f.write(new_code)
+    dir_path = os.path.dirname(ENGINE_FILE)
+    os.makedirs(dir_path, exist_ok=True)
+    tmp_path = os.path.join(dir_path, f".engine_{os.getpid()}.tmp")
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(new_code)
+        os.replace(tmp_path, ENGINE_FILE)
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+        raise
 
 def extract_score(output_text):
     match = re.search(r'🏆 最终得分：\s*(\d+)', output_text)
@@ -150,6 +163,21 @@ def extract_target_func(full_code, target_func="build_dynamic_prompt"):
     func_code = '\n'.join(lines[start_idx:end_idx])
     return func_code, start_idx, end_idx
 
+def sanitize_report_for_llm(report: str) -> str:
+    """清洗测试报告，移除可能干扰 LLM 的特殊标记，防止 Prompt 注入。"""
+    # 移除常见的 Prompt 注入标记
+    markers_to_remove = [
+        "[TASK:", "[EVOLUTION", "[CRITICAL", "[INJECT", "[SYSTEM",
+        "```system", "```instruction", "```config",
+    ]
+    result = report
+    for marker in markers_to_remove:
+        result = result.replace(marker, "[BLOCKED]")
+    # 限制连续特殊字符数量（防止 ASCII art 或混淆）
+    result = re.sub(r'[^\S\n]{30,}', ' ', result)
+    return result
+
+
 async def call_gemini_to_fix(report, current_full_code):
     logger.info("🧠 [AI Agent]: 正在提取核心函数并进行 Prompt 重构 (保留20轮测试报告)...")
 
@@ -159,7 +187,8 @@ async def call_gemini_to_fix(report, current_full_code):
         logger.error("❌ 无法从文件中定位到 build_dynamic_prompt 函数！")
         return None
 
-    short_report = report[-3000:] if len(report) > 3000 else report
+    short_report = report[-REPORT_CONTEXT_TRUNCATE_CHARS:] if len(report) > REPORT_CONTEXT_TRUNCATE_CHARS else report
+    short_report = sanitize_report_for_llm(short_report)
 
     prompt = f"""
 [TASK: SYSTEM EVOLUTION FOR ENGLISH COACH]
@@ -277,39 +306,40 @@ async def run_optimization_loop():
         logger.info(f"▶️ 第 {generation} 代测试开始 (当前连续达标: {stable_count}/{REQUIRED_STABLE_ROUNDS})")
 
         logger.info("🟢 正在尝试唤醒后端服务器...")
-        server_log_fd = open(SERVER_LOG_FILE, "a", encoding="utf-8")
-        server_process = subprocess.Popen(
-            [sys.executable, SERVER_SCRIPT],
-            env=win_env,
-            stdout=server_log_fd,
-            stderr=subprocess.STDOUT
-        )
-        ready = await wait_for_server_ready()
-        if not ready:
-            logger.warning("⚠️ 后端在预期时间内未就绪，测试可能失败。")
+        with open(SERVER_LOG_FILE, "a", encoding="utf-8") as server_log_fd:
+            server_process = subprocess.Popen(
+                [sys.executable, SERVER_SCRIPT],
+                env=win_env,
+                stdout=server_log_fd,
+                stderr=subprocess.STDOUT
+            )
+            ready = await wait_for_server_ready()
+            if not ready:
+                logger.warning("⚠️ 后端在预期时间内未就绪，测试可能失败。")
 
-        logger.info("⚔️ 混沌对抗测试进行中 (约需1-2分钟)...")
-        test_process = subprocess.Popen(
-            [sys.executable, TEST_SCRIPT],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding='utf-8',
-            env=win_env
-        )
+            logger.info("⚔️ 混沌对抗测试进行中 (约需1-2分钟)...")
+            test_process = subprocess.Popen(
+                [sys.executable, TEST_SCRIPT],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                env=win_env
+            )
 
-        test_stdout, test_stderr = test_process.communicate()
+            try:
+                test_stdout, test_stderr = test_process.communicate(timeout=TEST_SUBPROCESS_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                test_process.kill()
+                test_stdout, test_stderr = test_process.communicate()
+                logger.error(f"⚠️ 测试脚本执行超时（>{TEST_SUBPROCESS_TIMEOUT_SEC}s），已被强制终止。")
 
-        # 🌟 释放端口
-        server_process.terminate()
-        try:
-            server_process.wait(timeout=3)
-        except subprocess.TimeoutExpired:
-            server_process.kill()
-            server_process.wait(timeout=3)
-
-        server_log_fd.close()
-        await asyncio.sleep(2)
+            server_process.terminate()
+            try:
+                server_process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                server_process.kill()
+                server_process.wait(timeout=3)
 
         score = extract_score(test_stdout)
 
@@ -327,8 +357,8 @@ async def run_optimization_loop():
 
         logger.info(f"📊 本轮裁决得分: {score}")
 
-        # 🌟 快照存档逻辑 (只保存 >= 75 分，且打破当前记录的代码)
-        if score >= 75 and score > best_score:
+        # 快照存档逻辑 (只保存 >= SNAPSHOT_ARCHIVE_MIN_SCORE 分，且打破当前记录的代码)
+        if score >= SNAPSHOT_ARCHIVE_MIN_SCORE and score > best_score:
             best_score = score
             logger.info(f"🏆 发现新的历史最高分: {best_score} 分！正在生成快照备份...")
             timestamp = datetime.datetime.now().strftime("%m%d_%H%M%S")

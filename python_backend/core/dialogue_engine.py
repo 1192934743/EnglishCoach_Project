@@ -32,6 +32,7 @@ import random
 import logging
 import re
 import asyncio
+import datetime
 from typing import Optional
 from sqlalchemy.orm import Session
 from fastapi import WebSocket
@@ -455,7 +456,7 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                     progress.mastery_score = update_mastery(
                         progress.mastery_score, was_correct=True, quality=quality
                     )
-                    progress.last_practiced_at = __import__("datetime").datetime.utcnow()
+                    progress.last_practiced_at = datetime.datetime.utcnow()
 
                 db.commit()
 
