@@ -311,6 +311,31 @@ def _latency_log(lat: dict, stage: str, **kwargs) -> None:
     logger.info("[LATENCY] turn=%s stage=%-28s cum=%8.1fms%s", tid, stage, ms, extra)
 
 
+def _coerce_turn_trace_id(raw) -> str:
+    """与客户端 trace_id 对齐；合法则用作 turn_id，否则服务端生成短 id。"""
+    if not isinstance(raw, str):
+        return uuid.uuid4().hex[:8]
+    s = raw.strip().replace("-", "")
+    if 4 <= len(s) <= 32 and s.isalnum():
+        return s.lower()
+    return uuid.uuid4().hex[:8]
+
+
+def _e2e_log_client_report(data: dict) -> None:
+    """客户端在 tts_finished 后上报的纯端上耗时，便于与 [LATENCY] 同 turn 对照。"""
+    tid_raw = data.get("trace_id")
+    tid = tid_raw.strip()[:32].lower() if isinstance(tid_raw, str) and tid_raw.strip() else "?"
+    logger.info(
+        "[E2E] turn=%s client_submit_to_first_pcm_ms=%r client_submit_to_tts_finished_ms=%r "
+        "had_first_pcm=%r client_report_wall_ms=%r",
+        tid,
+        data.get("submit_to_first_pcm_ms"),
+        data.get("submit_to_tts_finished_ms"),
+        data.get("had_first_pcm"),
+        data.get("client_report_wall_ms"),
+    )
+
+
 # ================= 数据库上下文 =================
 @contextmanager
 def get_db():
@@ -597,6 +622,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 if payload_user_id and not current_user:
                     current_user = await run_in_threadpool(init_or_get_user, payload_user_id)
 
+                if action == "client_latency_report":
+                    _e2e_log_client_report(data)
+                    continue
+
                 if action == "ping":
                     ws_payload: dict = {"event": "warmup_success"}
                     uid = payload_user_id or (current_user.id if current_user else None)
@@ -745,16 +774,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                 if action in ["user_finish_speaking", "test_text_input"]:
                     is_test_mode = (action == "test_text_input")
                     asr_partial_last_mono = 0.0
+                    turn_id = _coerce_turn_trace_id(data.get("trace_id"))
+                    wall_recv_ms = int(time.time() * 1000)
+                    csw = data.get("client_submit_wall_ms")
+                    client_wall_ok = isinstance(csw, int) and csw > 0
                     lat: dict = {
-                        "turn_id": uuid.uuid4().hex[:8],
+                        "turn_id": turn_id,
                         "t0": time.perf_counter(),
                     }
-                    _latency_log(
-                        lat,
-                        "01_turn_accepted",
-                        action=action,
-                        test_mode=is_test_mode,
-                    )
+                    if client_wall_ok:
+                        lat["client_submit_wall_ms"] = int(csw)
+                    _kwargs_01: dict = {
+                        "action": action,
+                        "test_mode": is_test_mode,
+                        "wall_recv_ms": wall_recv_ms,
+                    }
+                    if client_wall_ok:
+                        _kwargs_01["client_submit_wall_ms"] = int(csw)
+                        skew_hint_ms = wall_recv_ms - int(csw)
+                        _kwargs_01["wall_skew_hint_ms"] = skew_hint_ms
+                    _latency_log(lat, "01_turn_accepted", **_kwargs_01)
 
                     # 1. 语音转文本
                     if is_test_mode:

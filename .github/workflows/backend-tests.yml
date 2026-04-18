@@ -1,0 +1,39 @@
+name: backend-tests
+on:
+  push:
+    paths:
+      - "python_backend/**"
+      - ".github/workflows/backend-tests.yml"
+  pull_request:
+    paths:
+      - "python_backend/**"
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: python_backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+      - name: Unit + API tests
+        env:
+          DEEPSEEK_KEY: ci-placeholder-not-for-production
+          VOLC_API_KEY: ci-placeholder-not-for-production
+          VOLC_RESOURCE_ID: ci-asr
+          VOLC_RESOURCE_ID_TTS: ci-tts
+        run: python -m pytest tests -m "not integration" -q --tb=short
+      - name: Integration (WebSocket ping)
+        env:
+          DEEPSEEK_KEY: ci-placeholder-not-for-production
+          VOLC_API_KEY: ci-placeholder-not-for-production
+          VOLC_RESOURCE_ID: ci-asr
+          VOLC_RESOURCE_ID_TTS: ci-tts
+        run: python -m pytest tests -m integration -q --tb=short
