@@ -54,6 +54,18 @@ class SettingsScreen extends ConsumerWidget {
             Icons.autorenew,
             baseSize,
           ),
+          _buildSwitchTile(
+            tr(ref, "TTS Pre-warming", "TTS 预热加速"),
+            tr(
+              ref,
+              "Warm up TTS connections at startup to reduce first-sentence latency by 200-500ms.",
+              "服务启动时预热 TTS 连接，使首句合成延迟降低 200-500ms",
+            ),
+            settings.ttsPreWarming,
+            notifier.setTtsPreWarming,
+            Icons.bolt_rounded,
+            baseSize,
+          ),
 
           Container(
             padding: const EdgeInsets.all(16),

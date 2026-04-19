@@ -7,6 +7,7 @@ import struct
 import uuid
 import logging
 import time
+import os
 import websockets
 from collections.abc import AsyncIterator
 from typing import Optional, Tuple
@@ -454,6 +455,358 @@ async def run_volc_streaming_asr_worker(
 
 # ================= 2. 文本转流式语音 (TTS) =================
 
+# ================= TTS 连接预热池 =================
+
+_TTS_POOL_SIZE = int(os.getenv("TTS_WARM_POOL_SIZE", "2"))
+_TTS_WARM_TIMEOUT_SEC = float(os.getenv("TTS_WARM_TIMEOUT_SEC", "300"))
+
+
+class _WarmTTSConnection:
+    """
+    单条预热好的 TTS 连接。
+    持有已建立的 WebSocket，状态为等待 StartSession 请求。
+    """
+
+    __slots__ = ("ws", "connect_id", "created_at")
+
+    def __init__(self, ws, connect_id: str):
+        self.ws = ws
+        self.connect_id = connect_id
+        self.created_at = time.monotonic()
+
+
+class TTSPool:
+    """
+    TTS 连接池：预热 N 条连接，调用时直接取用，省去建连 + 握手 + SessionStarted 的 ~200-500ms。
+
+    官方最佳实践（双向流式 TTS）：
+      ConnectionStarted → StartSession → TaskRequest → ... → SessionFinished → (新) StartSession
+    每次 StartSession 前服务端不再发 50，收到 150 即代表 session 正式开始。
+
+    使用流程：
+      conn = await pool.acquire()   # 等待一条已预热的连接（或新建）
+      # conn.ws 已就绪，可在上面发 StartSession / TaskRequest
+      # 收到 SessionFinished 后立即 startNewSession，连接留在池中
+      await pool.release(conn)       # 放回池中（连接未关闭）
+    """
+
+    def __init__(self, config: dict):
+        self._config = config
+        self._idle: asyncio.Queue = asyncio.Queue()
+        self._in_use: int = 0
+        self._total_created: int = 0
+        self._closed: bool = False
+        self._lock: asyncio.Lock = asyncio.Lock()
+
+    async def warm_up(self) -> None:
+        """服务启动时预热连接（并行创建，不阻塞）"""
+        if self._closed:
+            return
+        async with self._lock:
+            if self._total_created >= _TTS_POOL_SIZE:
+                return
+            remaining = _TTS_POOL_SIZE - self._total_created
+        tasks = [self._build_one_connection() for _ in range(remaining)]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        logger.info(f"[TTSPool] warm_up 完成，预热 {self._total_created}/{_TTS_POOL_SIZE} 条连接")
+
+    async def _build_one_connection(self) -> _WarmTTSConnection | None:
+        """创建一条预热连接：完成 StartConnection + 等待 ConnectionStarted"""
+        WSS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+        api_key = self._config.get("VOLC_API_KEY")
+        resource_id = self._config.get("VOLC_RESOURCE_ID_TTS")
+        if not api_key or not resource_id:
+            logger.warning("[TTSPool] 缺少 TTS 配置，跳过建连")
+            return None
+        connect_id = str(uuid.uuid4())
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "x-api-key": api_key,
+            "X-Api-Resource-Id": resource_id,
+            "X-Api-Connect-Id": connect_id,
+        }
+        try:
+            ws = await asyncio.wait_for(
+                websockets.connect(WSS_URL, additional_headers=headers, open_timeout=10),
+                timeout=12.0,
+            )
+            await ws.send(pack_tts_request(1))
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=min(2.0, deadline - time.monotonic()))
+                except asyncio.TimeoutError:
+                    continue
+                parsed = _try_parse_tts_server_frame(raw)
+                if not parsed:
+                    continue
+                event_type, _ = parsed
+                if event_type == 52:
+                    continue
+                if event_type == 50:
+                    conn = _WarmTTSConnection(ws, connect_id)
+                    async with self._lock:
+                        self._total_created += 1
+                    await self._idle.put(conn)
+                    logger.debug(f"[TTSPool] 连接就绪: {connect_id[:8]}")
+                    return conn
+                if event_type == 51:
+                    logger.warning(f"[TTSPool] 服务端拒绝建连: {connect_id[:8]}")
+                    return None
+            logger.warning(f"[TTSPool] 等待 ConnectionStarted 超时: {connect_id[:8]}")
+        except asyncio.TimeoutError:
+            logger.warning(f"[TTSPool] 建连超时: {connect_id[:8]}")
+        except Exception as e:
+            logger.warning(f"[TTSPool] 建连异常: {e}")
+        return None
+
+    async def acquire(self) -> _WarmTTSConnection:
+        """
+        获取一条就绪连接（已在 ConnectionStarted 状态）。
+        若池为空则新建一条（同步等待）。
+        """
+        if self._closed:
+            raise RuntimeError("TTSPool 已关闭")
+        while True:
+            try:
+                conn = self._idle.get_nowait()
+                if time.monotonic() - conn.created_at > _TTS_WARM_TIMEOUT_SEC:
+                    logger.debug(f"[TTSPool] 连接过期，丢弃并重建: {conn.connect_id[:8]}")
+                    await self._close_one(conn)
+                    continue
+                self._in_use += 1
+                return conn
+            except asyncio.QueueEmpty:
+                pass
+            async with self._lock:
+                if self._total_created < _TTS_POOL_SIZE:
+                    needed = min(1, _TTS_POOL_SIZE - self._total_created)
+                else:
+                    needed = 0
+            if needed > 0:
+                conn = await self._build_one_connection()
+                if conn is not None:
+                    self._in_use += 1
+                    return conn
+            await asyncio.sleep(0.05)
+
+    async def release(self, conn: _WarmTTSConnection) -> None:
+        """将连接放回空闲池（尝试 ping 保活，失败则丢弃）"""
+        self._in_use -= 1
+        if self._closed:
+            await self._close_one(conn)
+            return
+        try:
+            await asyncio.wait_for(conn.ws.ping(), timeout=3.0)
+        except Exception:
+            logger.debug(f"[TTSPool] 连接已失效，丢弃: {conn.connect_id[:8]}")
+            await self._close_one(conn)
+            async with self._lock:
+                if self._total_created > 0:
+                    self._total_created -= 1
+            return
+        await self._idle.put(conn)
+
+    async def _close_one(self, conn: _WarmTTSConnection) -> None:
+        try:
+            await conn.ws.close()
+        except Exception:
+            pass
+
+    async def close(self) -> None:
+        """关闭池中所有连接（服务停止时调用）"""
+        self._closed = True
+        closed = 0
+        while True:
+            try:
+                conn = self._idle.get_nowait()
+                await self._close_one(conn)
+                closed += 1
+            except asyncio.QueueEmpty:
+                break
+        logger.info(f"[TTSPool] 已关闭 {closed} 条预热连接")
+
+
+# 模块级连接池单例（server.py 启动时初始化）
+_tts_pool: TTSPool | None = None
+
+
+def get_tts_pool() -> TTSPool | None:
+    return _tts_pool
+
+
+def init_tts_pool(config: dict) -> TTSPool:
+    global _tts_pool
+    if _tts_pool is None:
+        _tts_pool = TTSPool(config)
+    return _tts_pool
+
+
+async def warm_tts_pool() -> None:
+    """供 server.py startup 调用，启动时并行预热连接池"""
+    pool = get_tts_pool()
+    if pool:
+        await pool.warm_up()
+
+
+async def iter_tts_pcm_chunks_pooled(
+    text: str,
+    config: dict,
+    latency_hooks: Optional[dict] = None,
+) -> AsyncIterator[bytes]:
+    """
+    从连接池取出一条预热好的 TTS 连接，省去 StartConnection + ConnectionStarted 开销。
+    内部完成 StartSession → TaskRequest(逐字) → FinishSession → 释放回池。
+
+    官方流程（连接复用）：
+      StartSession(100) → SessionStarted(150) → TaskRequest(200) × N → FinishSession(102)
+      → 收到 SessionFinished(152) 后，连接回到池中供下一句复用。
+    """
+    pool = get_tts_pool()
+    if pool is None:
+        logger.warning("[TTSPool] 池未初始化，回退到非池化模式")
+        async for chunk in iter_tts_pcm_chunks(text, config, latency_hooks):
+            yield chunk
+        return
+
+    voice_type = config.get("VOICE", "BV001_streaming")
+    session_id = str(uuid.uuid4())
+
+    conn = None
+    try:
+        conn = await pool.acquire()
+        ws = conn.ws
+
+        base_req = {
+            "user": {"uid": "english_coach"},
+            "namespace": "BidirectionalTTS",
+            "req_params": {
+                "speaker": voice_type,
+                "audio_params": {
+                    "format": "pcm",
+                    "sample_rate": 24000,
+                    "enable_timestamp": True,
+                },
+                "additions": json.dumps({
+                    "disable_markdown_filter": False,
+                }),
+            },
+        }
+
+        await ws.send(pack_tts_request(100, session_id, base_req))
+
+        deadline = time.monotonic() + 8.0
+        saw_150 = False
+        while time.monotonic() < deadline and not saw_150:
+            try:
+                raw = await asyncio.wait_for(
+                    ws.recv(), timeout=min(2.0, max(0.05, deadline - time.monotonic()))
+                )
+            except asyncio.TimeoutError:
+                continue
+            parsed = _try_parse_tts_server_frame(raw)
+            if not parsed:
+                continue
+            et, pb = parsed
+            if et == 352:
+                if latency_hooks is not None and not latency_hooks.get("_tts_first_pcm_logged"):
+                    latency_hooks["_tts_first_pcm_logged"] = True
+                    t0 = latency_hooks.get("t0")
+                    tid = latency_hooks.get("turn_id", "?")
+                    if isinstance(t0, (int, float)):
+                        ms = (time.perf_counter() - float(t0)) * 1000.0
+                        logger.info(
+                            "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
+                            tid,
+                            "07_first_pcm_to_client",
+                            ms,
+                            len(pb),
+                        )
+                yield pb
+                continue
+            if et == 150:
+                saw_150 = True
+                break
+            if et == 350:
+                logger.debug("TTS 句子开始 (event 350)")
+                continue
+            if et == 351:
+                logger.debug("TTS 句子结束 (event 351)")
+                continue
+            if et == 52:
+                continue
+        if not saw_150:
+            raise TimeoutError("火山引擎 TTS 池化连接等待 SessionStarted(150) 超时")
+
+        for char in text:
+            synthesis_req = copy.deepcopy(base_req)
+            synthesis_req["event"] = 200
+            synthesis_req["req_params"]["text"] = char
+            await ws.send(pack_tts_request(200, session_id, synthesis_req))
+            await asyncio.sleep(0.005)
+
+        await ws.send(pack_tts_request(102, session_id))
+
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            try:
+                raw = await asyncio.wait_for(
+                    ws.recv(), timeout=min(2.0, max(0.05, deadline - time.monotonic()))
+                )
+            except asyncio.TimeoutError:
+                continue
+            parsed = _try_parse_tts_server_frame(raw)
+            if not parsed:
+                continue
+            et, pb = parsed
+            if et == 352:
+                if latency_hooks is not None and not latency_hooks.get("_tts_first_pcm_logged"):
+                    latency_hooks["_tts_first_pcm_logged"] = True
+                    t0 = latency_hooks.get("t0")
+                    tid = latency_hooks.get("turn_id", "?")
+                    if isinstance(t0, (int, float)):
+                        ms = (time.perf_counter() - float(t0)) * 1000.0
+                        logger.info(
+                            "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
+                            tid,
+                            "07_first_pcm_to_client",
+                            ms,
+                            len(pb),
+                        )
+                yield pb
+                continue
+            if et == 350:
+                logger.debug("TTS 句子开始 (event 350)")
+                continue
+            if et == 351:
+                logger.debug("TTS 句子结束 (event 351)")
+                continue
+            if et == 152:
+                break
+            if et == 52:
+                continue
+        # 成功完成，连接回到池中
+        await pool.release(conn)
+        conn = None
+
+    except asyncio.CancelledError:
+        if conn is not None:
+            try:
+                await pool.release(conn)
+            except Exception:
+                pass
+        raise
+    except Exception:
+        if conn is not None:
+            try:
+                await pool.release(conn)
+            except Exception:
+                pass
+        raise
+
+
+# ================= TTS 核心异步迭代器（支持从连接池取用） =================
+
 _PCM_STREAM_END = object()
 
 
@@ -624,13 +977,23 @@ async def iter_tts_pcm_chunks(
                             "audio_params": {
                                 "format": "pcm",
                                 "sample_rate": 24000,
+                                "enable_timestamp": True,
                             },
+                            "additions": json.dumps({
+                                "disable_markdown_filter": False,
+                            }),
                         },
                     }
                     await ws.send(pack_tts_request(100, session_id, req))
 
                 elif event_type == 150:
                     session_started_event.set()
+
+                elif event_type == 350:
+                    logger.debug("TTS 句子开始 (event 350)")
+
+                elif event_type == 351:
+                    logger.debug("TTS 句子结束 (event 351)")
 
                 elif event_type == 352:
                     if latency_hooks is not None and not latency_hooks.get(
@@ -651,9 +1014,12 @@ async def iter_tts_pcm_chunks(
                     await pcm_queue.put(payload)
 
                 elif event_type == 152:
-                    await ws.send(pack_tts_request(2))
+                    # SessionFinished：服务端通知本 session 合成完毕，session 关闭。
+                    # 不发 Event 2（FinishConnection），连接由上下文管理器自动关闭。
+                    break
 
                 elif event_type == 52:
+                    # ConnectionFinished：服务端确认连接已关闭。收到后 break 退出。
                     break
         finally:
             await mark_stream_end()
@@ -673,9 +1039,30 @@ async def iter_tts_pcm_chunks(
                 except asyncio.TimeoutError:
                     raise TimeoutError("火山引擎 TTS 建连超时")
 
-                await ws.send(
-                    pack_tts_request(200, session_id, {"req_params": {"text": text}})
-                )
+                base_req = {
+                    "user": {"uid": "english_coach"},
+                    "namespace": "BidirectionalTTS",
+                    "req_params": {
+                        "speaker": voice_type,
+                        "audio_params": {
+                            "format": "pcm",
+                            "sample_rate": 24000,
+                            "enable_timestamp": True,
+                        },
+                        "additions": json.dumps({
+                            "disable_markdown_filter": False,
+                        }),
+                    },
+                }
+
+                # 官方最佳实践：逐字发送文本，5ms 间隔，让服务端尽早开始合成
+                for char in text:
+                    synthesis_req = copy.deepcopy(base_req)
+                    synthesis_req["event"] = 200
+                    synthesis_req["req_params"]["text"] = char
+                    await ws.send(pack_tts_request(200, session_id, synthesis_req))
+                    await asyncio.sleep(0.005)
+
                 await ws.send(pack_tts_request(102, session_id))
 
                 while True:
@@ -713,8 +1100,20 @@ async def run_tts_to_ws(
     config: dict,
     latency_hooks: Optional[dict] = None,
 ):
+    """点读单句 TTS：优先从连接池取预热连接，池未就绪时回退非池化。"""
+    pool = get_tts_pool()
+    use_pool = pool is not None
+
+    async def _iter():
+        if use_pool:
+            async for chunk in iter_tts_pcm_chunks_pooled(text, config, latency_hooks):
+                yield chunk
+        else:
+            async for chunk in iter_tts_pcm_chunks(text, config, latency_hooks):
+                yield chunk
+
     try:
-        async for payload in iter_tts_pcm_chunks(text, config, latency_hooks):
+        async for payload in _iter():
             async with ws_lock:
                 await client_ws.send_bytes(payload)
     except Exception as e:
@@ -729,189 +1128,195 @@ async def run_tts_turn_reused_from_queue(
     latency_hooks: Optional[dict] = None,
 ):
     """
-    一轮对话：单条 WebSocket 顺序多 session（官方：ConnectionStarted → 多次
-    StartSession / TaskRequest / FinishSession，收到 SessionFinished 后再开下一句）。
-    二进制协议下 event 152 表示本轮合成结束；句间不发送 event 2，仅在队列结束后
-    finish connection。首段前等事件 50；后续段通常无 50，直接发 100 再收 150。
-    点读单句仍用 run_tts_to_ws / iter_tts_pcm_chunks。
+    一轮对话 TTS：优先从连接池取预热连接，省去建连 + ConnectionStarted 开销。
+
+    官方连接复用流程：
+      ConnectionStarted → StartSession(100) → SessionStarted(150) → TaskRequest(200) → ...
+      → SessionFinished(152) → (下一句) StartSession(100) → SessionStarted(150) → ...
+
+    池中连接已处于 ConnectionStarted 状态，首句可直接发 StartSession，后续句同理。
+    队列结束后发送 FinishSession(102)，连接回到池中供下一轮复用。
     """
-    WSS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
-    volc_api_key = config.get("VOLC_API_KEY")
-    volc_resource_id = config.get("VOLC_RESOURCE_ID_TTS")
+    pool = get_tts_pool()
+    use_pool = pool is not None
     voice_type = config.get("VOICE", "BV001_streaming")
 
-    if not volc_api_key or not volc_resource_id:
-        logger.error("🚨 TTS 启动失败: 缺失配置信息")
-        return
-
-    headers = {
-        "Authorization": f"Bearer {volc_api_key}",
-        "x-api-key": volc_api_key,
-        "X-Api-Resource-Id": volc_resource_id,
-        "X-Api-Connect-Id": str(uuid.uuid4()),
-    }
+    conn: Optional[_WarmTTSConnection] = None
+    ws = None
 
     base_req = {
         "user": {"uid": "english_coach"},
         "namespace": "BidirectionalTTS",
         "req_params": {
             "speaker": voice_type,
-            "audio_params": {"format": "pcm", "sample_rate": 24000},
+            "audio_params": {
+                "format": "pcm",
+                "sample_rate": 24000,
+                "enable_timestamp": True,
+            },
+            "additions": json.dumps({
+                "disable_markdown_filter": False,
+            }),
         },
     }
 
-    async def _recv_frame_deadline(ws, deadline: float) -> bytes:
+    def _make_session_id() -> str:
+        return str(uuid.uuid4())
+
+    async def _recv_frame_deadline(wss, deadline: float) -> bytes:
         while time.monotonic() < deadline:
             remain = deadline - time.monotonic()
             if remain <= 0:
                 break
             try:
                 return await asyncio.wait_for(
-                    ws.recv(), timeout=max(0.05, min(2.0, remain))
+                    wss.recv(), timeout=max(0.05, min(2.0, remain))
                 )
             except asyncio.TimeoutError:
                 continue
         raise TimeoutError("火山引擎 TTS 收包超时")
 
-    try:
-        async with websockets.connect(
-            WSS_URL, additional_headers=headers, open_timeout=10
-        ) as ws:
-            await ws.send(pack_tts_request(1))
-
-            # 仅连接建立后首段会话前会收到事件 50；同连接后续句服务端往往不再发 50，
-            # 须在 152 之后直接发 100 开新 session（否则在「等 50」处 8s 收包超时，中段全丢）。
-            first_segment_on_link = True
-
-            while True:
-                text_chunk = await segment_queue.get()
-                if text_chunk is None:
-                    segment_queue.task_done()
-                    try:
-                        await ws.send(pack_tts_request(2))
-                    except Exception:
-                        pass
-                    break
-
-                session_id = str(uuid.uuid4())
-                deadline = time.monotonic() + 8.0
-
-                try:
-                    if first_segment_on_link:
-                        saw_50 = False
-                        while time.monotonic() < deadline and not saw_50:
-                            raw = await _recv_frame_deadline(ws, deadline)
-                            parsed = _try_parse_tts_server_frame(raw)
-                            if not parsed:
-                                continue
-                            et, _pb = parsed
-                            if et == 52:
-                                continue
-                            if et == 50:
-                                saw_50 = True
-                                await ws.send(
-                                    pack_tts_request(
-                                        100, session_id, copy.deepcopy(base_req)
-                                    )
-                                )
-                                break
-                        if not saw_50:
-                            raise TimeoutError(
-                                "火山引擎 TTS 建连超时(等待事件 50)"
-                            )
-                    else:
-                        await ws.send(
-                            pack_tts_request(
-                                100, session_id, copy.deepcopy(base_req)
-                            )
+    async def _send_and_wait_150(wss, session_id: str) -> None:
+        """发 StartSession(100)，等 SessionStarted(150)；同时透传 352 音频帧"""
+        await wss.send(pack_tts_request(100, session_id, copy.deepcopy(base_req)))
+        deadline = time.monotonic() + 8.0
+        saw_150 = False
+        while time.monotonic() < deadline and not saw_150:
+            raw = await _recv_frame_deadline(wss, deadline)
+            parsed = _try_parse_tts_server_frame(raw)
+            if not parsed:
+                continue
+            et, pb = parsed
+            if et == 352:
+                if latency_hooks is not None and not latency_hooks.get("_tts_first_pcm_logged"):
+                    latency_hooks["_tts_first_pcm_logged"] = True
+                    t0 = latency_hooks.get("t0")
+                    tid = latency_hooks.get("turn_id", "?")
+                    if isinstance(t0, (int, float)):
+                        ms = (time.perf_counter() - float(t0)) * 1000.0
+                        logger.info(
+                            "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
+                            tid, "07_first_pcm_to_client", ms, len(pb),
                         )
+                async with ws_lock:
+                    await client_ws.send_bytes(pb)
+                continue
+            if et == 150:
+                saw_150 = True
+                break
+            if et == 350:
+                logger.debug("TTS 句子开始 (event 350)")
+                continue
+            if et == 351:
+                logger.debug("TTS 句子结束 (event 351)")
+                continue
+            if et == 52:
+                continue
+        if not saw_150:
+            raise TimeoutError("火山引擎 TTS 等待 SessionStarted(150) 超时")
 
-                    saw_150 = False
+    async def _send_and_wait_152(wss, session_id: str, chunk_text: str) -> None:
+        """发 TaskRequest(逐字) + FinishSession(102)，等 SessionFinished(152)；同时透传 352"""
+        for char in chunk_text:
+            synthesis_req = copy.deepcopy(base_req)
+            synthesis_req["event"] = 200
+            synthesis_req["req_params"]["text"] = char
+            await wss.send(pack_tts_request(200, session_id, synthesis_req))
+            await asyncio.sleep(0.005)
+        await wss.send(pack_tts_request(102, session_id))
+
+        deadline = time.monotonic() + 120.0
+        while time.monotonic() < deadline:
+            raw = await _recv_frame_deadline(wss, deadline)
+            parsed = _try_parse_tts_server_frame(raw)
+            if not parsed:
+                continue
+            et, pb = parsed
+            if et == 352:
+                if latency_hooks is not None and not latency_hooks.get("_tts_first_pcm_logged"):
+                    latency_hooks["_tts_first_pcm_logged"] = True
+                    t0 = latency_hooks.get("t0")
+                    tid = latency_hooks.get("turn_id", "?")
+                    if isinstance(t0, (int, float)):
+                        ms = (time.perf_counter() - float(t0)) * 1000.0
+                        logger.info(
+                            "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
+                            tid, "07_first_pcm_to_client", ms, len(pb),
+                        )
+                async with ws_lock:
+                    await client_ws.send_bytes(pb)
+                continue
+            if et == 350:
+                logger.debug("TTS 句子开始 (event 350)")
+                continue
+            if et == 351:
+                logger.debug("TTS 句子结束 (event 351)")
+                continue
+            if et == 152:
+                break
+            if et == 52:
+                continue
+
+    # ── 主循环 ──────────────────────────────────────────────────────────────
+    try:
+        while True:
+            text_chunk = await segment_queue.get()
+            if text_chunk is None:
+                segment_queue.task_done()
+                break
+
+            session_id = _make_session_id()
+
+            # 首次使用时：从池中取连接（或新建）
+            if ws is None:
+                if use_pool:
+                    try:
+                        conn = await pool.acquire()
+                        ws = conn.ws
+                        logger.debug("[TTS] 使用池化连接")
+                    except Exception as e:
+                        logger.warning(f"[TTS] 池化连接获取失败，回退新建: {e}")
+                        use_pool = False
+                        conn = None
+
+                if not use_pool or ws is None:
+                    # 非池化回退（首次建连，含 ConnectionStarted）
+                    WSS_URL = "wss://openspeech.bytedance.com/api/v3/tts/bidirection"
+                    volc_api_key = config.get("VOLC_API_KEY")
+                    volc_resource_id = config.get("VOLC_RESOURCE_ID_TTS")
+                    if not volc_api_key or not volc_resource_id:
+                        logger.error("🚨 TTS 启动失败: 缺失配置信息")
+                        return
+                    headers = {
+                        "Authorization": f"Bearer {volc_api_key}",
+                        "x-api-key": volc_api_key,
+                        "X-Api-Resource-Id": volc_resource_id,
+                        "X-Api-Connect-Id": str(uuid.uuid4()),
+                    }
+                    ws = await websockets.connect(
+                        WSS_URL, additional_headers=headers, open_timeout=10
+                    )
+                    await ws.send(pack_tts_request(1))
                     deadline = time.monotonic() + 8.0
-                    while time.monotonic() < deadline and not saw_150:
+                    saw_50 = False
+                    while time.monotonic() < deadline and not saw_50:
                         raw = await _recv_frame_deadline(ws, deadline)
                         parsed = _try_parse_tts_server_frame(raw)
                         if not parsed:
                             continue
-                        et, pb = parsed
-                        if et == 352:
-                            if latency_hooks is not None and not latency_hooks.get(
-                                "_tts_first_pcm_logged"
-                            ):
-                                latency_hooks["_tts_first_pcm_logged"] = True
-                                t0 = latency_hooks.get("t0")
-                                tid = latency_hooks.get("turn_id", "?")
-                                if isinstance(t0, (int, float)):
-                                    ms = (time.perf_counter() - float(t0)) * 1000.0
-                                    logger.info(
-                                        "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
-                                        tid,
-                                        "07_first_pcm_to_client",
-                                        ms,
-                                        len(pb),
-                                    )
-                            try:
-                                async with ws_lock:
-                                    await client_ws.send_bytes(pb)
-                            except Exception as e:
-                                logger.warning(f"TTS 下发中断 (前端可能断开): {e}")
-                                raise
-                            continue
-                        if et == 150:
-                            saw_150 = True
-                            break
+                        et, _pb = parsed
                         if et == 52:
                             continue
-                    if not saw_150:
-                        raise TimeoutError("火山引擎 TTS 建连超时(等待事件 150)")
-
-                    await ws.send(
-                        pack_tts_request(
-                            200,
-                            session_id,
-                            {"req_params": {"text": text_chunk}},
-                        )
-                    )
-                    await ws.send(pack_tts_request(102, session_id))
-
-                    deadline = time.monotonic() + 120.0
-                    while time.monotonic() < deadline:
-                        raw = await _recv_frame_deadline(ws, deadline)
-                        parsed = _try_parse_tts_server_frame(raw)
-                        if not parsed:
-                            continue
-                        et, pb = parsed
-                        if et == 352:
-                            if latency_hooks is not None and not latency_hooks.get(
-                                "_tts_first_pcm_logged"
-                            ):
-                                latency_hooks["_tts_first_pcm_logged"] = True
-                                t0 = latency_hooks.get("t0")
-                                tid = latency_hooks.get("turn_id", "?")
-                                if isinstance(t0, (int, float)):
-                                    ms = (time.perf_counter() - float(t0)) * 1000.0
-                                    logger.info(
-                                        "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
-                                        tid,
-                                        "07_first_pcm_to_client",
-                                        ms,
-                                        len(pb),
-                                    )
-                            try:
-                                async with ws_lock:
-                                    await client_ws.send_bytes(pb)
-                            except Exception as e:
-                                logger.warning(f"TTS 下发中断 (前端可能断开): {e}")
-                                raise
-                        elif et == 152:
+                        if et == 50:
+                            saw_50 = True
                             break
-                        elif et == 52:
-                            continue
-                    else:
-                        raise TimeoutError("火山引擎 TTS 单句合成超时(未收到 152)")
-                    first_segment_on_link = False
-                finally:
-                    segment_queue.task_done()
+                    if not saw_50:
+                        raise TimeoutError("火山引擎 TTS 建连超时(等待事件 50)")
+
+            # StartSession + 逐字发送
+            await _send_and_wait_150(ws, session_id)
+            await _send_and_wait_152(ws, session_id, text_chunk)
+            segment_queue.task_done()
 
     except asyncio.CancelledError:
         raise
@@ -919,3 +1324,11 @@ async def run_tts_turn_reused_from_queue(
         logger.warning("🌋 TTS WebSocket 意外断开")
     except Exception as e:
         logger.error(f"❌ TTS 全局异常: {e}")
+    finally:
+        if use_pool and conn is not None:
+            await pool.release(conn)
+        elif ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass

@@ -29,6 +29,9 @@ from core.audio_service import (
     run_volc_streaming_asr_worker,
     run_tts_to_ws,
     run_tts_turn_reused_from_queue,
+    init_tts_pool,
+    warm_tts_pool,
+    get_tts_pool,
 )
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
@@ -138,11 +141,16 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def on_startup():
-    """服务启动时：SQLite 结构升级 → VectorStore 预热 → DeepSeek HTTP 预热"""
+    """服务启动时：SQLite 结构升级 → VectorStore 预热 → DeepSeek HTTP 预热 → TTS 连接池预热"""
     await run_in_threadpool(ensure_schema_upgrades)
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
     await warm_deepseek_connection("server_startup")
+    # TTS 连接池预热（后台任务，不阻塞启动）
+    from core.audio_service import _TTS_POOL_SIZE as _TP_SIZE
+    pool = init_tts_pool(CONFIG)
+    asyncio.create_task(warm_tts_pool())
+    logger.info(f"🔥 TTS 连接池已初始化（大小={_TP_SIZE}），正在后台预热...")
 
 
 @app.on_event("shutdown")
@@ -151,6 +159,9 @@ async def on_shutdown():
         await client.close()
     except Exception as e:
         logger.warning("[LLM] AsyncOpenAI close: %s", e)
+    pool = get_tts_pool()
+    if pool:
+        await pool.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
