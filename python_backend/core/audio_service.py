@@ -624,13 +624,23 @@ async def iter_tts_pcm_chunks(
                             "audio_params": {
                                 "format": "pcm",
                                 "sample_rate": 24000,
+                                "enable_timestamp": True,
                             },
+                            "additions": json.dumps({
+                                "disable_markdown_filter": False,
+                            }),
                         },
                     }
                     await ws.send(pack_tts_request(100, session_id, req))
 
                 elif event_type == 150:
                     session_started_event.set()
+
+                elif event_type == 350:
+                    logger.debug("TTS 句子开始 (event 350)")
+
+                elif event_type == 351:
+                    logger.debug("TTS 句子结束 (event 351)")
 
                 elif event_type == 352:
                     if latency_hooks is not None and not latency_hooks.get(
@@ -651,9 +661,12 @@ async def iter_tts_pcm_chunks(
                     await pcm_queue.put(payload)
 
                 elif event_type == 152:
-                    await ws.send(pack_tts_request(2))
+                    # SessionFinished：服务端通知本 session 合成完毕，session 关闭。
+                    # 不发 Event 2（FinishConnection），连接由上下文管理器自动关闭。
+                    break
 
                 elif event_type == 52:
+                    # ConnectionFinished：服务端确认连接已关闭。收到后 break 退出。
                     break
         finally:
             await mark_stream_end()
@@ -673,9 +686,30 @@ async def iter_tts_pcm_chunks(
                 except asyncio.TimeoutError:
                     raise TimeoutError("火山引擎 TTS 建连超时")
 
-                await ws.send(
-                    pack_tts_request(200, session_id, {"req_params": {"text": text}})
-                )
+                base_req = {
+                    "user": {"uid": "english_coach"},
+                    "namespace": "BidirectionalTTS",
+                    "req_params": {
+                        "speaker": voice_type,
+                        "audio_params": {
+                            "format": "pcm",
+                            "sample_rate": 24000,
+                            "enable_timestamp": True,
+                        },
+                        "additions": json.dumps({
+                            "disable_markdown_filter": False,
+                        }),
+                    },
+                }
+
+                # 官方最佳实践：逐字发送文本，5ms 间隔，让服务端尽早开始合成
+                for char in text:
+                    synthesis_req = copy.deepcopy(base_req)
+                    synthesis_req["event"] = 200
+                    synthesis_req["req_params"]["text"] = char
+                    await ws.send(pack_tts_request(200, session_id, synthesis_req))
+                    await asyncio.sleep(0.005)
+
                 await ws.send(pack_tts_request(102, session_id))
 
                 while True:
@@ -756,7 +790,14 @@ async def run_tts_turn_reused_from_queue(
         "namespace": "BidirectionalTTS",
         "req_params": {
             "speaker": voice_type,
-            "audio_params": {"format": "pcm", "sample_rate": 24000},
+            "audio_params": {
+                "format": "pcm",
+                "sample_rate": 24000,
+                "enable_timestamp": True,
+            },
+            "additions": json.dumps({
+                "disable_markdown_filter": False,
+            }),
         },
     }
 
@@ -860,18 +901,25 @@ async def run_tts_turn_reused_from_queue(
                         if et == 150:
                             saw_150 = True
                             break
+                        if et == 350:
+                            logger.debug("TTS 句子开始 (event 350)")
+                            continue
+                        if et == 351:
+                            logger.debug("TTS 句子结束 (event 351)")
+                            continue
                         if et == 52:
                             continue
                     if not saw_150:
                         raise TimeoutError("火山引擎 TTS 建连超时(等待事件 150)")
 
-                    await ws.send(
-                        pack_tts_request(
-                            200,
-                            session_id,
-                            {"req_params": {"text": text_chunk}},
-                        )
-                    )
+                    # 官方最佳实践：逐字发送文本，5ms 间隔，让服务端尽早开始合成
+                    for char in text_chunk:
+                        synthesis_req = copy.deepcopy(base_req)
+                        synthesis_req["event"] = 200
+                        synthesis_req["req_params"]["text"] = char
+                        await ws.send(pack_tts_request(200, session_id, synthesis_req))
+                        await asyncio.sleep(0.005)
+
                     await ws.send(pack_tts_request(102, session_id))
 
                     deadline = time.monotonic() + 120.0
@@ -903,6 +951,10 @@ async def run_tts_turn_reused_from_queue(
                             except Exception as e:
                                 logger.warning(f"TTS 下发中断 (前端可能断开): {e}")
                                 raise
+                        elif et == 350:
+                            logger.debug("TTS 句子开始 (event 350)")
+                        elif et == 351:
+                            logger.debug("TTS 句子结束 (event 351)")
                         elif et == 152:
                             break
                         elif et == 52:
