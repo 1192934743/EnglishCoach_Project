@@ -1,21 +1,58 @@
 // lib/features/chat/providers/chat_provider.dart
+//
+// 职责：
+// 1. 定义 ChatState / ChatStatus / ChatTurn（已保留）
+// 2. 管理 UI 状态（会话历史、进度、角色翻转等）
+// 3. 响应用户 action（toggleButton、swapRole 等）
+// 4. 委托音频控制 → AudioController
+// 5. 委托 WS 消息解析 → ws_message_parser.dart
+//
+// 不再包含：音频录制/播放逻辑、WS 消息解析（已拆分到 services/）
+
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:record/record.dart';
-import 'package:flutter_sound/flutter_sound.dart';
-import 'package:audio_session/audio_session.dart';
 import 'package:uuid/uuid.dart';
+
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/network/user_manager.dart';
 import '../models/session_report_model.dart';
+import '../models/ws_message_models.dart';
+import '../services/audio_controller.dart';
+import '../services/ws_message_parser.dart';
 
 export '../models/session_report_model.dart';
+export '../models/ws_message_models.dart' show
+    WsSessionReportPreliminary,
+    WsSessionReportFinal,
+    UserSettings,
+    WsEventType,
+    WsWarmupSuccess,
+    WsTtsFinished,
+    WsTeachingData,
+    WsRoleSwapped,
+    WsTopicMastery,
+    WsTopicGenerating,
+    WsTopicChanged,
+    WsSessionReport,
+    WsError,
+    WsAsrPartial,
+    WsTestAiReply;
+
+// ── 类型别名 ───────────────────────────────────────────────────────────────
 
 enum ChatStatus { idle, listening, speaking }
+
+// ── Debug ──────────────────────────────────────────────────────────────
+// true:  依赖 flutter_sound 的 whenFinished 回调切到用户说话（ttsFinished 只关流不等待）。
+//         测试方法：手动把这里改为 true，真机跑一遍看音频尾巴是否完整、切换是否流畅。
+// false: 使用 ttsFinished 事件 + 300ms 缓冲后关流（现有机制）。
+const bool _kUseNativeAudioCallback = kDebugMode;
+
+// ── 数据模型 ─────────────────────────────────────────────────────────────
 
 class ChatTurn {
   final String userText;
@@ -34,15 +71,10 @@ class ChatState {
   final bool isFlipped;
   final double masteryProgress;
   final String? errorMessage;
-  // ── LMS 新增字段 ───────────────────────────────────────────────────────
-  /// 非 null 时触发报告卡弹出；dismiss 后调用 clearSessionReport() 置 null
   final SessionReport? sessionReport;
   final String currentTopicTitle;
-  /// 来自后端 `topics.title_zh` / TaskPacket；空则界面用 `topicTitleUiLabel` 兜底。
   final String currentTopicTitleZh;
   final String currentRoleName;
-
-  /// true while backend is generating a user-requested topic
   final bool isGeneratingTopic;
 
   ChatState({
@@ -89,99 +121,327 @@ class ChatState {
   }
 }
 
-// copyWith 的哨兵值，用于区分「未传参」与「显式传 null」
 const Object _sentinel = Object();
 
-class ChatNotifier extends Notifier<ChatState> {
-  late AudioRecorder _recorder;
-  final FlutterSoundPlayer _player = FlutterSoundPlayer();
+// ── Provider ──────────────────────────────────────────────────────────────
 
+final chatProvider = NotifierProvider<ChatNotifier, ChatState>(
+  () => ChatNotifier(),
+);
+
+// ── ChatNotifier ────────────────────────────────────────────────────────
+
+class ChatNotifier extends Notifier<ChatState> {
+  // ── 音频控制器（委托）─────────────────────────────────────────────
+  late final AudioController _audio;
+
+  // ── 订阅管理 ──────────────────────────────────────────────────────
   StreamSubscription? _commandSubscription;
   StreamSubscription? _audioSubscription;
-  StreamSubscription<Amplitude>? _ampSubscription;
   StreamSubscription? _connectionSubscription;
-  Timer? _silenceTimer;
+  StreamSubscription? _pcmSubscription;
 
+  // ── VAD 状态 ──────────────────────────────────────────────────────
+  Timer? _silenceTimer;
+  Timer? _maxListenTimer;
   bool _hasSpoken = false;
   int _noiseFrames = 0;
-  bool _isAutoLooping = false;
-  int _totalBytesReceived = 0;
-  DateTime? _playbackStartTime;
 
-  /// 打断标志：true 期间，所有 TTS 回调（音频流 / tts_finished）均被忽略
+  // ── AutoMode / Interrupt ──────────────────────────────────────────
   bool _isInterrupting = false;
-
-  /// 重连标志：上一次状态为 reconnecting，用于判断是否需要重新握手
   bool _wasReconnecting = false;
+  bool _isStartingListen = false;  // Fix B4
+  bool _reportShowing = false;       // Fix B7
 
-  /// Fix B4: 防止 startListening() 并发调用的互斥标志
-  bool _isStartingListen = false;
-
-  /// Fix B5: 最大录音计时器（静默超时保护）
-  Timer? _maxListenTimer;
-
-  /// Fix B7: 报告卡展示期间暂停 autoMode 自动开始录音
-  bool _reportShowing = false;
-
-  /// 端到端延迟排查：从 stopListeningAndSubmit 到首包 PCM 的客户端阶段
+  // ── Latency 追踪 ───────────────────────────────────────────────────
   Stopwatch? _latencySw;
   bool _latencyLoggedFirstPcm = false;
-  /// 与后端 [LATENCY]/[E2E] 对齐的轮次 id（随 user_finish_speaking 上报）
   String? _latencyTurnId;
   int? _latencyFirstPcmMs;
 
-  void _latencyLogClient(String stage, [String extra = '']) {
-    final sw = _latencySw;
-    if (sw == null) return;
-    final ms = sw.elapsedMilliseconds;
-    final tail = extra.isEmpty ? '' : ' $extra';
-    final tid = _latencyTurnId;
-    final turnSeg = (tid != null && tid.isNotEmpty) ? 'turn=$tid ' : '';
-    debugPrint('[LATENCY][client] $turnSeg$stage +${ms}ms$tail');
-  }
-
   @override
   ChatState build() {
-    _recorder = AudioRecorder();
-    _initAudioSessionAndPlayer();
+    _audio = AudioController();
+    _initAudio();
     _initWebSocketListeners();
     Future.delayed(const Duration(milliseconds: 500), () => warmUpConnection());
 
-    // ── 监听 WS 连接状态，自动处理重连后的握手重建 ─────────────────────────
     final wsClient = ref.read(websocketProvider);
-    _connectionSubscription = wsClient.connectionStateStream.listen((
-      connState,
-    ) {
-      debugPrint('[WS] connectionState → $connState  (status=${state.status})');
+    _connectionSubscription = wsClient.connectionStateStream.listen((connState) {
+      debugPrint('[WS_conn] state=$connState, status=${state.status}');
       if (connState == WsConnectionState.reconnecting) {
         _wasReconnecting = true;
-        forceIdle(); // 重连期间强制空闲，防止录音/播放残留
+        debugPrint('[WS_conn] reconnecting detected, calling forceIdle()');
+        forceIdle();
       } else if (connState == WsConnectionState.connected && _wasReconnecting) {
         _wasReconnecting = false;
-        Future.delayed(
-          const Duration(milliseconds: 300),
-          () => warmUpConnection(),
-        );
+        debugPrint('[WS_conn] reconnected, scheduling warmup');
+        Future.delayed(const Duration(milliseconds: 300), () => warmUpConnection());
       }
     });
 
     ref.onDispose(() {
       _commandSubscription?.cancel();
       _audioSubscription?.cancel();
-      _ampSubscription?.cancel();
       _connectionSubscription?.cancel();
+      _pcmSubscription?.cancel();
       _silenceTimer?.cancel();
       _maxListenTimer?.cancel();
-      _recorder.dispose();
-      _player.closePlayer();
+      _audio.dispose();
     });
-    return ChatState(
-      status: ChatStatus.idle,
-      chatHistory: [],
-      isFlipped: false,
+
+    return ChatState(status: ChatStatus.idle, chatHistory: []);
+  }
+
+  // ── 初始化 ────────────────────────────────────────────────────────
+
+  Future<void> _initAudio() async {
+    await _audio.init();
+  }
+
+  void _initWebSocketListeners() {
+    final wsClient = ref.read(websocketProvider);
+
+    // WS 文本消息处理
+    _commandSubscription = wsClient.commandStream.listen((data) async {
+      _handleIncomingMessage(data);
+    });
+
+    // WS 音频流处理
+    _audioSubscription = wsClient.audioStream.listen((audioBytes) {
+      debugPrint('[audioStream] received bytes=${audioBytes.length}');
+      if (_isInterrupting) return;
+      if (state.status == ChatStatus.speaking && _audio.isPlaying) {
+        if (!_latencyLoggedFirstPcm) {
+          _latencyLoggedFirstPcm = true;
+          _latencyFirstPcmMs = _latencySw?.elapsedMilliseconds;
+          _latencyLogClient('05_first_pcm_chunk', 'len=${audioBytes.length}');
+        }
+        _audio.writePcm(Uint8List.fromList(audioBytes));
+      } else {
+        debugPrint('[audioStream] DROP bytes=${audioBytes.length} status=${state.status} isPlaying=${_audio.isPlaying}');
+      }
+    });
+  }
+
+  // ── WS 入站消息处理（委托给 WsMessageParser）────────────────────────
+
+  void _handleIncomingMessage(Map<String, dynamic> data) {
+    final event = parseEventType(data);
+    if (event == null) return;
+
+    switch (event) {
+      case WsEventType.warmupSuccess:
+        _handleWarmupSuccess(data);
+        break;
+      case WsEventType.ttsFinished:
+        _handleTtsFinished(data);
+        break;
+      case WsEventType.teachingData:
+        _handleTeachingData(data);
+        break;
+      case WsEventType.roleSwapped:
+        _handleRoleSwapped(data);
+        break;
+      case WsEventType.topicMasteryReached:
+        _handleTopicMastery(data);
+        break;
+      case WsEventType.topicGenerating:
+        _handleTopicGenerating(data);
+        break;
+      case WsEventType.topicChanged:
+        _handleTopicChanged(data);
+        break;
+      case WsEventType.sessionReport:
+        _handleSessionReport(data);
+        break;
+      case WsEventType.error:
+        _handleError(data);
+        break;
+      default:
+        break;
+    }
+  }
+
+  void _handleWarmupSuccess(Map<String, dynamic> data) {
+    final parsed = parseWarmupSuccess(data);
+    if (parsed?.userSettings != null) {
+      _applyUserSettings(parsed!.userSettings!);
+    }
+  }
+
+  void _handleTtsFinished(Map<String, dynamic> data) {
+    if (_isInterrupting) return;
+    debugPrint('[ttsFinished] ▶ received, status=${state.status}');
+    try {
+      _latencyLogClient('06_tts_finished_event');
+      final tid = _latencyTurnId;
+      final sw = _latencySw;
+      if (tid != null && tid.isNotEmpty && sw != null) {
+        ref.read(websocketProvider).sendCommand('client_latency_report', {
+          'trace_id': tid,
+          'submit_to_first_pcm_ms': _latencyFirstPcmMs,
+          'submit_to_tts_finished_ms': sw.elapsedMilliseconds,
+          'had_first_pcm': _latencyFirstPcmMs != null,
+          'client_report_wall_ms': DateTime.now().millisecondsSinceEpoch,
+        });
+      }
+
+      // ttsFinished 到达时，服务端音频已全部发出。
+      // 两种模式：
+      //   _kUseNativeAudioCallback=true:  用进度监听器估算播放结束时刻，
+      //     届时直接调用 _onAudioFinished。无需等 ttsFinished 触发关流。
+      //   _kUseNativeAudioCallback=false: 等 300ms 缓冲后关流（ttsFinished 触发）。
+      if (_kUseNativeAudioCallback) {
+        final totalBytes = _audio.totalPcmBytes;
+        // 24000Hz * 1ch * 2bytes = 48000 bytes/s
+        final audioDurationMs = (totalBytes ~/ 48000 * 1000).clamp(500, 8000);
+        // 留 200ms 缓冲，确保播放器处理完最后一块
+        final fireAtMs = audioDurationMs + 200;
+        debugPrint('[ttsFinished] nativeCallbackMode: totalBytes=$totalBytes → fire in ${fireAtMs}ms');
+        Timer(Duration(milliseconds: fireAtMs), () {
+          _onAudioFinished();
+        });
+      } else {
+        const _streamFinalizeDelayMs = 300;
+        debugPrint('[ttsFinished] ttsFinishedMode: closing stream in ${_streamFinalizeDelayMs}ms');
+        Future.delayed(const Duration(milliseconds: _streamFinalizeDelayMs), () {
+          _audio.closePcmStream();
+        });
+      }
+    } catch (e, st) {
+      debugPrint('[ttsFinished] EXCEPTION: $e STACKTRACE: $st');
+      state = state.copyWith(status: ChatStatus.idle);
+    }
+  }
+
+  void _handleTeachingData(Map<String, dynamic> data) {
+    final parsed = parseTeachingData(data);
+    if (parsed == null) return;
+    if (parsed.userText.isEmpty && parsed.aiText.isEmpty) return;
+    final newTurn = ChatTurn(
+      userText: parsed.userText,
+      aiText: parsed.aiText,
+      rawTeachingData: Map<String, dynamic>.from(data['data'] ?? {}),
+    );
+    state = state.copyWith(chatHistory: [...state.chatHistory, newTurn]);
+  }
+
+  void _handleRoleSwapped(Map<String, dynamic> data) {
+    final parsed = parseRoleSwapped(data);
+    if (parsed != null) {
+      state = state.copyWith(isFlipped: parsed.isFlipped);
+    }
+  }
+
+  void _handleTopicMastery(Map<String, dynamic> data) {
+    final parsed = parseTopicMastery(data);
+    if (parsed != null) {
+      state = state.copyWith(masteryProgress: parsed.progress);
+    }
+  }
+
+  void _handleTopicGenerating(Map<String, dynamic> data) {
+    state = state.copyWith(isGeneratingTopic: true);
+  }
+
+  void _handleTopicChanged(Map<String, dynamic> data) {
+    final parsed = parseTopicChanged(data);
+    if (parsed == null) return;
+    state = state.copyWith(
+      isGeneratingTopic: false,
+      currentTopicTitle: parsed.topicTitle.isNotEmpty
+          ? parsed.topicTitle
+          : state.currentTopicTitle,
+      currentTopicTitleZh: parsed.topicTitleZh ?? '',
+      currentRoleName: parsed.roleName.isNotEmpty
+          ? parsed.roleName
+          : state.currentRoleName,
       masteryProgress: 0.0,
     );
   }
+
+  void _handleSessionReport(Map<String, dynamic> data) {
+    final parsed = parseSessionReport(data);
+    if (parsed == null) return;
+
+    if (parsed is WsSessionReportPreliminary) {
+      _reportShowing = true;
+      forceIdle();
+      final report = SessionReport.fromJson(data);
+      state = state.copyWith(
+        sessionReport: report,
+        currentTopicTitle: report.topicTitle,
+        currentTopicTitleZh: report.topicTitleZh?.trim() ?? state.currentTopicTitleZh,
+      );
+    } else if (parsed is WsSessionReportFinal) {
+      final existing = state.sessionReport;
+      if (existing != null && existing.sessionId == parsed.sessionId) {
+        state = state.copyWith(sessionReport: existing.mergeWithFinal(data));
+      }
+    }
+  }
+
+  void _handleError(Map<String, dynamic> data) {
+    final parsed = parseError(data);
+    if (parsed == null) return;
+    final needIdle = parsed.isLlmTimeout || parsed.isLlmError || parsed.isTopicGenerationFailed;
+    if (needIdle) forceIdle();
+    final isZh = ref.read(settingsProvider).isChinese;
+    final zh = parsed.messageZh?.trim();
+    final en = parsed.message?.trim();
+    final message = (isZh && zh != null && zh.isNotEmpty)
+        ? zh
+        : (en ?? (isZh ? '出错了，请稍后再试。' : 'Something went wrong. Please try again.'));
+    state = state.copyWith(errorMessage: message);
+  }
+
+  // ── 音频回调 ──────────────────────────────────────────────────────
+
+  void _onAudioFinished() {
+    final totalBytes = _audio.totalPcmBytes;
+    debugPrint('[onAudioFinished] ▶ called, _pcmSubscription=$_pcmSubscription, status=${state.status}, total_pcm_bytes=$totalBytes');
+    // 幂等检查：如果已清理则直接返回
+    if (_pcmSubscription == null) {
+      debugPrint('[onAudioFinished] idempotency guard: _pcmSubscription already null, returning');
+      return;
+    }
+    _pcmSubscription?.cancel();
+    _pcmSubscription = null;
+    debugPrint('[onAudioFinished] subscription cancelled');
+
+    // closePcmStream() 在 ttsFinished 的延迟后被调用，
+    // 这会触发 _pcmSubscription.onDone() → 本函数被调用。
+    // 此处无需再关闭 stream。
+
+    // stopPlayer() 在 microtask 里执行，此时播放器已经没有数据来源。
+    // 延迟一帧让播放器有机会完成最后几帧的播放。
+    Future.microtask(() async {
+      try {
+        await _audio.stopPlayer();
+        debugPrint('[onAudioFinished] player stopped');
+      } catch (e) {
+        debugPrint('[onAudioFinished] stopPlayer exception: $e');
+      }
+    });
+
+    _audio.resetPlaybackState();
+    _latencySw = null;
+    _latencyTurnId = null;
+    _latencyFirstPcmMs = null;
+
+    final auto = ref.read(settingsProvider).autoMode;
+    debugPrint('[onAudioFinished] autoMode=$auto, _reportShowing=$_reportShowing');
+    if (auto && !_reportShowing) {
+      debugPrint('[onAudioFinished] calling startListening()...');
+      startListening();
+    } else {
+      debugPrint('[onAudioFinished] setting status=idle');
+      state = state.copyWith(status: ChatStatus.idle);
+    }
+  }
+
+  // ── 用户操作 ──────────────────────────────────────────────────────
 
   Future<void> warmUpConnection() async {
     final wsClient = ref.read(websocketProvider);
@@ -189,7 +449,6 @@ class ChatNotifier extends Notifier<ChatState> {
       await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
-      // 等待服务端 warmup_success（可带 user_settings）先到达，再回写本地 LMS，减少竞态
       await Future<void>.delayed(const Duration(milliseconds: 200));
       final settings = ref.read(settingsProvider);
       wsClient.sendCommand("update_lms_settings", {
@@ -201,26 +460,15 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  /// 服务端 DB 中的 user.settings（握手时下发）。有字段才覆盖本地。
-  Future<void> _applyUserSettingsFromServer(Object? raw) async {
-    if (raw is! Map) return;
-    final us = Map<String, dynamic>.from(raw);
-    if (us.isEmpty) return;
+  Future<void> _applyUserSettings(UserSettings us) async {
     final sn = ref.read(settingsProvider.notifier);
     final prefs = await SharedPreferences.getInstance();
-    final lv = us['learner_level'];
-    if (lv is String && lv.trim().isNotEmpty) {
-      sn.setLearnerLevel(lv.trim());
-      await prefs.setString('learner_level', lv.trim());
+    if (us.learnerLevel != null && us.learnerLevel!.trim().isNotEmpty) {
+      sn.setLearnerLevel(us.learnerLevel!.trim());
+      await prefs.setString('learner_level', us.learnerLevel!.trim());
     }
-    final dp = us['depth_preference'];
-    if (dp is num) {
-      sn.setDepthPreference(dp.toDouble());
-    }
-    final ap = us['new_topic_appetite'];
-    if (ap is num) {
-      sn.setNewTopicAppetite(ap.toDouble());
-    }
+    if (us.depthPreference != null) sn.setDepthPreference(us.depthPreference!);
+    if (us.newTopicAppetite != null) sn.setNewTopicAppetite(us.newTopicAppetite!);
   }
 
   Future<void> swapRole() async {
@@ -237,225 +485,75 @@ class ChatNotifier extends Notifier<ChatState> {
     try {
       await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
-      wsClient.sendCommand("update_politeness", {
-        "level": level,
-        "user_id": userId,
-      });
+      wsClient.sendCommand("update_politeness", {"level": level, "user_id": userId});
     } catch (_) {}
-  }
-
-  Future<void> _initAudioSessionAndPlayer() async {
-    try {
-      final session = await AudioSession.instance;
-      await session.configure(
-        AudioSessionConfiguration(
-          avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
-          avAudioSessionCategoryOptions:
-              AVAudioSessionCategoryOptions.allowBluetooth |
-              AVAudioSessionCategoryOptions.defaultToSpeaker,
-          avAudioSessionMode: AVAudioSessionMode.spokenAudio,
-          avAudioSessionRouteSharingPolicy:
-              AVAudioSessionRouteSharingPolicy.defaultPolicy,
-          avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
-          androidAudioAttributes: const AndroidAudioAttributes(
-            contentType: AndroidAudioContentType.speech,
-            usage: AndroidAudioUsage.voiceCommunication,
-          ),
-          androidAudioFocusGainType: AndroidAudioFocusGainType.gain,
-          androidWillPauseWhenDucked: true,
-        ),
-      );
-      await _player.openPlayer();
-    } catch (e) {
-      print("音频会话配置异常: $e");
-    }
   }
 
   Future<void> speakText(String text) async {
     await forceIdle();
     state = state.copyWith(status: ChatStatus.speaking);
+    debugPrint('[speakText] status -> speaking');
     try {
-      await _player.startPlayerFromStream(
-        codec: Codec.pcm16,
-        numChannels: 1,
-        sampleRate: 24000,
-        interleaved: true,
-        bufferSize: 8192,
-      );
+      _audio.startPcmStream();
+      await _audio.startPlayerFromStream();
+      debugPrint('[speakText] player started');
       final userId = await UserManager.getOrCreateUuid();
-      ref.read(websocketProvider).sendCommand("request_tts", {
-        "text": text,
-        "user_id": userId,
-      });
-    } catch (_) {
+      ref.read(websocketProvider).sendCommand("request_tts", {"text": text, "user_id": userId});
+    } catch (e) {
+      debugPrint('[speakText] exception: $e');
       forceIdle();
     }
   }
 
-  void _initWebSocketListeners() {
-    final wsClient = ref.read(websocketProvider);
-    // async 回调：允许在 error 分支 await forceIdle() 后再写 errorMessage
-    _commandSubscription = wsClient.commandStream.listen((data) async {
-      if (data['event'] == 'warmup_success') {
-        await _applyUserSettingsFromServer(data['user_settings']);
-      } else if (data['event'] == 'tts_finished') {
-        if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
-        _handleAudioFinished();
-      } else if (data['event'] == 'teaching_data') {
-        final d = data['data'];
-        if (d['user_text'] != null && d['ai_text'] != null) {
-          final newTurn = ChatTurn(
-            userText: d['user_text'],
-            aiText: d['ai_text'],
-            rawTeachingData: d,
-          );
-          state = state.copyWith(chatHistory: [...state.chatHistory, newTurn]);
-        }
-      } else if (data['event'] == 'role_swapped') {
-        state = state.copyWith(isFlipped: data['is_flipped']);
-      } else if (data['event'] == 'topic_mastery_reached') {
-        final progress = (data['progress'] as num?)?.toDouble() ?? 0.0;
-        state = state.copyWith(masteryProgress: progress);
-      } else if (data['event'] == 'topic_generating') {
-        state = state.copyWith(isGeneratingTopic: true);
-      } else if (data['event'] == 'topic_changed') {
-        final zhRaw = data['topic_title_zh'];
-        final zh = zhRaw is String ? zhRaw.trim() : '';
-        state = state.copyWith(
-          isGeneratingTopic: false,
-          currentTopicTitle:
-              data['topic_title'] as String? ?? state.currentTopicTitle,
-          currentTopicTitleZh: zh.isNotEmpty ? zh : '',
-          currentRoleName:
-              data['role_name'] as String? ?? state.currentRoleName,
-          masteryProgress: 0.0,
-        );
-      } else if (data['event'] == 'session_report') {
-        _handleSessionReport(data);
-      } else if (data['event'] == 'error') {
-        final code = data['code'] as String? ?? 'UNKNOWN';
-        final needIdle = code == 'LLM_TIMEOUT' ||
-            code == 'LLM_ERROR' ||
-            code == 'TOPIC_GENERATION_FAILED';
-        if (needIdle) await forceIdle();
-        final isZh = ref.read(settingsProvider).isChinese;
-        final zh = (data['message_zh'] as String?)?.trim();
-        final en = (data['message'] as String?)?.trim();
-        final message = (isZh && zh != null && zh.isNotEmpty)
-            ? zh
-            : (en ??
-                (isZh ? '出错了，请稍后再试。' : 'Something went wrong. Please try again.'));
-        state = state.copyWith(errorMessage: message);
-      }
-    }, onError: (_) => forceIdle());
-
-    _audioSubscription = wsClient.audioStream.listen((audioBytes) {
-      // 打断期间或非播放状态时，丢弃网络中残留的 PCM 包
-      if (_isInterrupting) return;
-      if (state.status == ChatStatus.speaking && _player.isPlaying) {
-        if (!_latencyLoggedFirstPcm) {
-          _latencyLoggedFirstPcm = true;
-          _latencyFirstPcmMs = _latencySw?.elapsedMilliseconds;
-          _latencyLogClient(
-            '05_first_pcm_chunk',
-            'len=${audioBytes.length}',
-          );
-        }
-        _playbackStartTime ??= DateTime.now();
-        _totalBytesReceived += audioBytes.length;
-        try {
-          _player.uint8ListSink?.add(Uint8List.fromList(audioBytes));
-        } catch (_) {}
-      }
-    });
-  }
-
-  Future<void> _handleAudioFinished() async {
-    try {
-      await _player.uint8ListSink?.close();
-    } catch (_) {}
-    if (_isAutoLooping) return;
-    _isAutoLooping = true;
-    _latencyLogClient('06_tts_finished_event');
-
-    final tid = _latencyTurnId;
-    final sw = _latencySw;
-    if (tid != null && tid.isNotEmpty && sw != null) {
-      ref.read(websocketProvider).sendCommand('client_latency_report', {
-        'trace_id': tid,
-        'submit_to_first_pcm_ms': _latencyFirstPcmMs,
-        'submit_to_tts_finished_ms': sw.elapsedMilliseconds,
-        'had_first_pcm': _latencyFirstPcmMs != null,
-        'client_report_wall_ms': DateTime.now().millisecondsSinceEpoch,
-      });
-    }
-
-    if (_playbackStartTime != null && _totalBytesReceived > 0) {
-      int durationMs = (_totalBytesReceived / 48.0).ceil();
-      int elapsedMs = DateTime.now()
-          .difference(_playbackStartTime!)
-          .inMilliseconds;
-      int timeLeftMs = durationMs - elapsedMs;
-      if (timeLeftMs > 0) {
-        await Future.delayed(Duration(milliseconds: timeLeftMs));
-      }
-    }
-    try {
-      if (_player.isPlaying) await _player.stopPlayer();
-    } catch (_) {}
-    _isAutoLooping = false;
-    _playbackStartTime = null;
-    _totalBytesReceived = 0;
-    _latencySw = null;
-    _latencyTurnId = null;
-    _latencyFirstPcmMs = null;
-
-    // Fix B7: do not auto-start while the session report card is visible
-    if (ref.read(settingsProvider).autoMode && !_reportShowing) {
-      startListening();
-    } else {
-      state = state.copyWith(status: ChatStatus.idle);
-    }
-  }
-
   Future<void> startListening() async {
-    // Fix B4: mutex guard — prevents concurrent calls from racing past the status check
-    if (_isStartingListen) return;
-    if (state.status == ChatStatus.listening) return;
+    debugPrint('[startListening] ▶ called, _isStartingListen=$_isStartingListen, status=${state.status}');
+    // Fix B4: mutex guard
+    if (_isStartingListen) {
+      debugPrint('[startListening] guard: _isStartingListen=true, returning');
+      return;
+    }
+    if (state.status == ChatStatus.listening) {
+      debugPrint('[startListening] guard: already listening, returning');
+      return;
+    }
     _isStartingListen = true;
 
     try {
-      if (_player.isPlaying) await _player.stopPlayer();
+      await _audio.stopPlayer();
+      debugPrint('[startListening] player stopped');
       final permStatus = await Permission.microphone.request();
-      if (!permStatus.isGranted) return;
+      debugPrint('[startListening] mic permission=$permStatus');
+      if (!permStatus.isGranted) {
+        debugPrint('[startListening] mic denied, returning');
+        return;
+      }
 
-      // Fix B2: removed session.setActive(true) — the `record` package manages
-      // Android AudioFocus internally; calling setActive() here creates a double
-      // focus request that triggers onAudioFocusChange(-1) and breaks recording.
       final wsClient = ref.read(websocketProvider);
       await wsClient.connect();
-      const config = RecordConfig(
-        encoder: AudioEncoder.pcm16bits,
-        sampleRate: 16000,
-        numChannels: 1,
-      );
-      if (await _recorder.isRecording()) await _recorder.stop();
-      final stream = await _recorder.startStream(config);
+
+      final stream = await _audio.startRecording();
+      debugPrint('[startListening] recording stream=${stream != null}');
+      if (stream == null) {
+        debugPrint('[startListening] stream null, returning');
+        return;
+      }
 
       state = state.copyWith(status: ChatStatus.listening);
+      debugPrint('[startListening] status -> listening');
       _hasSpoken = false;
       _noiseFrames = 0;
 
+      // 音频流发送到 WS
       stream.listen((data) {
-        if (state.status == ChatStatus.listening) wsClient.sendAudio(data);
+        if (state.status == ChatStatus.listening) {
+          wsClient.sendAudio(data);
+        }
       });
 
-      // Fix B5: max-listen safety timer — if no voice is detected within 30s,
-      // forceIdle() to prevent the UI from being permanently stuck in "Listening".
+      // Fix B5: 最大录音计时器（30s 静默保护）
       _maxListenTimer?.cancel();
       _maxListenTimer = Timer(const Duration(seconds: 30), () {
         if (state.status == ChatStatus.listening) {
-          // If the user started speaking but silence timer never fired, submit anyway.
           if (_hasSpoken) {
             stopListeningAndSubmit();
           } else {
@@ -464,65 +562,75 @@ class ChatNotifier extends Notifier<ChatState> {
         }
       });
 
-      _ampSubscription?.cancel();
-      _ampSubscription = _recorder
-          .onAmplitudeChanged(const Duration(milliseconds: 100))
+      // Fix B3: VAD（声音激活检测）
+      _audio.recorder.onAmplitudeChanged(const Duration(milliseconds: 100))
           .listen((amp) {
-            if (state.status != ChatStatus.listening) return;
-            final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-            // Fix B3: raised threshold -25 → -35 dBFS; min frames 5 → 4（约 400ms 有声）再判「已开口」，
-            // 略缩有效句长、更快进入静默计时。
-            if (amp.current > -35.0) {
-              _noiseFrames++;
-              if (_noiseFrames > 3) {
-                _hasSpoken = true;
-                _silenceTimer?.cancel();
-              }
-            } else {
-              _noiseFrames = 0;
-              if (_hasSpoken) {
-                if (_silenceTimer == null || !_silenceTimer!.isActive) {
-                  _silenceTimer = Timer(
-                    Duration(milliseconds: currentVadTimeout),
-                    () => stopListeningAndSubmit(),
-                  );
-                }
-              }
+        if (state.status != ChatStatus.listening) return;
+        final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
+        if (amp.current > -35.0) {
+          _noiseFrames++;
+          if (_noiseFrames > 3) {
+            _hasSpoken = true;
+            _silenceTimer?.cancel();
+          }
+        } else {
+          _noiseFrames = 0;
+          if (_hasSpoken) {
+            if (_silenceTimer == null || !_silenceTimer!.isActive) {
+              _silenceTimer = Timer(
+                Duration(milliseconds: currentVadTimeout),
+                () => stopListeningAndSubmit(),
+              );
             }
-          });
+          }
+        }
+      });
+      debugPrint('[startListening] VAD listener registered');
     } catch (e, st) {
-      // Print the real exception so we can see exactly what failed
       debugPrint('[startListening] EXCEPTION: $e');
       debugPrint('[startListening] STACKTRACE: $st');
       forceIdle();
     } finally {
-      // Fix B4: always release the mutex so future calls are not permanently blocked
+      debugPrint('[startListening] finally: _isStartingListen=false');
       _isStartingListen = false;
     }
   }
 
   Future<void> stopListeningAndSubmit() async {
-    if (state.status != ChatStatus.listening) return;
+    debugPrint('[stopListening] ▶ called, status=${state.status}');
+    if (state.status != ChatStatus.listening) {
+      debugPrint('[stopListening] not listening, returning');
+      return;
+    }
     _latencyTurnId = const Uuid().v4().replaceAll('-', '');
     _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
     _latencySw = Stopwatch()..start();
     _latencyLogClient('01_stopListening_submit_start');
+
     try {
-      await _recorder.stop();
+      await _audio.stopRecording();
       _latencyLogClient('02_recorder_stopped');
-      _ampSubscription?.cancel();
       _silenceTimer?.cancel();
-      _maxListenTimer?.cancel(); // Fix B5
+      _maxListenTimer?.cancel();
+
       state = state.copyWith(status: ChatStatus.speaking);
-      await _player.startPlayerFromStream(
-        codec: Codec.pcm16,
-        numChannels: 1,
-        sampleRate: 24000,
-        interleaved: true,
-        bufferSize: 8192,
-      );
+      _audio.startPcmStream();
+      await _audio.startPlayerFromStream();
       _latencyLogClient('03_player_stream_ready');
+
+      // 订阅 PCM 流写入播放器
+      _pcmSubscription?.cancel();
+      _pcmSubscription = _audio.pcmStream?.listen(
+        (bytes) {
+          _audio.writeToPlayer(bytes);
+        },
+        onDone: () {
+          debugPrint('[pcmSubscription] onDone: stream closed, calling _onAudioFinished');
+          _onAudioFinished();
+        },
+      );
+
       final userId = await UserManager.getOrCreateUuid();
       final wallMs = DateTime.now().millisecondsSinceEpoch;
       ref.read(websocketProvider).sendCommand("user_finish_speaking", {
@@ -532,80 +640,56 @@ class ChatNotifier extends Notifier<ChatState> {
       });
       _latencyLogClient('04_ws_user_finish_sent');
     } catch (_) {
-      _latencySw = null;
-      _latencyTurnId = null;
-      _latencyFirstPcmMs = null;
-      _latencyLoggedFirstPcm = false;
+      _resetLatencyState();
       forceIdle();
     }
   }
 
   Future<void> forceIdle() async {
-    _latencySw = null;
-    _latencyTurnId = null;
-    _latencyFirstPcmMs = null;
-    _latencyLoggedFirstPcm = false;
-    _isAutoLooping = false;
-    _isStartingListen =
-        false; // Fix B4: release mutex if we force-idle mid-start
-    _playbackStartTime = null;
-    _totalBytesReceived = 0;
+    _resetLatencyState();
+    _isStartingListen = false;  // Fix B4
+    _audio.resetPlaybackState();
+    _pcmSubscription?.cancel();
     try {
-      if (_player.isPlaying) await _player.stopPlayer();
+      await _audio.stopPlayer();
     } catch (_) {}
     try {
-      if (await _recorder.isRecording()) await _recorder.stop();
+      if (await _audio.checkIsRecording()) await _audio.stopRecording();
     } catch (_) {}
-    _ampSubscription?.cancel();
     _silenceTimer?.cancel();
-    _maxListenTimer?.cancel(); // Fix B5: cancel the safety timer
+    _maxListenTimer?.cancel();
     state = state.copyWith(status: ChatStatus.idle);
   }
 
-  /// P0 打断机制：AI 说话途中用户开口 → 立刻停播 + 清空 PCM + 通知后端 + 开始录音
-  Future<void> interruptAndListen() async {
-    if (state.status != ChatStatus.speaking) return;
-
-    // ── 1. 设置打断标志，屏蔽所有后续 TTS 回调 ───────────────────────────
-    _isInterrupting = true;
-    _isAutoLooping = false;
-
-    // ── 2. 关闭 PCM 输入 sink（清空 flutter_sound 内部缓冲区）─────────────
-    try {
-      await _player.uint8ListSink?.close();
-    } catch (_) {}
-
-    // ── 3. 强制停止播放器（立刻停音）─────────────────────────────────────
-    try {
-      if (_player.isPlaying) await _player.stopPlayer();
-    } catch (_) {}
-
-    // ── 4. 清零前端 PCM 追踪状态 ──────────────────────────────────────────
-    _totalBytesReceived = 0;
-    _playbackStartTime = null;
-
-    // ── 5. 通知后端取消 TTS，同时清空后端 audio_buffer ────────────────────
-    ref.read(websocketProvider).sendCommand("cancel_tts", {});
-
+  void _resetLatencyState() {
     _latencySw = null;
     _latencyTurnId = null;
     _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
+  }
 
-    // ── 6. 解除打断标志，切换到录音状态 ──────────────────────────────────
+  /// 打断机制：AI 说话途中用户开口 → 立刻停播 + 通知后端 + 开始录音
+  Future<void> interruptAndListen() async {
+    if (state.status != ChatStatus.speaking) return;
+    _isInterrupting = true;
+
+    _audio.closePcmStream();
+    await _audio.stopPlayer();
+    _audio.resetPlaybackState();
+
+    ref.read(websocketProvider).sendCommand("cancel_tts", {});
+
+    _resetLatencyState();
     _isInterrupting = false;
     await startListening();
   }
 
-  /// UI 展示错误 Snackbar 后调用，清空 errorMessage 防止重复弹出
   void clearError() {
     state = state.copyWith(errorMessage: null);
   }
 
-  /// 报告卡 dismiss 后调用，防止重复弹出，并恢复 autoMode 录音循环
   void clearSessionReport() {
-    _reportShowing =
-        false; // Fix B7: resume autoMode cycle after report dismissed
+    _reportShowing = false;
     state = state.copyWith(sessionReport: null);
   }
 
@@ -614,13 +698,10 @@ class ChatNotifier extends Notifier<ChatState> {
     final wsClient = ref.read(websocketProvider);
     try {
       await wsClient.connect();
-      wsClient.sendCommand("request_topic", {
-        "description": description.trim(),
-      });
+      wsClient.sendCommand("request_topic", {"description": description.trim()});
     } catch (_) {}
   }
 
-  // 🌟 修改：主动更新设置时也传 learnerLevel
   Future<void> updateLmsSettings({
     required double depthPreference,
     required double newTopicAppetite,
@@ -639,43 +720,25 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  void _handleSessionReport(Map<String, dynamic> data) {
-    final stage = data['stage'] as String? ?? 'preliminary';
-
-    if (stage == 'preliminary') {
-      // Fix B7: pause autoMode while report card is visible, and stop any
-      // ongoing recording/playback so the UI is clean when the sheet appears.
-      _reportShowing = true;
-      forceIdle(); // async, but fire-and-forget is fine here
-
-      final report = SessionReport.fromJson(data);
-      final zh = report.topicTitleZh?.trim() ?? '';
-      state = state.copyWith(
-        sessionReport: report,
-        currentTopicTitle: report.topicTitle,
-        currentTopicTitleZh: zh.isNotEmpty ? zh : state.currentTopicTitleZh,
-      );
-    } else if (stage == 'final') {
-      final existing = state.sessionReport;
-      final incomingId = data['session_id'] as String? ?? '';
-      if (existing != null && existing.sessionId == incomingId) {
-        state = state.copyWith(sessionReport: existing.mergeWithFinal(data));
-      }
-    }
-  }
-
   Future<void> toggleButton() async {
     if (state.status == ChatStatus.idle) {
       await startListening();
     } else if (state.status == ChatStatus.listening) {
       await stopListeningAndSubmit();
     } else if (state.status == ChatStatus.speaking) {
-      // 🛑 打断：不再只是停到 idle，而是立刻开始新一轮录音
       await interruptAndListen();
     }
   }
-}
 
-final chatProvider = NotifierProvider<ChatNotifier, ChatState>(
-  () => ChatNotifier(),
-);
+  // ── Latency 工具 ─────────────────────────────────────────────────
+
+  void _latencyLogClient(String stage, [String extra = '']) {
+    final sw = _latencySw;
+    if (sw == null) return;
+    final ms = sw.elapsedMilliseconds;
+    final tail = extra.isEmpty ? '' : ' $extra';
+    final tid = _latencyTurnId;
+    final turnSeg = (tid != null && tid.isNotEmpty) ? 'turn=$tid ' : '';
+    debugPrint('[LATENCY][client] $turnSeg$stage +${ms}ms$tail');
+  }
+}

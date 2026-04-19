@@ -69,9 +69,7 @@ class _SessionReportContent extends ConsumerWidget {
           ),
           child: Column(
             children: [
-              // ── 拖拽把手 ──────────────────────────────────────────────
               const _DragHandle(),
-              // ── 可滚动内容 ────────────────────────────────────────────
               Expanded(
                 child: ListView(
                   controller: scrollController,
@@ -106,21 +104,20 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 标题区 ──────────────────────────────────────────────────────────────
   Widget _buildHeader(BuildContext context, WidgetRef ref, SessionReport report) {
     return Column(
       children: [
         const SizedBox(height: 8),
         Row(
           children: [
-            const Text('🎓', style: TextStyle(fontSize: 26)),
+            const Text('\u{1F393}', style: TextStyle(fontSize: 26)),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
-                    tr(ref, 'Session complete', '本局完成'),
+                    tr(ref, 'Session complete', '\u672C\u5C40\u5B8C\u6210'),
                     style: TextStyle(
                       fontSize: 13,
                       color: Colors.grey[500],
@@ -145,7 +142,7 @@ class _SessionReportContent extends ConsumerWidget {
                 ],
               ),
             ),
-            _TierBadge(ref: ref, tier: report.depthTier),
+            _TierBadge(tier: report.depthTier),
           ],
         ),
         if (report.isFinal) ...[
@@ -162,7 +159,7 @@ class _SessionReportContent extends ConsumerWidget {
                 const Icon(Icons.verified_rounded, size: 14, color: _kBlue),
                 const SizedBox(width: 6),
                 Text(
-                  tr(ref, 'AI-verified quality analysis ready', 'AI 已完成口语质量分析'),
+                  tr(ref, 'AI-verified quality analysis ready', 'AI \u5DF2\u5B8C\u6210\u53E3\u8BED\u54C1\u8D28\u5206\u6790'),
                   style: const TextStyle(fontSize: 12, color: _kBlue, fontWeight: FontWeight.w600),
                 ),
               ],
@@ -173,11 +170,10 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 得分区（圆形进度 + 命中统计）──────────────────────────────────────────
   Widget _buildScoreRow(WidgetRef ref, SessionReport report) {
     return Row(
       children: [
-        _ScoreCircle(ref: ref, score: report.sessionScore),
+        _ScoreCircle(score: report.sessionScore),
         const SizedBox(width: 20),
         Expanded(
           child: Column(
@@ -186,7 +182,7 @@ class _SessionReportContent extends ConsumerWidget {
               _StatRow(
                 icon: Icons.check_circle_rounded,
                 color: _kGreen,
-                label: tr(ref, 'Expressions hit', '命中表达'),
+                label: tr(ref, 'Expressions hit', '\u547D\u4E2D\u8868\u8FBE'),
                 value: '${report.hitCount} / ${report.totalNodes}',
               ),
               const SizedBox(height: 10),
@@ -194,7 +190,7 @@ class _SessionReportContent extends ConsumerWidget {
                 _StatRow(
                   icon: Icons.star_rounded,
                   color: _kOrange,
-                  label: tr(ref, 'Newly mastered', '新掌握'),
+                  label: tr(ref, 'Newly mastered', '\u65B0\u638C\u63E1'),
                   value: report.newlyMastered.length.toString(),
                 ),
                 const SizedBox(height: 10),
@@ -202,8 +198,8 @@ class _SessionReportContent extends ConsumerWidget {
               _StatRow(
                 icon: Icons.layers_rounded,
                 color: _kBlue,
-                label: tr(ref, 'Depth tier', '难度层级'),
-                value: tr(ref, 'Tier ${report.depthTier}', '第 ${report.depthTier} 层'),
+                label: tr(ref, 'Depth tier', '\u96BE\u5EA6\u5C42\u7EA7'),
+                value: tr(ref, 'Tier ${report.depthTier}', '\u7B2C ${report.depthTier} \u5C42'),
               ),
             ],
           ),
@@ -212,7 +208,6 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 深度进度条 ───────────────────────────────────────────────────────────
   Widget _buildTierSection(WidgetRef ref, SessionReport report) {
     final ts = report.tierStatus;
     return Container(
@@ -232,8 +227,8 @@ class _SessionReportContent extends ConsumerWidget {
             children: [
               Text(
                 ts.unlockedNextTier
-                    ? tr(ref, '🎉 Tier ${ts.tier + 1} Unlocked!', '🎉 已解锁第 ${ts.tier + 1} 层！')
-                    : tr(ref, 'Tier ${ts.tier} progress', '第 ${ts.tier} 层进度'),
+                    ? tr(ref, '\u{1F389} Tier ${ts.tier + 1} Unlocked!', '\u{1F389} \u5DF2\u89E3\u9501\u7B2C ${ts.tier + 1} \u5C42\uFF01')
+                    : tr(ref, 'Tier ${ts.tier} progress', '\u7B2C ${ts.tier} \u5C42\u8FDB\u5EA6'),
                 style: TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
@@ -266,7 +261,7 @@ class _SessionReportContent extends ConsumerWidget {
             const SizedBox(height: 8),
             Text(
               ref.watch(settingsProvider).isChinese
-                  ? '还需 ${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} 点掌握度即可解锁第 ${ts.tier + 1} 层'
+                  ? '\u8FD8\u9700 ${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} \u70B9\u638C\u63E1\u5EA6\u5373\u53EF\u89E3\u9501\u7B2C ${ts.tier + 1} \u5C42'
                   : '${(ts.threshold - ts.avgEffectiveMastery).clamp(0, 100).toInt()} more mastery points to unlock Tier ${ts.tier + 1}',
               style: TextStyle(fontSize: 12, color: Colors.grey[500]),
             ),
@@ -276,13 +271,12 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 节点列表 ─────────────────────────────────────────────────────────────
   Widget _buildNodesSection(WidgetRef ref, SessionReport report) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          tr(ref, 'Expressions practiced', '本局练习的表达'),
+          tr(ref, 'Expressions practiced', '\u672C\u5C40\u7EC3\u4E60\u7684\u8868\u8FBE'),
           style: TextStyle(
             fontSize: 14,
             fontWeight: FontWeight.bold,
@@ -292,13 +286,12 @@ class _SessionReportContent extends ConsumerWidget {
         const SizedBox(height: 12),
         ...report.nodes.map((node) => Padding(
               padding: const EdgeInsets.only(bottom: 10),
-              child: _NodeCard(ref: ref, node: node),
+              child: _NodeCard(node: node),
             )),
       ],
     );
   }
 
-  // ── L2 平均质量徽章 ──────────────────────────────────────────────────────
   Widget _buildQualityBadge(WidgetRef ref, SessionReport report) {
     final q = report.avgQuality!;
     final label = report.qualityLabel ?? 'good';
@@ -319,7 +312,7 @@ class _SessionReportContent extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  tr(ref, 'Overall speaking quality', '口语整体质量'),
+                  tr(ref, 'Overall speaking quality', '\u53E3\u8BED\u6574\u4F53\u54C1\u8D28'),
                   style: TextStyle(fontSize: 12, color: Colors.grey[600]),
                 ),
                 const SizedBox(height: 4),
@@ -347,7 +340,6 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 鼓励文字 ─────────────────────────────────────────────────────────────
   Widget _buildEncouragement(WidgetRef ref, SessionReport report) {
     final isZh = ref.watch(settingsProvider).isChinese;
     final zhEnc = report.encouragementZh?.trim();
@@ -379,8 +371,8 @@ class _SessionReportContent extends ConsumerWidget {
     );
   }
 
-  // ── 继续按钮 ─────────────────────────────────────────────────────────────
   Widget _buildContinueButton(BuildContext context, WidgetRef ref) {
+    final isZh = ref.watch(settingsProvider).isChinese;
     return SizedBox(
       width: double.infinity,
       height: 52,
@@ -393,7 +385,7 @@ class _SessionReportContent extends ConsumerWidget {
           elevation: 0,
         ),
         child: Text(
-          tr(ref, 'Keep practicing', '继续练习'),
+          isZh ? '\u7EE7\u7EED\u7EC3\u4E60' : 'Keep practicing',
           style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
         ),
       ),
@@ -402,11 +394,12 @@ class _SessionReportContent extends ConsumerWidget {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 子组件
+// 子组件（均使用 ConsumerWidget，避免存储 WidgetRef 字段）
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _DragHandle extends StatelessWidget {
   const _DragHandle();
+
   @override
   Widget build(BuildContext context) {
     return Padding(
@@ -425,12 +418,12 @@ class _DragHandle extends StatelessWidget {
   }
 }
 
-class _TierBadge extends StatelessWidget {
-  final WidgetRef ref;
+class _TierBadge extends ConsumerWidget {
   final int tier;
-  const _TierBadge({required this.ref, required this.tier});
+  const _TierBadge({required this.tier});
+
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
       decoration: BoxDecoration(
@@ -438,7 +431,7 @@ class _TierBadge extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
       ),
       child: Text(
-        tr(ref, 'Tier $tier', '第 $tier 层'),
+        tr(ref, 'Tier $tier', '\u7B2C $tier \u5C42'),
         style: const TextStyle(
           fontSize: 12,
           fontWeight: FontWeight.bold,
@@ -449,10 +442,9 @@ class _TierBadge extends StatelessWidget {
   }
 }
 
-class _ScoreCircle extends StatelessWidget {
-  final WidgetRef ref;
+class _ScoreCircle extends ConsumerWidget {
   final double score;
-  const _ScoreCircle({required this.ref, required this.score});
+  const _ScoreCircle({required this.score});
 
   Color get _color {
     if (score >= 80) return _kGreen;
@@ -462,7 +454,7 @@ class _ScoreCircle extends StatelessWidget {
   }
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     return SizedBox(
       width: 90,
       height: 90,
@@ -488,7 +480,7 @@ class _ScoreCircle extends StatelessWidget {
                 ),
               ),
               Text(
-                tr(ref, 'pts', '分'),
+                tr(ref, 'pts', '\u5206'),
                 style: TextStyle(fontSize: 10, color: Colors.grey[500]),
               ),
             ],
@@ -510,6 +502,7 @@ class _StatRow extends StatelessWidget {
     required this.label,
     required this.value,
   });
+
   @override
   Widget build(BuildContext context) {
     return Row(
@@ -527,13 +520,12 @@ class _StatRow extends StatelessWidget {
   }
 }
 
-class _NodeCard extends StatelessWidget {
-  final WidgetRef ref;
+class _NodeCard extends ConsumerWidget {
   final SessionNodeReport node;
-  const _NodeCard({required this.ref, required this.node});
+  const _NodeCard({required this.node});
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
     final hit = node.hit;
     final bgColor = hit ? _kGreenLight : const Color(0xFFF5F5F5);
     final borderColor = hit ? _kGreen.withOpacity(0.3) : Colors.transparent;
@@ -552,7 +544,7 @@ class _NodeCard extends StatelessWidget {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          // ── 表达文字 + 命中图标 ──────────────────────────────────────
+          // ── 表达文字 + 命中图标 ──────────────────────────────
           Row(
             children: [
               Icon(
@@ -563,7 +555,7 @@ class _NodeCard extends StatelessWidget {
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
-                  '"${node.text}"',
+                  '\"${node.text}\"',
                   style: TextStyle(
                     fontSize: 15,
                     fontWeight: FontWeight.bold,
@@ -595,16 +587,12 @@ class _NodeCard extends StatelessWidget {
               ],
             ],
           ),
-          // ── 掌握度进度条 ─────────────────────────────────────────────
+          // ── 掌握度进度条 ────────────────────────────────
           if (hit) ...[
             const SizedBox(height: 10),
-            _MasteryBar(
-              ref: ref,
-              before: node.masteryBefore,
-              after: node.masteryNow,
-            ),
+            _MasteryBar(before: node.masteryBefore, after: node.masteryNow),
           ],
-          // ── L2 质量标签 ──────────────────────────────────────────────
+          // ── L2 质量标签 ───────────────────────────────
           if (node.qualityLabel != null && node.qualityLabel != 'not_used') ...[
             const SizedBox(height: 8),
             Row(
@@ -643,10 +631,9 @@ class _NodeCard extends StatelessWidget {
 }
 
 class _MasteryBar extends StatelessWidget {
-  final WidgetRef ref;
   final double before;
   final double after;
-  const _MasteryBar({required this.ref, required this.before, required this.after});
+  const _MasteryBar({required this.before, required this.after});
 
   @override
   Widget build(BuildContext context) {
@@ -657,7 +644,7 @@ class _MasteryBar extends StatelessWidget {
           mainAxisAlignment: MainAxisAlignment.spaceBetween,
           children: [
             Text(
-              tr(ref, 'Mastery', '掌握度'),
+              'Mastery',
               style: TextStyle(fontSize: 11, color: Colors.grey[500]),
             ),
             Text(
@@ -723,10 +710,10 @@ class _MasteryBar extends StatelessWidget {
 
 String _qualityLabelText(WidgetRef ref, String label) {
   return switch (label) {
-    'excellent' => tr(ref, 'Excellent — natural & correct', '优秀：自然且准确'),
-    'good' => tr(ref, 'Good — correct', '良好：表达正确'),
-    'fair' => tr(ref, 'Fair — needs polish', '一般：还可打磨'),
-    'needs_work' => tr(ref, 'Needs more practice', '需加强练习'),
-    _ => tr(ref, 'Not attempted', '未评估'),
+    'excellent' => tr(ref, 'Excellent \u2014 natural & correct', '\u4F18\u79C0\uFF1A\u81EA\u7136\u4E14\u51C6\u786E'),
+    'good' => tr(ref, 'Good \u2014 correct', '\u826F\u597D\uFF1A\u8868\u8FBE\u6B63\u786E'),
+    'fair' => tr(ref, 'Fair \u2014 needs polish', '\u4E00\u822C\uFF1A\u8FD8\u53EF\u6253\u78E8'),
+    'needs_work' => tr(ref, 'Needs more practice', '\u9700\u52A0\u5F3A\u7EC3\u4E60'),
+    _ => tr(ref, 'Not attempted', '\u672A\u8BC4\u4F30'),
   };
 }
