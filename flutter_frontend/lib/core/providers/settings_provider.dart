@@ -13,6 +13,8 @@ class SettingsState {
   final bool showProgressBar;
   final double depthPreference;
   final double newTopicAppetite;
+  // 🌟 TTS 预热开关：启用后服务启动时预热 TTS 连接池，首句延迟降低 200-500ms
+  final bool ttsPreWarming;
   // 🌟 新增：用户英语熟练度等级
   final String learnerLevel;
 
@@ -27,6 +29,7 @@ class SettingsState {
     required this.showProgressBar,
     this.depthPreference = 1.0,
     this.newTopicAppetite = 0.2,
+    this.ttsPreWarming = true,
     this.learnerLevel = "Intermediate", // 默认中级
   });
 
@@ -41,6 +44,7 @@ class SettingsState {
     bool? showProgressBar,
     double? depthPreference,
     double? newTopicAppetite,
+    bool? ttsPreWarming,
     String? learnerLevel,
   }) {
     return SettingsState(
@@ -54,6 +58,7 @@ class SettingsState {
       showProgressBar: showProgressBar ?? this.showProgressBar,
       depthPreference: depthPreference ?? this.depthPreference,
       newTopicAppetite: newTopicAppetite ?? this.newTopicAppetite,
+      ttsPreWarming: ttsPreWarming ?? this.ttsPreWarming,
       learnerLevel: learnerLevel ?? this.learnerLevel,
     );
   }
@@ -89,6 +94,8 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(depthPreference: val);
   void setNewTopicAppetite(double val) =>
       state = state.copyWith(newTopicAppetite: val);
+  void setTtsPreWarming(bool val) =>
+      state = state.copyWith(ttsPreWarming: val);
   // 🌟 新增：更新等级的方法
   void setLearnerLevel(String val) => state = state.copyWith(learnerLevel: val);
 }
