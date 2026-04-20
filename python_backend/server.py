@@ -303,7 +303,7 @@ async def get_stats(user_id: str = Query(...)):
 LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 音频防爆限制：5MB
-MAX_BUFFER_CHARS = 38              # 无标点时略缩短，更快送入 TTS
+MAX_BUFFER_CHARS = 65              # 无标点时略缩短，更快送入 TTS
 # 首段语音：不等长句标点也可提前合成（避免首句卡在句号前）
 FIRST_TTS_EARLY_FLUSH_CHARS = 22
 # chat_history token 预算：4 chars ≈ 1 token（粗估），给模型上下文留足余量
@@ -936,10 +936,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     queue,
                                     latency_hooks=lat,
                                 )
+                            except asyncio.CancelledError:
+                                raise  # 正常被打断，让外部路径消费
                             except Exception:
                                 logger.exception("TTS 流式播放期间发生异常")
-                            await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
-                            _latency_log(lat, "10_ws_tts_finished_event_sent")
+                            finally:
+                                # 无论正常结束还是异常崩溃，都必须通知前端释放锁
+                                await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
+                                _latency_log(lat, "10_ws_tts_finished_event_sent")
 
                         # 终止上一轮仍未处理完的 TTS
                         if consumer_task and not consumer_task.done():
@@ -949,13 +953,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     # 4. LLM 流式对话（包含首包连接 + 全量 chunk 消费，统一超时保护）
                     raw_full_reply = ""
                     sentence_buffer = ""
-                    punctuation_marks = ['.', '!', '?', ',', '。', '！', '？', '，', '\n']
+                    punctuation_marks = ['.', '!', '?', '。', '！', '？', '\n']
                     early_head_flush_used = False
                     _lat_flags = {"llm_first": False, "tts_enqueue": False}
 
                     async def _stream_llm_to_queue():
                         """将 create + async for 封装为单协程，便于 wait_for 统一超时"""
-                        nonlocal raw_full_reply, sentence_buffer, early_head_flush_used
+                        nonlocal raw_full_reply, sentence_buffer
                         _latency_log(
                             lat,
                             "04_llm_api_request_start",
@@ -976,29 +980,21 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 raw_full_reply += delta
                                 if not is_test_mode and tts_queue:
                                     sentence_buffer += delta
-                                    want_flush = (
-                                        any(p in delta for p in punctuation_marks)
-                                        or len(sentence_buffer) > MAX_BUFFER_CHARS
-                                    )
-                                    if (
-                                        not want_flush
-                                        and not early_head_flush_used
-                                        and len(sentence_buffer) >= FIRST_TTS_EARLY_FLUSH_CHARS
-                                    ):
-                                        want_flush = True
+                                    # ── 断句：完全依赖标点符号，或者在极度冗长时才强行截断 ──────────────────────
+                                    has_punct = any(p in delta for p in punctuation_marks)
+                                    # 终极防爆兜底：只有当长达 120 字符不加标点，且恰好遇到空格/换行时，才允许强行截断
+                                    safety_cutoff = len(sentence_buffer) > 120 and (' ' in delta or '\n' in delta)
+
+                                    want_flush = has_punct or safety_cutoff
+
                                     if want_flush:
                                         chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
                                         if chunk_text:
                                             if not _lat_flags["tts_enqueue"]:
                                                 _lat_flags["tts_enqueue"] = True
                                                 cq = chunk_text[:72] + ("…" if len(chunk_text) > 72 else "")
-                                                _latency_log(
-                                                    lat,
-                                                    "06_tts_first_text_enqueued",
-                                                    preview=cq,
-                                                )
+                                                _latency_log(lat, "06_tts_first_text_enqueued", preview=cq)
                                             await tts_queue.put(chunk_text)
-                                            early_head_flush_used = True
                                         sentence_buffer = ""
 
                     async def _abort_tts():
