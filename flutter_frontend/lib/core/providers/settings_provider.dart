@@ -74,7 +74,7 @@ class SettingsNotifier extends Notifier<SettingsState> {
       showCorrection: false,
       showTranslation: false,
       showHints: true,
-      vadTimeout: 1200,
+      vadTimeout: 700,
       showProgressBar: true,
     );
   }
