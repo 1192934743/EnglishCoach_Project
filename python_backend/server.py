@@ -30,8 +30,6 @@ from core.audio_service import (
     run_tts_to_ws,
     run_tts_turn_reused_from_queue,
     init_tts_pool,
-    warm_tts_pool,
-    get_tts_pool,
 )
 from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
 from domain.entities.session_context import SessionContext
@@ -65,8 +63,9 @@ CONFIG = {
     "DEEPSEEK_BASE": os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com"),
     "VOLC_API_KEY": os.getenv("VOLC_API_KEY"),
     "VOLC_RESOURCE_ID_ASR": os.getenv("VOLC_RESOURCE_ID"),
-    "VOLC_RESOURCE_ID_TTS": os.getenv("VOLC_RESOURCE_ID_TTS"),
-    "VOICE": os.getenv("VOICE", "BV001_streaming"),
+    # Azure TTS 配置（替换火山引擎 TTS）
+    "AZURE_SPEECH_KEY": os.getenv("AZURE_SPEECH_KEY"),
+    "AZURE_SPEECH_REGION": os.getenv("AZURE_SPEECH_REGION", "eastasia"),
     # 与 core.audio_service.run_volcengine_wss_asr 约定一致；可在 config.env 覆盖
     "ASR_LANGUAGE": os.getenv("ASR_LANGUAGE", "en-US"),
 }
@@ -78,8 +77,8 @@ if not CONFIG["DEEPSEEK_KEY"] or not CONFIG["VOLC_API_KEY"]:
 
 if not CONFIG.get("VOLC_RESOURCE_ID_ASR"):
     logger.warning("⚠️ 未设置 VOLC_RESOURCE_ID（ASR）：语音转写将在调用时失败，请检查 config.env。")
-if not CONFIG.get("VOLC_RESOURCE_ID_TTS"):
-    logger.warning("⚠️ 未设置 VOLC_RESOURCE_ID_TTS：合成语音将在调用时失败，请检查 config.env。")
+if not CONFIG.get("AZURE_SPEECH_KEY") or not CONFIG.get("AZURE_SPEECH_REGION"):
+    logger.warning("⚠️ 未设置 AZURE_SPEECH_KEY/REGION：合成语音将在调用时失败，请检查 config.env。")
 
 TEACHING_CONFIG = {"enable_correction": False, "enable_translation": True, "enable_hints": True}
 
@@ -141,16 +140,13 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def on_startup():
-    """服务启动时：SQLite 结构升级 → VectorStore 预热 → DeepSeek HTTP 预热 → TTS 连接池预热"""
+    """服务启动时：SQLite 结构升级 → VectorStore 预热 → DeepSeek HTTP 预热"""
     await run_in_threadpool(ensure_schema_upgrades)
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
     await warm_deepseek_connection("server_startup")
-    # TTS 连接池预热（后台任务，不阻塞启动）
-    from core.audio_service import _TTS_POOL_SIZE as _TP_SIZE
-    pool = init_tts_pool(CONFIG)
-    asyncio.create_task(warm_tts_pool())
-    logger.info(f"🔥 TTS 连接池已初始化（大小={_TP_SIZE}），正在后台预热...")
+    # Azure TTS 无需预热连接池（SDK 内部自动管理），仅保留启动日志
+    logger.info("🔊 Azure Neural TTS 已就绪（无需预热）。")
 
 
 @app.on_event("shutdown")
@@ -159,9 +155,6 @@ async def on_shutdown():
         await client.close()
     except Exception as e:
         logger.warning("[LLM] AsyncOpenAI close: %s", e)
-    pool = get_tts_pool()
-    if pool:
-        await pool.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
