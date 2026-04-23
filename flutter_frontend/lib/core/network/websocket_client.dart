@@ -25,6 +25,7 @@ final wsConnectionStateProvider = StreamProvider<WsConnectionState>((ref) {
 class WebSocketClient {
   WebSocketChannel? _channel;
 
+  // 使用 broadcast 流来分发高频的 JSON 消息，包括 ai_text_stream
   final _jsonController = StreamController<Map<String, dynamic>>.broadcast();
   final _audioController = StreamController<Uint8List>.broadcast();
   final _stateController = StreamController<WsConnectionState>.broadcast();
@@ -44,7 +45,8 @@ class WebSocketClient {
   WsConnectionState get connectionState => _state;
   Stream<Map<String, dynamic>> get commandStream => _jsonController.stream;
   Stream<Uint8List> get audioStream => _audioController.stream;
-  Stream<WsConnectionState> get connectionStateStream => _stateController.stream;
+  Stream<WsConnectionState> get connectionStateStream =>
+      _stateController.stream;
 
   // ── 连接 ─────────────────────────────────────────────────────────────────
   Future<void> connect() async {

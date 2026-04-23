@@ -2,28 +2,9 @@
 Dialogue Engine - English Coach
 核心状态机、计分与对话引擎模块。
 
-[Session Ctx 状态字典约定]:
-- phase: 当前对话阶段 (ICE_BREAKING, CORE_TASK, EVENT_EXTENSION, WRAP_UP)
-- loop_count: 完成「整局模拟」的次数（WRAP_UP 结算并回到破冰时 +1，非每轮用户发言）
-- current_level: 用户当前所处的段位等级
-- completed_rounds_in_level: 在当前段位下已完成的局数 (满 ROUNDS_PER_LEVEL 局晋级)
-- new_targets / history_targets: 纯数据字典列表 [{"id": int, "node_text": str}], 彻底避免 ORM 跨会话 Detached 报错
-- chat_score / task_score: 维系当前局的分数统计
-
-[关于 ADVANCE 切阶段指令]:
-- 所有的切阶段行为，均由系统 Prompt 约束 LLM 在回复末尾输出 "[ADVANCE]" 触发。
-- 注意分工: 由 server.py 负责从大模型文本中提取该标记，并写入 session_ctx["llm_wants_to_advance"]。
-- 本模块 (dialogue_engine) 负责在下一轮用户交互时，读取该标志位并推进状态机。
-
-[Prompt 物理隔离架构]:
-- 所有英文文案（通用规则、阶段指令、性格描述）存储于 prompts/global_rules.json。
-- 场景三元组与场景专属护栏：优先从 TaskPacket 读取；TaskPacket 为 None 时降级到 scenes.json。
-- 本文件只负责结构组装与动态变量注入，不硬编码任何一句英文提示词。
-
-[TaskPacket 集成]:
-- build_dynamic_prompt 新增 task_packet 可选参数
-- 传入 TaskPacket 时：scene/role/level/rules 均从 TaskPacket 读取（LMS 主导）
-- task_packet=None 时：降级到 scenes.json（向后兼容，便于测试和迁移期使用）
+[终极演进 - 主从分离架构 (Dual-LLM Actor-Director Model)]:
+- LLM 1 (Actor): 纯粹的对话者，剥离所有 Tools，实现 TTFB < 1秒 的极速语音秒回。
+- LLM 2 (Director/Evaluator): 后台旁路运行，调用强制 Tool，生成翻译/提示，并裁定是否推进状态机。
 """
 
 import os
@@ -33,9 +14,10 @@ import logging
 import re
 import asyncio
 import datetime
-from typing import Optional
+from typing import Optional, Tuple
 from sqlalchemy.orm import Session
 from fastapi import WebSocket
+import jinja2
 
 from database import User, Topic, TargetNode, UserProgress
 from domain.entities.task_packet import (
@@ -52,11 +34,10 @@ logger = logging.getLogger("EnglishCoach")
 
 # ================= 业务全局常量 =================
 
-ROUNDS_PER_LEVEL = 3           # 每个段位需要完成的局数
-MAX_TURNS_PER_PHASE = 25       # 兜底机制：每个阶段最大互动轮数，超时强制推进
+ROUNDS_PER_LEVEL = 3  # 每个段位需要完成的局数
+MAX_TURNS_PER_PHASE = 25  # 兜底机制：每个阶段最大互动轮数，超时强制推进
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))  # python_backend/
-# 绝对路径，确保从任意目录启动 uvicorn 均能正常加载配置
 SCENES_FILE_PATH = os.path.join(_BACKEND_DIR, "scenes.json")
 GLOBAL_RULES_FILE_PATH = os.path.join(_BACKEND_DIR, "prompts", "global_rules.json")
 
@@ -69,6 +50,96 @@ EVENT_POOL = [
 
 # 闲聊得分的心流曲线 (非线性：前后慢，中间快。总和正好 40 分)
 CHAT_SCORE_CURVE = [2.0, 3.0, 5.0, 8.0, 10.0, 6.0, 3.0, 2.0, 1.0]
+
+# ================= Jinja2 模板引擎配置 =================
+JINJA_ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+
+# 【主 LLM 演员静态模板】：只关注沉浸式角色扮演，彻底无格式负担
+STATIC_SYSTEM_TEMPLATE = JINJA_ENV.from_string("""
+You are an expert English Coach. 
+Learner Level: {{ canonical_level }} | Practice content tier (target nodes): {{ depth_tier_val }}
+Coach turn length cap: {{ max_reply_sentences }} short in-character sentences per reply.
+
+[ROLE AND PERSONALITY]
+{{ role_desc }}
+{{ personality_desc }}
+
+{% if cog_line %}
+[COGNITIVE LOAD GUIDELINE]
+{{ cog_line }}
+{% endif %}
+
+{% if universal_rules %}
+[UNIVERSAL COACHING RULES]
+{% for rule in universal_rules %}
+{{ loop.index }}. {{ rule }}
+{% endfor %}
+{% endif %}
+
+{% if scene_specific_rules %}
+[SCENE-SPECIFIC RULES]
+{% for rule in scene_specific_rules %}
+- {{ rule }}
+{% endfor %}
+{% endif %}
+
+{% if session_goal_line %}
+[SESSION GOAL] 
+{{ session_goal_line }}
+{% endif %}
+
+[OUTPUT BUDGET & QUESTION POLICY]
+- Within your {{ max_reply_sentences }} sentence allowance: ask at most ONE question that expects an answer from the learner this turn.
+- Do NOT put two answerable questions in the same sentence. 
+- No bullet lists, no lecture-style multi-paragraph answers. Use plain conversational text only.
+""")
+
+# 【主 LLM 演员动态模板】：每轮的任务引导，剥离了所有 Tool Calling 命令
+DYNAMIC_TURN_TEMPLATE = JINJA_ENV.from_string("""
+[SYSTEM DIRECTIVE FOR CURRENT TURN]
+Current Phase: {{ phase }}
+
+{% if phase == 'ICE_BREAKING' %}
+PHASE 1: ICE BREAKING (Small Talk)
+Goal: Build rapport. Briefly greet the user and set the scene for {{ scene_name }}. Wrap up the greeting naturally when the user is ready.
+{% elif phase == 'CORE_TASK' %}
+PHASE 2: CORE TASK (Language Practice)
+Goal: Guide the user through the main task of the {{ scene_name }} while focusing on practice.
+Mandatory Practice: You MUST naturally guide the user to say these REMAINING target words: {{ unhit_targets }}.
+Bonus Review: The user already used these words: {{ hit_targets }}. 
+Action: Keep the conversation flowing naturally toward completing the task.
+{% elif phase == 'EVENT_EXTENSION' %}
+PHASE 3: EVENT EXTENSION (The Twist)
+Goal: Introduce this complication: '{{ current_event }}'. Test user's problem-solving skills.
+{% elif phase == 'WRAP_UP' %}
+PHASE 4: WRAP UP (Conclusion)
+Goal: Conclude naturally. Give one sentence of positive feedback and say a final goodbye.
+{% endif %}
+
+[CRITICAL INSTRUCTION]
+Just speak your English reply. DO NOT output any tags, JSON, or tool calls. Reply as fast and naturally as possible.
+""")
+
+# 【副 LLM 导演评估模板】：专职负责翻译、提示与状态推进，高内聚高稳定
+EVALUATOR_SYSTEM_TEMPLATE = JINJA_ENV.from_string("""
+You are the backend AI Director for an English coaching application. 
+You will be provided with the last exchange between the User and the AI Coach.
+
+Your job is to strictly use the `submit_analysis_and_feedback` tool to output a JSON object containing:
+1. `ai_translation_cn`: A natural Chinese translation of the AI Coach's English reply.
+2. `suggested_hints_en`: 2 or 3 short English responses the User could say next.
+3. `coach_correction_cn`: If the User made a severe grammar/vocabulary mistake in their text, correct it in Chinese. Otherwise, leave empty.
+4. `should_advance_phase`: A boolean. Set to TRUE ONLY IF the AI Coach's reply strongly indicates that the current phase goal is fulfilled and the conversation is naturally transitioning.
+
+Current Phase Rules for Evaluation:
+- If current phase is ICE_BREAKING: Advance to CORE_TASK if the small talk is over and they are ready to start the main scenario.
+- If current phase is CORE_TASK: Advance to EVENT_EXTENSION if the user has successfully completed the main task objective.
+- If current phase is EVENT_EXTENSION: Advance to WRAP_UP if the complication/twist has been resolved.
+- If current phase is WRAP_UP: Advance to ICE_BREAKING if the coach has said their final goodbye.
+
+Current Phase: {{ phase }}
+Scene: {{ scene_name }}
+""")
 
 # ================= 辅助工具 =================
 
@@ -86,6 +157,7 @@ def load_active_scene(file_path=SCENES_FILE_PATH):
         logger.warning(f"⚠️ Could not load scenes.json ({e}). Using default.")
         return {"scene": "McDonald's Ordering", "level": "Intermediate", "role": "McDonald's Cashier"}
 
+
 def load_global_rules(file_path=GLOBAL_RULES_FILE_PATH):
     """加载全局 Prompt 配置，支持热更新；加载失败时返回空字典，prompt 降级但不崩溃"""
     try:
@@ -94,26 +166,6 @@ def load_global_rules(file_path=GLOBAL_RULES_FILE_PATH):
     except Exception as e:
         logger.error(f"🚨 Could not load global_rules.json ({e}). Prompt will be degraded.")
         return {}
-
-def clean_llm_json(raw_text: str) -> dict:
-    """工业级 LLM JSON 清洗工具，逆向解析防长篇废话与多代码块干扰"""
-    raw_text = raw_text.strip()
-    try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        pass
-
-    # 使用 `{3}` 替代反引号防 Markdown 截断；获取代码块全量内容
-    matches = re.findall(r'`{3}(?:json)?\s*([\s\S]*?)\s*`{3}', raw_text)
-    if matches:
-        # 逆向遍历：如果模型输出了多个代码块，真正的 JSON 通常在最后一个
-        for match in reversed(matches):
-            try:
-                return json.loads(match.strip())
-            except Exception:
-                continue
-
-    raise ValueError("LLM returned malformed JSON that could not be parsed.")
 
 
 def _cognitive_load_line(rules: dict, canonical: str) -> Optional[str]:
@@ -125,10 +177,10 @@ def _cognitive_load_line(rules: dict, canonical: str) -> Optional[str]:
 
 
 def _preload_new_targets_if_empty(
-    db: Session,
-    session_ctx: dict,
-    task_packet: Optional[TaskPacket],
-    topic_id: int,
+        db: Session,
+        session_ctx: dict,
+        task_packet: Optional[TaskPacket],
+        topic_id: int,
 ) -> None:
     """本局 new_targets 为空时，从 TaskPacket 或 DB 预取最多 3 个节点（排除已在 history 中的 id）。"""
     if session_ctx.get("new_targets"):
@@ -170,45 +222,29 @@ def _preload_new_targets_if_empty(
         )
 
 
-# ================= 核心提示词构建 =================
+# ================= 核心提示词构建 (动静分离) =================
 
-def build_dynamic_prompt(
-    user: Optional[User],
-    is_flipped: bool,
-    session_ctx: dict,
-    task_packet: Optional[TaskPacket] = None,
-    session_hits: Optional[set] = None,
-):
-    """
-    Prompt 组装入口。
-
-    优先级：
-    1. task_packet 不为 None → 从 TaskPacket 读取场景信息（LMS 主导模式）
-    2. task_packet 为 None  → 降级到 scenes.json（兼容模式，用于测试/迁移期）
-
-    所有英文文案模板仍从 global_rules.json 加载，本函数只负责结构拼接与变量注入。
-
-    session_hits: 当前局已命中的节点 id，用于 CORE_TASK 下拆分必做/复习目标。
-    """
+def build_prompts(
+        user: Optional[User],
+        is_flipped: bool,
+        session_ctx: dict,
+        task_packet: Optional[TaskPacket] = None,
+        session_hits: Optional[set] = None,
+) -> Tuple[str, str]:
+    """构建发给主 LLM（演员）的 Prompt"""
     rules = load_global_rules()
     if session_hits is None:
         session_hits = set()
 
+    # 1. 提取基础变量
     if task_packet is not None:
-        # ── LMS 主导模式：从 TaskPacket 读取场景三元组 ──────────────────────
         scene_name = task_packet.scene_prompt
         role_name = task_packet.role_name
         user_level = task_packet.learner_level
         scene_specific_rules = task_packet.scene_specific_rules
         depth_tier_val = int(task_packet.depth_tier or 1)
-        # max_reply_sentences 在 canonical 计算后统一赋值（忽略组包快照，避免与 user.settings 分叉）
-
-        # 将 session_goal 注入 prompt（帮助 AI 理解本次练习意图）
-        session_goal_line = (
-            f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else ""
-        )
+        session_goal_line = (f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else "")
     else:
-        # ── 兼容模式：从 scenes.json 读取 ───────────────────────────────────
         active_scene = load_active_scene()
         scene_name = active_scene.get("scene", "Daily Conversation")
         role_name = active_scene.get("role", "Assistant")
@@ -217,14 +253,9 @@ def build_dynamic_prompt(
         session_goal_line = ""
         depth_tier_val = 1
 
-    # 单一权威等级带：用户 settings > TaskPacket / 场景默认；句数 cap 始终由此 + tier 推导
     settings_dict = (user.settings or {}) if user and getattr(user, "settings", None) else None
-    canonical_level = effective_learner_label(
-        settings_dict,
-        task_packet.learner_level if task_packet else None,
-        user_level,
-    )
-    user_level = canonical_level
+    canonical_level = effective_learner_label(settings_dict, task_packet.learner_level if task_packet else None,
+                                              user_level)
     max_reply_sentences = compute_max_reply_sentences(canonical_level, depth_tier_val)
 
     logger.info(
@@ -233,159 +264,69 @@ def build_dynamic_prompt(
     )
 
     phase = session_ctx.get("phase", "ICE_BREAKING")
-    loop_count = session_ctx.get("loop_count", 1)
 
-    # ── 角色与性格 ──────────────────────────────────────────────────────────
+    # 角色与性格
     role_desc = (
         f"You are acting as: {role_name} in a {scene_name} setting."
         if not is_flipped
         else f"You are the CUSTOMER/USER. The user is acting as the {role_name}."
     )
-    personality_levels = rules.get("personality_levels", {
-        "0": "Your personality: IMPATIENT and RUDE.",
-        "1": "Your personality: PROFESSIONAL and POLITE.",
-        "2": "Your personality: EXTREMELY POLITE and TALKATIVE."
-    })
+    personality_levels = rules.get("personality_levels", {})
     politeness_key = str(user.politeness_level) if user else "1"
     personality_desc = personality_levels.get(politeness_key, personality_levels.get("1", ""))
 
-    prompt_blocks = [
-        (
-            f"Learner Level: {user_level} | Practice content tier (target nodes): {depth_tier_val} "
-            f"| Coach turn length cap: {max_reply_sentences} short in-character sentences per reply "
-            f"(excluding a trailing [ADVANCE] token if required)"
-        ),
-        role_desc,
-        personality_desc,
-        "",
-    ]
-
-    # ── 认知负荷（canonical 键直查 cognitive_load_levels）────────────────────
+    # 认知负荷与全局规则
     cog_line = _cognitive_load_line(rules, canonical_level)
     if not cog_line:
         cog_line = _cognitive_load_line(rules, "Intermediate")
-        logger.warning(
-            f"[Prompt] No cognitive_load_levels entry for '{canonical_level}', "
-            f"falling back to Intermediate text."
-        )
-    if cog_line:
-        prompt_blocks.append("[COGNITIVE LOAD GUIDELINE]")
-        prompt_blocks.append(str(cog_line))
-        prompt_blocks.append("")
 
-    # ── 通用规则（按等级分档；缺省回退 universal_rules）────────────────────────
     by_level = rules.get("universal_rules_by_level") or {}
     universal_rules = by_level.get(canonical_level) or rules.get("universal_rules", [])
-    if universal_rules:
-        prompt_blocks.append("[UNIVERSAL COACHING RULES]")
-        for i, rule in enumerate(universal_rules, 1):
-            prompt_blocks.append(f"{i}. {rule}")
-        prompt_blocks.append("")
 
-    # ── 场景专属护栏（优先来自 TaskPacket，兼容模式来自 scenes.json）───────────
-    if scene_specific_rules:
-        prompt_blocks.append("[SCENE-SPECIFIC RULES]")
-        for rule in scene_specific_rules:
-            prompt_blocks.append(f"- {rule}")
-        prompt_blocks.append("")
+    # 2. 准备动态变量 (打靶词汇与事件)
+    new_targets_list = session_ctx.get("new_targets", [])
+    history_targets_list = session_ctx.get("history_targets", [])
+    all_active = new_targets_list + history_targets_list
 
-    # ── 本次练习目标（仅 TaskPacket 模式下注入）──────────────────────────────
-    if session_goal_line:
-        prompt_blocks.append(session_goal_line)
-        prompt_blocks.append("")
+    unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
+    hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
 
-    # ── 阶段控制框架 ────────────────────────────────────────────────────────
-    phase_control = rules.get("phase_control", {})
-    if phase_control:
-        prompt_blocks.append("[PHASE CONTROL]")
-        prompt_blocks.append(
-            phase_control.get("header", "").format(loop_count=loop_count, phase=phase)
-        )
-        prompt_blocks.append(phase_control.get("advance_rule", ""))
-        prompt_blocks.append(phase_control.get("advance_critical", ""))
-        prompt_blocks.append("")
+    unhit_targets = ", ".join(
+        [f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]) or "(none — great job)"
+    hit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]) or "(none yet)"
+    current_event = session_ctx.get("current_event", "There is a small problem with your request.")
 
-    # ── 当前阶段指令（从 JSON 读取，用 .format() 注入动态变量）─────────────
-    prompt_blocks.append("[YOUR CURRENT DIRECTIVE]:")
-    directive = rules.get("phase_directives", {}).get(phase, {})
-
-    if phase == "ICE_BREAKING":
-        prompt_blocks.append(directive.get("header", "PHASE 1: ICE BREAKING (Small Talk)"))
-        prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
-        fw = directive.get("firewall", "")
-        if fw:
-            prompt_blocks.append(fw)
-        prompt_blocks.append(directive.get("advance", ""))
-
-    elif phase == "CORE_TASK":
-        new_targets_list = session_ctx.get("new_targets", [])
-        history_targets_list = session_ctx.get("history_targets", [])
-        all_active = new_targets_list + history_targets_list
-        unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
-        hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
-        unhit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]) or "(none — great job)"
-        hit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]) or "(none yet)"
-
-        prompt_blocks.append(directive.get("header", "PHASE 2: CORE TASK (Language Practice)"))
-        prompt_blocks.append(directive.get("goal", "").format(scene_name=scene_name))
-        prompt_blocks.append(
-            directive.get("directive", "").format(unhit_targets=unhit_targets)
-        )
-        prompt_blocks.append(directive.get("history", "").format(hit_targets=hit_targets))
-        prompt_blocks.append(directive.get("coaching", "").format(role_name=role_name))
-        prompt_blocks.append(directive.get("advance", ""))
-
-    elif phase == "EVENT_EXTENSION":
-        current_event = session_ctx.get("current_event", "There is a small problem with your request.")
-        prompt_blocks.append(directive.get("header", "PHASE 3: EVENT EXTENSION (The Twist)"))
-        goal_tmpl = directive.get("goal", "")
-        try:
-            prompt_blocks.append(goal_tmpl.format(current_event=current_event))
-        except (KeyError, ValueError):
-            prompt_blocks.append(goal_tmpl)
-        prompt_blocks.append(directive.get("override", "").format(current_event=current_event))
-        prompt_blocks.append(directive.get("coach_role", ""))
-        prompt_blocks.append(directive.get("advance", ""))
-
-    elif phase == "WRAP_UP":
-        prompt_blocks.append(directive.get("header", "PHASE 4: WRAP UP (Conclusion)"))
-        prompt_blocks.append(directive.get("goal", ""))
-        prompt_blocks.append(directive.get("advance", ""))
-
-    # 初学者：禁止一句里连问两个要回答的点；但不等于整轮只能说一句话（见 OUTPUT BUDGET 句数）
-    if canonical_level in ("Beginner", "Elementary") or max_reply_sentences <= 3:
-        prompt_blocks.append(
-            "[QUESTION BUDGET] Within your [OUTPUT BUDGET] sentence allowance: at most **one** question "
-            "that expects an answer from the learner this turn. You may use other short sentences for "
-            "greeting or acknowledgment. Do NOT put two answerable questions in the same sentence "
-            "(e.g. avoid 'Would you like a drink, and what size?'). If you need two details, split across turns."
-        )
-
-    # Recency: models often overweight later instructions; repeat length cap after phase text.
-    prompt_blocks.append("")
-    prompt_blocks.append(
-        f"[OUTPUT BUDGET] Your next reply: at most {max_reply_sentences} short in-character sentences "
-        f"before any trailing [ADVANCE] token. No bullet lists, no lecture-style multi-paragraph answers."
+    # 3. 渲染静态模板
+    static_system_prompt = STATIC_SYSTEM_TEMPLATE.render(
+        canonical_level=canonical_level,
+        depth_tier_val=depth_tier_val,
+        max_reply_sentences=max_reply_sentences,
+        role_desc=role_desc,
+        personality_desc=personality_desc,
+        cog_line=cog_line,
+        universal_rules=universal_rules,
+        scene_specific_rules=scene_specific_rules,
+        session_goal_line=session_goal_line,
     )
 
-    # 【新增】强制 LLM 在同一次请求中输出 JSON 教辅数据
-    prompt_blocks.append("")
-    prompt_blocks.append(
-        "[OUTPUT FORMAT]\n"
-        "You MUST strictly follow this response structure:\n"
-        "1. Your in-character English reply to the learner.\n"
-        "2. [ADVANCE] (Optional, ONLY if the phase directive requires a transition).\n"
-        "3. [COACH_JSON]\n"
-        "{\n"
-        '  "ai_translation_cn": "<A natural Chinese translation of your English reply>",\n'
-        '  "suggested_hints_en": ["<Hint 1 for user to reply>", "<Hint 2>"],\n'
-        '  "coach_correction_cn": "<If the user made a grammar/vocabulary mistake, briefly correct it in Chinese. Otherwise empty.>"\n'
-        "}\n"
-        "[/COACH_JSON]\n"
-        "Do NOT output any other text after [/COACH_JSON]."
+    # 4. 渲染动态模板
+    dynamic_turn_prompt = DYNAMIC_TURN_TEMPLATE.render(
+        phase=phase,
+        scene_name=scene_name,
+        unhit_targets=unhit_targets,
+        hit_targets=hit_targets,
+        current_event=current_event,
     )
 
-    return "\n".join(prompt_blocks)
+    return static_system_prompt, dynamic_turn_prompt
+
+
+def build_evaluator_prompt(session_ctx: dict, task_packet: Optional[TaskPacket] = None) -> str:
+    """构建发给旁路副 LLM（导演）的系统 Prompt"""
+    phase = session_ctx.get("phase", "ICE_BREAKING")
+    scene_name = task_packet.scene_prompt if task_packet else load_active_scene().get("scene", "Conversation")
+    return EVALUATOR_SYSTEM_TEMPLATE.render(phase=phase, scene_name=scene_name)
+
 
 # ================= 核心计分与状态机 =================
 
@@ -394,15 +335,7 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                                       task_packet: Optional[TaskPacket] = None):
     """
     L1 评估层：轻量同步，每轮对话触发。
-
-    升级点（Phase 2）：
-    1. 文本规范化：缩写展开 + 词干匹配（normalize_text / simple_stem）
-    2. 命中质量分级：精准匹配=1.0，词干匹配=0.8
-    3. 掌握度更新：SM-2 公式（update_mastery）替换原来的 flat +15
-    4. 更新 last_practiced_at（之前从未更新）
-
-    @param _topic_id: 保留作备用，供后续话题维度细粒度统计。
-    @param task_packet: 用于在 new_targets 为空时从 LMS 预加载节点。
+    保留原版词干提取、计分逻辑和 WS 进度推送。
     """
     try:
         _preload_new_targets_if_empty(db, session_ctx, task_packet, _topic_id)
@@ -417,9 +350,10 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
                     added_score = CHAT_SCORE_CURVE[chat_idx]
                     session_ctx["chat_score"] = min(40.0, session_ctx.get("chat_score", 0.0) + added_score)
                     session_ctx["chat_interaction_count"] = chat_idx + 1
-                    logger.info(f"[L1] Chat curve step {chat_idx+1} (+{added_score:.1f}) | total={session_ctx['chat_score']:.1f}/40")
+                    logger.info(
+                        f"[L1] Chat curve step {chat_idx + 1} (+{added_score:.1f}) | total={session_ctx['chat_score']:.1f}/40")
 
-        # --- 计分模块 2：核心任务 L1 命中检测 (60%) — 全阶段（含 ICE）扫描 active 词表 ---
+        # --- 计分模块 2：核心任务 L1 命中检测 (60%) ---
         new_targets = session_ctx.get("new_targets", [])
         history_targets = session_ctx.get("history_targets", [])
         all_active_targets = new_targets + history_targets
@@ -428,10 +362,7 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
             denom = max(1, len(new_targets) if new_targets else len(all_active_targets))
             points_per_new_word = 60.0 / denom
 
-            # 规范化用户输入（缩写展开，仅做一次）
             user_normalized = normalize_text(user_text)
-
-            # hit_info: [(node_id, quality_score)]
             hit_info: list[tuple[int, float]] = []
 
             for node in all_active_targets:
@@ -448,11 +379,10 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
 
                     is_new = any(n.get("id") == node_id for n in new_targets)
                     added_task = points_per_new_word if is_new else (points_per_new_word * 0.5)
-                    added_task *= quality  # 词干匹配只得 80% 分
+                    added_task *= quality
                     session_ctx["task_score"] = min(60.0, session_ctx.get("task_score", 0.0) + added_task)
                     logger.info(f"[L1] Hit '{node_text}' quality={quality:.2f} +{added_task:.1f}pts")
 
-            # 批量更新 UserProgress（SM-2 公式）
             if hit_info:
                 hit_ids = [h[0] for h in hit_info]
                 existing = db.query(UserProgress).filter(
@@ -484,9 +414,9 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
 
         last_sent = session_ctx.get("_ws_last_progress")
         skip_ws = (
-            phase == "ICE_BREAKING"
-            and last_sent is not None
-            and abs(overall_progress - float(last_sent)) < 2.5
+                phase == "ICE_BREAKING"
+                and last_sent is not None
+                and abs(overall_progress - float(last_sent)) < 2.5
         )
 
         try:
@@ -509,25 +439,17 @@ async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int,
 def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
     """
     L1 节点命中检测，返回质量分 0~1（0 = 未命中）。
-
-    检测顺序（优先精准）：
-    1. 精准匹配：node 完整出现在 user_text 中（词边界匹配）→ 1.0
-    2. 词干匹配：node 中每个词的词干都出现在 user 词干集合中 → 0.8
     """
-    # 精准匹配（带词边界，防止 "order" 误匹配 "disorder"）
     pattern_exact = rf"(?<!\w){re.escape(node_normalized)}(?!\w)"
     if re.search(pattern_exact, user_normalized):
         return L1_EXACT_QUALITY
 
-    # 词干匹配：只有用户输入做 stem，节点词本身已是原型，不 stem（否则 "burger"→"burg" 导致误判）
     node_words = node_normalized.split()
-    if len(node_words) <= 3:  # 超过 3 词的短语不做词干匹配，避免误报
-        # 用户词的 stem 集合 + 原始词集合（双保险）
+    if len(node_words) <= 3:
         user_word_set = {w for w in user_normalized.split() if len(w) >= 3}
         user_stem_set = {simple_stem(w) for w in user_word_set}
         all_user_forms = user_word_set | user_stem_set
 
-        # 节点中长度 >= 3 的词直接与用户词形集合匹配
         node_key_words = [w for w in node_words if len(w) >= 3]
         if node_key_words and all(nw in all_user_forms for nw in node_key_words):
             return L1_STEM_QUALITY
@@ -536,18 +458,15 @@ def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
 
 
 def advance_state_machine(
-    session_ctx: dict,
-    db: Session,
-    current_topic: Topic,
-    session_hits: set,
-    task_packet: Optional[TaskPacket] = None,
+        session_ctx: dict,
+        db: Session,
+        current_topic: Topic,
+        session_hits: set,
+        task_packet: Optional[TaskPacket] = None,
 ):
     """
     推进对话阶段状态机。
-
-    task_packet 参数（可选）：
-    - 若提供，进入 CORE_TASK 时优先使用 TaskPacket 中的 target_nodes（LMS 决策）
-    - 若未提供，降级为从 DB 随机采样（兼容旧流程）
+    [演进]：根据副 LLM 异步传来的 llm_wants_to_advance 标志位推进状态机。
     """
     phase = session_ctx.get("phase", "ICE_BREAKING")
     llm_signal = session_ctx.get("llm_wants_to_advance", False)
@@ -560,7 +479,6 @@ def advance_state_machine(
         session_ctx["phase"] = "CORE_TASK"
         session_ctx["phase_turns"] = 0
         session_ctx["llm_wants_to_advance"] = False
-        # new_targets 已在 evaluate 阶段预加载，此处不再合并 history / 重新抽词
         logger.info(
             "🔄 [推进] ICE_BREAKING -> CORE_TASK（沿用预加载词表）: "
             f"{[n.get('node_text') for n in session_ctx.get('new_targets', [])]}"
@@ -606,7 +524,6 @@ def advance_state_machine(
 
             logger.info(f"🎉🎉🎉 [状态机结算] 恭喜突破！成功晋级至 Lv.{session_ctx['current_level']}，词表重置 🎉🎉🎉")
         else:
-            # 未满 3 局晋级：本局词并入 history，清空 new_targets 以便下一轮 evaluate 重新预加载
             old_new = session_ctx.get("new_targets", [])
             session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
             session_ctx["new_targets"] = []

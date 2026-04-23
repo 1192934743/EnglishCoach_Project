@@ -36,7 +36,9 @@ class _TopicRequestSheetState extends ConsumerState<_TopicRequestSheet> {
   @override
   Widget build(BuildContext context) {
     return Padding(
-      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      padding: EdgeInsets.only(
+        bottom: MediaQuery.of(context).viewInsets.bottom,
+      ),
       child: Container(
         decoration: const BoxDecoration(
           color: Colors.white,
@@ -82,10 +84,15 @@ class _TopicRequestSheetState extends ConsumerState<_TopicRequestSheet> {
                   'e.g. "Ordering at Starbucks" or "机场值机"',
                   '例如：星巴克点单、机场值机',
                 ),
-                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: Colors.blueAccent, width: 2),
+                  borderSide: const BorderSide(
+                    color: Colors.blueAccent,
+                    width: 2,
+                  ),
                 ),
               ),
             ),
@@ -131,9 +138,8 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    builder: (_) => _TopicRequestSheet(
-      onSubmit: (desc) => notifier.requestTopic(desc),
-    ),
+    builder: (_) =>
+        _TopicRequestSheet(onSubmit: (desc) => notifier.requestTopic(desc)),
   );
 }
 
@@ -223,8 +229,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       }
 
       // 🌟 学习报告卡：preliminary 到达时弹出底部面板
-      if (next.sessionReport != null &&
-          previous?.sessionReport == null) {
+      if (next.sessionReport != null && previous?.sessionReport == null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           showSessionReportSheet(context).then((_) {
             // 面板 dismiss 后清空状态，防止重复弹出
@@ -233,6 +238,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         });
       }
     });
+
+    // ── 控制显示进行中状态的标识 ──
+    final hasActiveTurn = isListening || chatState.isWaitingForTeachingData;
+    final showEmptyState = chatState.chatHistory.isEmpty && !hasActiveTurn;
 
     return Scaffold(
       backgroundColor: const Color(0xFFF4F6F9),
@@ -245,7 +254,10 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 ? null
                 : chatState.currentTopicTitleZh,
           ),
-          style: const TextStyle(fontWeight: FontWeight.bold, color: Colors.black87),
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+            color: Colors.black87,
+          ),
           overflow: TextOverflow.ellipsis,
         ),
         backgroundColor: Colors.white,
@@ -370,8 +382,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               ),
                             ],
                           ),
-                          child: chatState.chatHistory.isEmpty
-                              ? _buildEmptyState(ref, isListening, settings.fontSize)
+                          child: showEmptyState
+                              ? _buildEmptyState(
+                                  ref,
+                                  isListening,
+                                  settings.fontSize,
+                                )
                               : ListView.builder(
                                   controller: _scrollController,
                                   reverse: true,
@@ -382,12 +398,26 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     bottom: shouldShowButton ? 120.0 : 20.0,
                                   ),
                                   physics: const BouncingScrollPhysics(),
-                                  itemCount: chatState.chatHistory.length,
+                                  itemCount:
+                                      chatState.chatHistory.length +
+                                      (hasActiveTurn ? 1 : 0),
                                   itemBuilder: (context, index) {
+                                    if (hasActiveTurn && index == 0) {
+                                      // 👉 渲染最新的动态构建气泡 (打字机效果+骨架屏)
+                                      return _buildActiveTurn(
+                                        ref,
+                                        chatState,
+                                        settings,
+                                        notifier,
+                                      );
+                                    }
+                                    final historyIndex = hasActiveTurn
+                                        ? index - 1
+                                        : index;
                                     final reversedIndex =
                                         chatState.chatHistory.length -
                                         1 -
-                                        index;
+                                        historyIndex;
                                     return _buildChatTurn(
                                       ref,
                                       chatState.chatHistory[reversedIndex],
@@ -469,6 +499,216 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             ),
           ],
         ),
+      ),
+    );
+  }
+
+  // ── 动态构建的当前轮次 (局部刷新) ──────────────────────────────────
+  Widget _buildActiveTurn(
+    WidgetRef ref,
+    ChatState state,
+    SettingsState settings,
+    ChatNotifier notifier,
+  ) {
+    final isListening = state.status == ChatStatus.listening;
+    final isWaiting = state.isWaitingForTeachingData;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // User Bubble 局部监听
+          ValueListenableBuilder<String>(
+            valueListenable: notifier.activeUserTextNotifier,
+            builder: (context, userText, child) {
+              if (userText.isEmpty && !isListening)
+                return const SizedBox.shrink();
+              return Align(
+                alignment: Alignment.centerRight,
+                child: Container(
+                  margin: const EdgeInsets.only(left: 40, bottom: 12),
+                  padding: const EdgeInsets.all(16),
+                  decoration: const BoxDecoration(
+                    color: Color(0xFFF0F4F8),
+                    borderRadius: BorderRadius.only(
+                      topLeft: Radius.circular(20),
+                      topRight: Radius.circular(20),
+                      bottomLeft: Radius.circular(20),
+                    ),
+                  ),
+                  child: Text(
+                    userText.isEmpty ? "..." : userText,
+                    style: TextStyle(
+                      fontSize: settings.fontSize,
+                      color: userText.isEmpty ? Colors.black38 : Colors.black87,
+                    ),
+                  ),
+                ),
+              );
+            },
+          ),
+
+          // AI Bubble & 骨架屏 局部监听
+          if (isWaiting)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Container(
+                margin: const EdgeInsets.only(right: 30),
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(20),
+                    topRight: Radius.circular(20),
+                    bottomRight: Radius.circular(20),
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.04),
+                      blurRadius: 10,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.all(16),
+                      child: ValueListenableBuilder<String>(
+                        valueListenable: notifier.activeAiTextNotifier,
+                        builder: (context, aiText, child) {
+                          if (aiText.isNotEmpty) {
+                            return _AIChatBubble(
+                              text: aiText,
+                              fontSize: settings.fontSize,
+                              onSentenceTap: (_) {}, // 流式输出时禁用点击复读，防止打断
+                            );
+                          }
+                          // AI 还没发声时的思考态
+                          return AnimatedBuilder(
+                            animation: _glowAnimation,
+                            builder: (context, _) => Opacity(
+                              opacity: 0.4 + (_glowAnimation.value * 0.6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  const SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Colors.blueAccent,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    tr(ref, 'Thinking...', '思考中...'),
+                                    style: TextStyle(
+                                      color: Colors.blueAccent,
+                                      fontSize: settings.fontSize,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                    if (settings.showTranslation || settings.showHints)
+                      _buildSkeletonTeachingData(ref, settings),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  // ── 副模型教辅数据生成期间的骨架屏掩护 (Skeleton Loader) ──
+  Widget _buildSkeletonTeachingData(WidgetRef ref, SettingsState settings) {
+    return Container(
+      decoration: BoxDecoration(
+        color: const Color(0xFFFAFAFA),
+        borderRadius: const BorderRadius.only(bottomRight: Radius.circular(20)),
+        border: Border(top: BorderSide(color: Colors.grey.shade100)),
+      ),
+      child: AnimatedBuilder(
+        animation: _glowAnimation,
+        builder: (context, _) {
+          return Opacity(
+            opacity: 0.4 + (_glowAnimation.value * 0.6),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (settings.showTranslation)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 12,
+                    ),
+                    decoration: const BoxDecoration(color: Color(0xFFF0F8FF)),
+                    child: Container(
+                      height: settings.fontSize,
+                      width: 180,
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                    ),
+                  ),
+                if (settings.showHints)
+                  Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.lightbulb_rounded,
+                              color: Colors.green.shade300,
+                              size: 16,
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              tr(ref, 'Generating feedback...', '教练正在生成反馈...'),
+                              style: const TextStyle(
+                                fontSize: 12,
+                                fontWeight: FontWeight.bold,
+                                color: Colors.black45,
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Container(
+                          height: settings.fontSize * 1.2,
+                          width: double.infinity,
+                          decoration: BoxDecoration(
+                            color: Colors.green.withOpacity(0.06),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          height: settings.fontSize * 1.2,
+                          width: MediaQuery.of(context).size.width * 0.5,
+                          decoration: BoxDecoration(
+                            color: Colors.green.withOpacity(0.06),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+              ],
+            ),
+          );
+        },
       ),
     );
   }
@@ -566,7 +806,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           const SizedBox(height: 20),
           Text(
             isListening
-                ? tr(ref, "I'm listening... Try saying 'Hello'!", '正在聆听…试试说 Hello！')
+                ? tr(
+                    ref,
+                    "I'm listening... Try saying 'Hello'!",
+                    '正在聆听…试试说 Hello！',
+                  )
                 : tr(ref, 'Tap the pill below to start!', '点击下方按钮开始对话！'),
             textAlign: TextAlign.center,
             style: TextStyle(color: Colors.grey[600], fontSize: fontSize),
@@ -650,8 +894,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 isLis
                     ? tr(ref, 'Listening...', '聆听中…')
                     : (isSpe
-                        ? tr(ref, 'Speaking...', '说话中…')
-                        : tr(ref, 'Ready', '就绪')),
+                          ? tr(ref, 'Speaking...', '说话中…')
+                          : tr(ref, 'Ready', '就绪')),
                 style: TextStyle(
                   fontSize: fs + 2,
                   fontWeight: FontWeight.bold,
@@ -937,20 +1181,33 @@ class _TopicGeneratingBanner extends ConsumerWidget {
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
       decoration: BoxDecoration(
         gradient: LinearGradient(
-          colors: [Colors.blueAccent.withValues(alpha: 0.12), Colors.purpleAccent.withValues(alpha: 0.08)],
+          colors: [
+            Colors.blueAccent.withValues(alpha: 0.12),
+            Colors.purpleAccent.withValues(alpha: 0.08),
+          ],
         ),
-        border: Border(bottom: BorderSide(color: Colors.blueAccent.withValues(alpha: 0.2))),
+        border: Border(
+          bottom: BorderSide(color: Colors.blueAccent.withValues(alpha: 0.2)),
+        ),
       ),
       child: Row(
         children: [
           const SizedBox(
-            width: 16, height: 16,
-            child: CircularProgressIndicator(strokeWidth: 2, color: Colors.blueAccent),
+            width: 16,
+            height: 16,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: Colors.blueAccent,
+            ),
           ),
           const SizedBox(width: 10),
           Text(
             tr(ref, 'Generating your practice topic...', '正在生成练习场景…'),
-            style: TextStyle(fontSize: 12, color: Colors.blueAccent.shade700, fontWeight: FontWeight.w500),
+            style: TextStyle(
+              fontSize: 12,
+              color: Colors.blueAccent.shade700,
+              fontWeight: FontWeight.w500,
+            ),
           ),
         ],
       ),

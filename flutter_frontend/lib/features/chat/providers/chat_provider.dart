@@ -38,12 +38,16 @@ class ChatState {
   /// 非 null 时触发报告卡弹出；dismiss 后调用 clearSessionReport() 置 null
   final SessionReport? sessionReport;
   final String currentTopicTitle;
+
   /// 来自后端 `topics.title_zh` / TaskPacket；空则界面用 `topicTitleUiLabel` 兜底。
   final String currentTopicTitleZh;
   final String currentRoleName;
 
   /// true while backend is generating a user-requested topic
   final bool isGeneratingTopic;
+
+  // ── 主从分离架构新增：标识正在等待旁路的 JSON 辅导数据 ─────────────
+  final bool isWaitingForTeachingData;
 
   ChatState({
     required this.status,
@@ -56,6 +60,7 @@ class ChatState {
     this.currentTopicTitleZh = '',
     this.currentRoleName = "AI Coach",
     this.isGeneratingTopic = false,
+    this.isWaitingForTeachingData = false,
   });
 
   ChatState copyWith({
@@ -69,6 +74,7 @@ class ChatState {
     String? currentTopicTitleZh,
     String? currentRoleName,
     bool? isGeneratingTopic,
+    bool? isWaitingForTeachingData,
   }) {
     return ChatState(
       status: status ?? this.status,
@@ -85,6 +91,8 @@ class ChatState {
       currentTopicTitleZh: currentTopicTitleZh ?? this.currentTopicTitleZh,
       currentRoleName: currentRoleName ?? this.currentRoleName,
       isGeneratingTopic: isGeneratingTopic ?? this.isGeneratingTopic,
+      isWaitingForTeachingData:
+          isWaitingForTeachingData ?? this.isWaitingForTeachingData,
     );
   }
 }
@@ -126,9 +134,16 @@ class ChatNotifier extends Notifier<ChatState> {
   /// 端到端延迟排查：从 stopListeningAndSubmit 到首包 PCM 的客户端阶段
   Stopwatch? _latencySw;
   bool _latencyLoggedFirstPcm = false;
+
   /// 与后端 [LATENCY]/[E2E] 对齐的轮次 id（随 user_finish_speaking 上报）
   String? _latencyTurnId;
   int? _latencyFirstPcmMs;
+
+  // ── 高频文本流局部刷新：避免 ListView 全局重绘 ─────────────
+  final ValueNotifier<String> activeUserTextNotifier = ValueNotifier<String>(
+    '',
+  );
+  final ValueNotifier<String> activeAiTextNotifier = ValueNotifier<String>('');
 
   void _latencyLogClient(String stage, [String extra = '']) {
     final sw = _latencySw;
@@ -174,6 +189,8 @@ class ChatNotifier extends Notifier<ChatState> {
       _maxListenTimer?.cancel();
       _recorder.dispose();
       _player.closePlayer();
+      activeUserTextNotifier.dispose();
+      activeAiTextNotifier.dispose();
     });
     return ChatState(
       status: ChatStatus.idle,
@@ -267,7 +284,7 @@ class ChatNotifier extends Notifier<ChatState> {
       );
       await _player.openPlayer();
     } catch (e) {
-      print("音频会话配置异常: $e");
+      debugPrint("音频会话配置异常: $e");
     }
   }
 
@@ -301,7 +318,17 @@ class ChatNotifier extends Notifier<ChatState> {
       } else if (data['event'] == 'tts_finished') {
         if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
         _handleAudioFinished();
+      } else if (data['event'] == 'asr_partial') {
+        // 捕获流式转写数据并展示
+        activeUserTextNotifier.value = data['text'] ?? '';
+      } else if (data['event'] == 'ai_text_stream') {
+        // ── 核心新增：捕获主 LLM 的流式回复，实现打字机效果 ──
+        if (!state.isWaitingForTeachingData) {
+          state = state.copyWith(isWaitingForTeachingData: true);
+        }
+        activeAiTextNotifier.value += (data['text'] ?? '');
       } else if (data['event'] == 'teaching_data') {
+        // ── 核心新增：捕获副 LLM 生成的分析结果，移除骨架屏并结算 ──
         final d = data['data'];
         if (d['user_text'] != null && d['ai_text'] != null) {
           final newTurn = ChatTurn(
@@ -309,7 +336,12 @@ class ChatNotifier extends Notifier<ChatState> {
             aiText: d['ai_text'],
             rawTeachingData: d,
           );
-          state = state.copyWith(chatHistory: [...state.chatHistory, newTurn]);
+          state = state.copyWith(
+            chatHistory: [...state.chatHistory, newTurn],
+            isWaitingForTeachingData: false,
+          );
+          activeUserTextNotifier.value = '';
+          activeAiTextNotifier.value = '';
         }
       } else if (data['event'] == 'role_swapped') {
         state = state.copyWith(isFlipped: data['is_flipped']);
@@ -334,7 +366,8 @@ class ChatNotifier extends Notifier<ChatState> {
         _handleSessionReport(data);
       } else if (data['event'] == 'error') {
         final code = data['code'] as String? ?? 'UNKNOWN';
-        final needIdle = code == 'LLM_TIMEOUT' ||
+        final needIdle =
+            code == 'LLM_TIMEOUT' ||
             code == 'LLM_ERROR' ||
             code == 'TOPIC_GENERATION_FAILED';
         if (needIdle) await forceIdle();
@@ -344,7 +377,9 @@ class ChatNotifier extends Notifier<ChatState> {
         final message = (isZh && zh != null && zh.isNotEmpty)
             ? zh
             : (en ??
-                (isZh ? '出错了，请稍后再试。' : 'Something went wrong. Please try again.'));
+                  (isZh
+                      ? '出错了，请稍后再试。'
+                      : 'Something went wrong. Please try again.'));
         state = state.copyWith(errorMessage: message);
       }
     }, onError: (_) => forceIdle());
@@ -356,10 +391,7 @@ class ChatNotifier extends Notifier<ChatState> {
         if (!_latencyLoggedFirstPcm) {
           _latencyLoggedFirstPcm = true;
           _latencyFirstPcmMs = _latencySw?.elapsedMilliseconds;
-          _latencyLogClient(
-            '05_first_pcm_chunk',
-            'len=${audioBytes.length}',
-          );
+          _latencyLogClient('05_first_pcm_chunk', 'len=${audioBytes.length}');
         }
         _playbackStartTime ??= DateTime.now();
         _totalBytesReceived += audioBytes.length;
@@ -491,7 +523,6 @@ class ChatNotifier extends Notifier<ChatState> {
             }
           });
     } catch (e, st) {
-      // Print the real exception so we can see exactly what failed
       debugPrint('[startListening] EXCEPTION: $e');
       debugPrint('[startListening] STACKTRACE: $st');
       forceIdle();
@@ -514,7 +545,14 @@ class ChatNotifier extends Notifier<ChatState> {
       _ampSubscription?.cancel();
       _silenceTimer?.cancel();
       _maxListenTimer?.cancel(); // Fix B5
-      state = state.copyWith(status: ChatStatus.speaking);
+
+      // 切换状态，唤起骨架屏，并重置本轮的 AI 流文本
+      state = state.copyWith(
+        status: ChatStatus.speaking,
+        isWaitingForTeachingData: true,
+      );
+      activeAiTextNotifier.value = '';
+
       await _player.startPlayerFromStream(
         codec: Codec.pcm16,
         numChannels: 1,
@@ -559,7 +597,13 @@ class ChatNotifier extends Notifier<ChatState> {
     _ampSubscription?.cancel();
     _silenceTimer?.cancel();
     _maxListenTimer?.cancel(); // Fix B5: cancel the safety timer
-    state = state.copyWith(status: ChatStatus.idle);
+
+    state = state.copyWith(
+      status: ChatStatus.idle,
+      isWaitingForTeachingData: false,
+    );
+    activeUserTextNotifier.value = '';
+    activeAiTextNotifier.value = '';
   }
 
   /// P0 打断机制：AI 说话途中用户开口 → 立刻停播 + 清空 PCM + 通知后端 + 开始录音
@@ -591,6 +635,11 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencyTurnId = null;
     _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
+
+    // 清理界面数据并重入录音
+    state = state.copyWith(isWaitingForTeachingData: false);
+    activeUserTextNotifier.value = '';
+    activeAiTextNotifier.value = '';
 
     // ── 6. 解除打断标志，切换到录音状态 ──────────────────────────────────
     _isInterrupting = false;
