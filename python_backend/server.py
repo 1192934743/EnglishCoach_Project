@@ -31,7 +31,9 @@ from core.audio_service import (
     run_tts_turn_reused_from_queue,
     init_tts_pool,
 )
-from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, async_fetch_and_send_teaching
+
+# 【修改点 1】：移除了旧的 async_fetch_and_send_teaching，引入了 clean_llm_json 用于稳健解析
+from core.dialogue_engine import build_dynamic_prompt, advance_state_machine, evaluate_and_check_progress, clean_llm_json
 from domain.entities.session_context import SessionContext
 import uuid
 import application.services.session_planner as session_planner
@@ -293,7 +295,8 @@ async def get_stats(user_id: str = Query(...)):
     return JSONResponse(content=data)
 
 # ================= 业务全局常量 =================
-LLM_MAX_TOKENS = 80                # 限制每次模型输出的长度，保证响应速度
+# 【修改点 2】：大幅提升 Token 上限以容纳多模态生成的 JSON 教辅数据
+LLM_MAX_TOKENS = 500               
 DEFAULT_TOPIC_ID = 999             # 兜底的话题ID
 MAX_AUDIO_BYTES = 5 * 1024 * 1024  # 音频防爆限制：5MB
 MAX_BUFFER_CHARS = 65              # 无标点时略缩短，更快送入 TTS
@@ -943,16 +946,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             consumer_task.cancel()
                         consumer_task = asyncio.create_task(tts_consumer(tts_queue))
 
+                    # 【修改点 3】：重写的单流拦截与分发逻辑
                     # 4. LLM 流式对话（包含首包连接 + 全量 chunk 消费，统一超时保护）
                     raw_full_reply = ""
                     sentence_buffer = ""
+                    json_buffer = ""
+                    in_json_mode = False
                     punctuation_marks = ['.', '!', '?', '。', '！', '？', '\n']
-                    early_head_flush_used = False
                     _lat_flags = {"llm_first": False, "tts_enqueue": False}
 
                     async def _stream_llm_to_queue():
-                        """将 create + async for 封装为单协程，便于 wait_for 统一超时"""
-                        nonlocal raw_full_reply, sentence_buffer
+                        nonlocal raw_full_reply, sentence_buffer, json_buffer, in_json_mode
                         _latency_log(
                             lat,
                             "04_llm_api_request_start",
@@ -970,25 +974,52 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     _lat_flags["llm_first"] = True
                                     pv = delta[:72] + ("…" if len(delta) > 72 else "")
                                     _latency_log(lat, "05_llm_first_content_delta", preview=pv)
+
                                 raw_full_reply += delta
-                                if not is_test_mode and tts_queue:
+
+                                # 【阶段 A】：正在接收英文语音台词
+                                if not in_json_mode:
                                     sentence_buffer += delta
-                                    # ── 断句：完全依赖标点符号，或者在极度冗长时才强行截断 ──────────────────────
-                                    has_punct = any(p in delta for p in punctuation_marks)
-                                    # 终极防爆兜底：只有当长达 120 字符不加标点，且恰好遇到空格/换行时，才允许强行截断
-                                    safety_cutoff = len(sentence_buffer) > 120 and (' ' in delta or '\n' in delta)
-
-                                    want_flush = has_punct or safety_cutoff
-
-                                    if want_flush:
-                                        chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
-                                        if chunk_text:
+                                    
+                                    # 状态机跃迁：检测到教辅 JSON 标记，立刻切断 TTS 投喂
+                                    if "[COACH_JSON]" in sentence_buffer:
+                                        in_json_mode = True
+                                        parts = sentence_buffer.split("[COACH_JSON]")
+                                        text_part = parts[0]
+                                        json_part = parts[1] if len(parts) > 1 else ""
+                                        
+                                        # 将标记前剩余的纯净英文刷入 TTS 队列
+                                        clean_text = text_part.replace("[ADVANCE]", "").strip()
+                                        if clean_text and not is_test_mode and tts_queue:
                                             if not _lat_flags["tts_enqueue"]:
                                                 _lat_flags["tts_enqueue"] = True
-                                                cq = chunk_text[:72] + ("…" if len(chunk_text) > 72 else "")
-                                                _latency_log(lat, "06_tts_first_text_enqueued", preview=cq)
-                                            await tts_queue.put(chunk_text)
+                                            await tts_queue.put(clean_text)
+
                                         sentence_buffer = ""
+                                        json_buffer += json_part
+                                    else:
+                                        # 🛡️ 坑1防护：计算未闭合的左括号数量，如果在 `[...` 状态中，绝对禁止因为 \n 等标点断句！
+                                        is_tag_open = sentence_buffer.rfind('[') > sentence_buffer.rfind(']')
+                                        
+                                        has_punct = any(p in delta for p in punctuation_marks)
+                                        safety_cutoff = len(sentence_buffer) > 120 and (' ' in delta or '\n' in delta)
+                                        
+                                        want_flush = (has_punct or safety_cutoff) and not is_tag_open
+
+                                        if want_flush:
+                                            chunk_text = sentence_buffer.replace("[ADVANCE]", "").strip()
+                                            if chunk_text:
+                                                if not _lat_flags["tts_enqueue"]:
+                                                    _lat_flags["tts_enqueue"] = True
+                                                    cq = chunk_text[:72] + ("…" if len(chunk_text) > 72 else "")
+                                                    _latency_log(lat, "06_tts_first_text_enqueued", preview=cq)
+                                                if not is_test_mode and tts_queue:
+                                                    await tts_queue.put(chunk_text)
+                                            sentence_buffer = ""
+                                            
+                                # 【阶段 B】：正在接收教辅 JSON
+                                else:
+                                    json_buffer += delta
 
                     async def _abort_tts():
                         """超时 / 报错时统一清理 TTS 资源，防止消费任务永久挂起"""
@@ -1025,28 +1056,27 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         })
                         continue
 
-                    # 尾盘入列（仅在正常完成时执行）
+                    # 🛡️ 坑3防护：尾盘清理。无论有没有遇到 JSON，必须给 TTS 注入 None，防止死锁
                     if not is_test_mode and tts_queue:
-                        final_chunk = sentence_buffer.replace("[ADVANCE]", "").strip()
-                        if final_chunk:
-                            if not _lat_flags["tts_enqueue"]:
-                                _lat_flags["tts_enqueue"] = True
-                                fq = final_chunk[:72] + ("…" if len(final_chunk) > 72 else "")
-                                _latency_log(
-                                    lat,
-                                    "06_tts_first_text_enqueued",
-                                    preview=fq,
-                                    tail_flush=True,
-                                )
-                            await tts_queue.put(final_chunk)
+                        if not in_json_mode:
+                            final_chunk = sentence_buffer.replace("[ADVANCE]", "").strip()
+                            if final_chunk:
+                                if not _lat_flags["tts_enqueue"]:
+                                    _lat_flags["tts_enqueue"] = True
+                                await tts_queue.put(final_chunk)
                         await tts_queue.put(None)
 
-                    # 5. 指令清洗与记录
+                    # 5. 指令清洗与记录 (核心逻辑剥离)
                     session_ctx["llm_wants_to_advance"] = "[ADVANCE]" in raw_full_reply
                     if session_ctx["llm_wants_to_advance"]:
                         logger.info("[StateMachine] AI signaled ADVANCE, will transition next turn.")
 
-                    clean_full_reply = raw_full_reply.replace("[ADVANCE]", "").strip()
+                    # 剥离 JSON 获得纯净回复以供上下文明确保留
+                    if "[COACH_JSON]" in raw_full_reply:
+                        clean_full_reply = raw_full_reply.split("[COACH_JSON]")[0].replace("[ADVANCE]", "").strip()
+                    else:
+                        clean_full_reply = raw_full_reply.replace("[ADVANCE]", "").strip()
+
                     chat_history.append({"role": "assistant", "content": clean_full_reply})
                     chat_history = trim_chat_history(chat_history)
 
@@ -1060,11 +1090,30 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         ai_chars=len(clean_full_reply),
                     )
 
-                    # 6. 后置辅导服务
+                    # 6. 后置辅导服务（解析收集到的 JSON 并在同一并发层下发，删除之前的独立网络请求）
                     if is_test_mode:
                         await safe_send_ws(websocket, ws_lock, {"event": "test_ai_reply", "text": clean_full_reply, "phase": session_ctx["phase"]})
+
+                    if in_json_mode:
+                        # 🛡️ 坑2与坑3联合防护：有闭合符截闭合符，无闭合符说明被 max_tokens 截断，进行兜底强行截取
+                        if "[/COACH_JSON]" in json_buffer:
+                            json_str = json_buffer.split("[/COACH_JSON]")[0].strip()
+                        else:
+                            json_str = json_buffer.strip()
+                            logger.warning("⚠️ JSON 闭合标签缺失，可能遭遇 max_tokens 截断，启用容错解析机制...")
+
+                        if json_str:
+                            try:
+                                # clean_llm_json 能稳健处理 Markdown 代码块和不完美的 JSON
+                                teaching_data = clean_llm_json(json_str)
+                                teaching_data["user_text"] = user_text
+                                teaching_data["ai_text"] = clean_full_reply
+                                await safe_send_ws(websocket, ws_lock, {"event": "teaching_data", "data": teaching_data})
+                            except Exception as e:
+                                logger.error(f"⚠️ 合并生成的教学数据解析失败: {e}\nRaw JSON String: {json_str}")
                     else:
-                        asyncio.create_task(async_fetch_and_send_teaching(user_text, clean_full_reply, TEACHING_CONFIG, client, websocket, ws_lock))
+                        if TEACHING_CONFIG.get("enable_translation", True):
+                            logger.warning("⚠️ LLM 未输出 [COACH_JSON] 标记，本次交互无翻译和提示下发。")
 
     except WebSocketDisconnect:
         logger.info("👋 连接已断开 (WebSocketDisconnect)。")

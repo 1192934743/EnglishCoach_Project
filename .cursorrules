@@ -1,59 +1,31 @@
-# 🚀 英语 AI 私教 App (MVP 2.0) - 全局架构与上下文交接文档
+# 🚀 EnglishCoach - 商业版全局开发准则 (Production Guidelines)
 
+## 1. 项目定位与协作模式 (Project Positioning & Collaboration)
+- **商业定位**：这是一款直接面向市场的生产级应用，并非 MVP 或测试原型。所有代码必须具备高可用性、健壮性及出色的用户体验。
+- **协作纪律**：本项目的架构设计、业务逻辑流转与技术选型由主架构师（Gemini）负责敲定。Cursor 的职责是严格按照架构师交付的设计文档和指令进行**高质量的代码实现**，禁止在未沟通的情况下擅自更改全局架构或引入重型第三方依赖。
 
+## 2. 核心产品理念 (Core Product Philosophy)
+- **终极目标**：让用户**“轻松地、无压力地反复持续对话”**，以此来提升英语口语。
+- **开发约束**：
+  - **前端 (Flutter)**：所有 UI 交互、动画过渡、错误提示（如网络不佳、麦克风权限）必须极其平滑、温和。教学辅助面板不可造成视觉压迫，音频流的收发必须做到极低延迟。
+  - **后端 (FastAPI)**：保证高并发场景下的 WebSocket 连接稳定性。响应速度是第一要务，流式处理必须高效，坚决避免让用户在对话中产生“等待感”。
 
-## 1. 项目概览与技术栈
+## 3. 生产级编码规范 (Production-Level Coding Standards)
 
-- **定位**：自适应英语 AI 教练 App（MVP 2.0）。
+### 3.1 全局纪律
+- **零硬编码**：绝对禁止在代码中硬编码任何敏感信息（API Keys、数据库密码、内网 IP 等），必须统一通过环境变量配置。
+- **防崩溃与容错**：无论发生何种网络异常、第三方 API 宕机或解析错误，程序绝不能闪退。必须实现优雅降级（Graceful Degradation）和完善的重试机制。
+- **全面日志 (Logging)**：异常捕获处必须有规范的日志记录，前后端均需建立可追溯的错误追踪流。
 
-- **前端**：Flutter（跨平台移动端）。
+### 3.2 前端规范 (Flutter)
+- 强制使用强类型和空安全（Null Safety）。
+- 严格遵循职责分离原则：UI 视图层、状态管理层、网络通信层必须解耦。
+- WebSocket 管理必须包含心跳保活（Ping/Pong）、断线自动静默重连机制。
 
-- **后端**：Python + FastAPI（WebSocket 驱动）。
+### 3.3 后端规范 (Python/FastAPI)
+- 强制使用 Type Hints，并利用 Pydantic 进行严格的输入输出数据验证。
+- 业务逻辑与底层基础设施（如数据库调用、LLM 调用、语音引擎服务）必须解耦，采用依赖注入或接口隔离。
+- WebSocket 端点必须具备并发处理能力、资源防泄漏（连接断开时的资源自动回收）机制。
 
-- **核心 AI 服务**：DeepSeek（对话、逻辑、教学辅助），火山引擎 Volcengine（低延迟流式 ASR/TTS）。
-
-
-
-## 2. 后端核心代码架构 (已完成模块化解耦)
-
-- **`server.py` (主调度入口)**：FastAPI 架构，维护 `/ws/coach` 路由，处理音频流收发与引擎调度。
-
-- **`core/audio_service.py` (音频引擎)**：独立封装 ASR 和 TTS WebSocket 调用，含二进制封包与 3 次网络重试防抖。
-
-- **`core/dialogue_engine.py` (大脑与状态机)**：动态组装 Prompt，管理三大状态（破冰 `ICE_BREAKING` -> 考核 `CORE_TASK` -> 桥梁 `EVENT_EXTENSION`），处理 `[ADVANCE]` 信号流转及教学辅助（翻译+提示）生成。
-
-- **`database.py` (数据持久层)**：基于 SQLAlchemy。定义并管理用户 (`User`)、话题 (`Topic`)、考核节点 (`TargetNode`) 及学习进度 (`UserProgress`) 表，自动生成本地 SQLite 数据库文件 **`english_coach.db`**。
-
-- **`auto_test_suite.py` (测试神器)**：注入混沌人格的纯文本自动对抗脚本，结合 LLM 裁判生成中文打分报告。
-
-
-
-## 3. 配置文件要求
-
-- **`config.env` (环境变量)**：必须包含 `DEEPSEEK_KEY`、`DEEPSEEK_BASE`、`VOLC_API_KEY`、`VOLC_RESOURCE_ID` (ASR)、`VOLC_RESOURCE_ID_TTS` (TTS) 及 `VOICE`。
-
-- **`scenes.json` (场景大纲)**：场景模板配置文件。定义当前激活的场景ID (`current_active_id`) 及场景详情（如 `McDonald's Ordering`、难度 `Intermediate`、角色 `Cashier` 等），供引擎动态读取。
-
-
-
-## 4. 前后端 WebSocket 通信协议契约 (API Contract)
-
-前端 (Flutter) 接下来需要解析并处理以下核心数据包：
-
-1. **教学面板数据**：`{"event": "teaching_data", "data": {"ai_translation_cn": "...", "suggested_hints_en": ["...", "..."], "user_text": "...", "ai_text": "..."}}`
-
-2. **进度条数据**：`{"event": "topic_mastery_reached", "progress": 85.0, "next_topic_suggestion": "..."}`
-
-3. **音频流**：纯二进制 PCM 数据流（用于 TTS 播放）。
-
-4. **状态信号**：`{"event": "tts_finished"}` 或 `{"event": "role_swapped"}`。
-
-
-
-## 5. 当前开发进度与下一步任务
-
-- **已完成**：后端的逻辑闭环、防抖处理、全自动测试验证。
-
-- **正在进行（第一战役）**：开始在 **Flutter 端** 编写 WebSocket 数据接收中枢。
-
-- **我的需求**：请 AI 准备好指导我在 Flutter 中解析上述通信协议，并设计“私教教学面板 (Teaching Overlay)”和“打分进度条”的 UI 交互逻辑。
+## 4. 行动触发口令
+当架构师（Gemini）在上下文中发出**“开始编码”**的信号时，Cursor 需自动读取紧跟其后的设计总结与代码实现交代，并以此为唯一依据生成代码。

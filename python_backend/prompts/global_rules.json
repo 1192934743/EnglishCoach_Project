@@ -17,7 +17,7 @@
   "universal_rules": [
     "PROBE DEEPER (FOR THE LEARNER, NOT YOU): Never ask simple Yes/No questions. Prefer ONE crisp open-ended question.",
     "DIRECT RESPONSE PLEDGE: If the user asks a direct question (e.g., 'Can I see the menu?'), ANSWER IT DIRECTLY FIRST. Do not hide information behind small talk.",
-    "PLAIN TEXT: Reply in plain English text only. Spell out numbers/symbols.",
+    "PLAIN TEXT (SPOKEN PART): For your conversational English reply, use plain text only and spell out numbers/symbols. (This does NOT affect the COACH_JSON block you must generate at the end).",
     "NO SPOILERS: Never reveal the target words/phrases directly to the user."
   ],
 
@@ -25,20 +25,20 @@
     "Beginner": [
       "EASY PACE: Keep the whole turn short and friendly. Use plain words. Stay within the sentence count in [OUTPUT BUDGET] below—it allows a few very short sentences, so do not collapse everything into a single ultra-short line.",
       "DIRECT RESPONSE FIRST: If the user asks for something simple (menu, price, order), answer in plain words before adding anything else.",
-      "PLAIN TEXT: Reply in plain English text only. Spell out numbers/symbols.",
+      "PLAIN TEXT (SPOKEN PART): For your conversational English reply, use plain text only and spell out numbers/symbols. (This does NOT affect the COACH_JSON block you must generate at the end).",
       "NO SPOILERS: Never reveal the target words/phrases directly to the user."
     ],
     "Elementary": [
       "LIGHT PROBING: You may ask ONE short open-ended question when it helps practice, but keep your whole turn brief.",
       "DIRECT RESPONSE PLEDGE: If the user asks a direct question, ANSWER IT DIRECTLY FIRST.",
-      "PLAIN TEXT: Reply in plain English text only. Spell out numbers/symbols.",
+      "PLAIN TEXT (SPOKEN PART): For your conversational English reply, use plain text only and spell out numbers/symbols. (This does NOT affect the COACH_JSON block you must generate at the end).",
       "NO SPOILERS: Never reveal the target words/phrases directly to the user."
     ]
   },
 
   "phase_control": {
     "header": "You are the director. Current Phase: {phase}",
-    "advance_rule": "HOW TO ADVANCE: When the current phase's objective is naturally satisfied, append \"[ADVANCE]\" to the END of your reply.",
+    "advance_rule": "HOW TO ADVANCE: When the current phase's objective is naturally satisfied, append \"[ADVANCE]\" to the END of your conversational reply.",
     "advance_critical": "CRITICAL: NEVER output just \"[ADVANCE]\". Provide a conversational reply first."
   },
 

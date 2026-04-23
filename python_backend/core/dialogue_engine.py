@@ -368,6 +368,23 @@ def build_dynamic_prompt(
         f"before any trailing [ADVANCE] token. No bullet lists, no lecture-style multi-paragraph answers."
     )
 
+    # 【新增】强制 LLM 在同一次请求中输出 JSON 教辅数据
+    prompt_blocks.append("")
+    prompt_blocks.append(
+        "[OUTPUT FORMAT]\n"
+        "You MUST strictly follow this response structure:\n"
+        "1. Your in-character English reply to the learner.\n"
+        "2. [ADVANCE] (Optional, ONLY if the phase directive requires a transition).\n"
+        "3. [COACH_JSON]\n"
+        "{\n"
+        '  "ai_translation_cn": "<A natural Chinese translation of your English reply>",\n'
+        '  "suggested_hints_en": ["<Hint 1 for user to reply>", "<Hint 2>"],\n'
+        '  "coach_correction_cn": "<If the user made a grammar/vocabulary mistake, briefly correct it in Chinese. Otherwise empty.>"\n'
+        "}\n"
+        "[/COACH_JSON]\n"
+        "Do NOT output any other text after [/COACH_JSON]."
+    )
+
     return "\n".join(prompt_blocks)
 
 # ================= 核心计分与状态机 =================
@@ -601,50 +618,3 @@ def advance_state_machine(
         transitioned = True
 
     return transitioned
-
-
-# ================= 异步后置任务 =================
-
-async def async_fetch_and_send_teaching(user_msg, ai_msg, teaching_config, client, client_ws: WebSocket, ws_lock: asyncio.Lock):
-    """后台调用 LLM 获取翻译和回复建议，具备超时防阻塞和 JSON 清洗"""
-    if not any(teaching_config.values()): return
-
-    # 防御：对话超长时截断防爆 (限制最后 1000 字符)
-    safe_user_msg = user_msg[-1000:] if len(user_msg) > 1000 else user_msg
-    safe_ai_msg = ai_msg[-1000:] if len(ai_msg) > 1000 else ai_msg
-
-    tasks_str = "1. A natural Chinese translation of the AI's reply.\n2. 1-2 suggested ways for the user to respond next (PLAIN ENGLISH ONLY).\n"
-    json_format_str = '{\n  "ai_translation_cn": "...",\n  "suggested_hints_en": ["Hint 1", "Hint 2"]\n}'
-
-    try:
-        resp = await asyncio.wait_for(
-            client.chat.completions.create(
-                model="deepseek-chat",
-                messages=[
-                    {"role": "system", "content": "You are a professional English coach."},
-                    {"role": "user",
-                     "content": f"User: {safe_user_msg}\nAI: {safe_ai_msg}\n\nTasks:\n{tasks_str}\nOutput JSON:\n{json_format_str}"}
-                ],
-                response_format={"type": "json_object"}
-            ),
-            timeout=15.0
-        )
-
-        raw_content = resp.choices[0].message.content
-        data = clean_llm_json(raw_content)
-
-        data["user_text"] = user_msg
-        data["ai_text"] = ai_msg
-
-        try:
-            async with ws_lock:
-                await client_ws.send_text(json.dumps({"event": "teaching_data", "data": data}))
-        except Exception as ws_err:
-            logger.error(f"Ws 发送教学数据失败: {ws_err}")
-
-    except asyncio.TimeoutError:
-        logger.warning("⚠️ 教学面板获取超时，本次主动放弃。")
-    except ValueError as ve:
-        logger.warning(f"⚠️ 教学面板 JSON 格式解析失败: {ve}")
-    except Exception as e:
-        logger.error(f"⚠️ 教学面板生成发生系统异常: {e}")
