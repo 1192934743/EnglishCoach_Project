@@ -720,7 +720,7 @@ async def iter_tts_pcm_chunks(
 
     volc_api_key = config.get("VOLC_API_KEY")
     volc_resource_id = config.get("VOLC_RESOURCE_ID_TTS")
-    voice_type = config.get("VOICE", "BV001_streaming")
+    voice_type = config.get("VOLC_VOICE", "BV001_streaming")
 
     if not volc_api_key or not volc_resource_id:
         logger.error("TTS 启动失败: 缺失配置信息")
@@ -938,7 +938,7 @@ async def run_tts_turn_reused_from_queue(
     import copy as copy_module
     pool = get_tts_pool()
     use_pool = pool is not None
-    voice_type = config.get("VOICE", "BV001_streaming")
+    voice_type = config.get("VOLC_VOICE", "BV001_streaming")
     resource_id = config.get("VOLC_RESOURCE_ID_TTS", "")
 
     conn: Optional[_WarmTTSConnection] = None

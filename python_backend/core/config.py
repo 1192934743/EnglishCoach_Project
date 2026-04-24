@@ -34,7 +34,8 @@ CONFIG = {
     "ASR_LANGUAGE": os.getenv("ASR_LANGUAGE", "en-US"),
     # TTS Configuration
     "DEFAULT_TTS_ENGINE": os.getenv("DEFAULT_TTS_ENGINE", "azure"),
-    "VOICE": os.getenv("VOICE", "en-US-AriaNeural"),
+    "AZURE_VOICE": os.getenv("AZURE_VOICE", "en-GB-RyanNeural"),
+    "VOLC_VOICE": os.getenv("VOLC_VOICE", "en_male_tim_uranus_bigtts"),
 }
 
 if not CONFIG["DEEPSEEK_KEY"] or not CONFIG["VOLC_API_KEY"]:

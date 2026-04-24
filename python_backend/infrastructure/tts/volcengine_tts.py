@@ -70,7 +70,7 @@ class VolcengineTTSProvider(BaseTTSProvider):
         from core.audio_service import run_tts_to_ws
         effective_config = dict(config)
         if voice_id:
-            effective_config["VOICE"] = voice_id
+            effective_config["VOLC_VOICE"] = voice_id
         try:
             await run_tts_to_ws(text, websocket, ws_lock, effective_config, latency_hooks)
         except Exception as e:
@@ -101,8 +101,8 @@ class VolcengineTTSProvider(BaseTTSProvider):
         from core.audio_service import run_tts_turn_reused_from_queue
         effective_config = dict(config)
         if voice_id:
-            effective_config["VOICE"] = voice_id
-        logger.info(f"[VolcengineTTS] Using VOICE={effective_config.get('VOICE')}, resource_id={effective_config.get('VOLC_RESOURCE_ID_TTS')}")
+            effective_config["VOLC_VOICE"] = voice_id
+        logger.info(f"[VolcengineTTS] Using VOLC_VOICE={effective_config.get('VOLC_VOICE')}, resource_id={effective_config.get('VOLC_RESOURCE_ID_TTS')}")
         try:
             await run_tts_turn_reused_from_queue(
                 websocket, ws_lock, effective_config, segment_queue, latency_hooks
