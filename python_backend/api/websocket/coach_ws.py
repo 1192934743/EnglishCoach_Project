@@ -505,6 +505,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                             _lat_flags["tts_enqueue"] = True
                                             _latency_log(lat, "06_tts_first_text_enqueued", preview=chunk_text[:72])
                                         if not is_test_mode and tts_queue:
+                                            logger.info(f"[TRACK_LLM] 截断送入TTS队列 len={len(chunk_text)} text={chunk_text[:40]}")
                                             await tts_queue.put(chunk_text)
                                     sentence_buffer = ""
 

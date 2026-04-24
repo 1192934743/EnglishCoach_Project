@@ -139,6 +139,10 @@ class ChatNotifier extends Notifier<ChatState> {
   String? _latencyTurnId;
   int? _latencyFirstPcmMs;
 
+  /// [TRACK_AUDIO] PCM 收包间隔追踪
+  DateTime? _lastPcmReceiveTime;
+  int _pcmChunkCount = 0;
+
   // ── 高频文本流局部刷新：避免 ListView 全局重绘 ─────────────
   final ValueNotifier<String> activeUserTextNotifier = ValueNotifier<String>(
     '',
@@ -297,7 +301,7 @@ class ChatNotifier extends Notifier<ChatState> {
         numChannels: 1,
         sampleRate: 24000,
         interleaved: true,
-        bufferSize: 8192,
+        bufferSize: 96000,
       );
       final userId = await UserManager.getOrCreateUuid();
       ref.read(websocketProvider).sendCommand("request_tts", {
@@ -388,6 +392,21 @@ class ChatNotifier extends Notifier<ChatState> {
       // 打断期间或非播放状态时，丢弃网络中残留的 PCM 包
       if (_isInterrupting) return;
       if (state.status == ChatStatus.speaking && _player.isPlaying) {
+        // [TRACK_AUDIO] 收包间隔检测
+        final now = DateTime.now();
+        if (_lastPcmReceiveTime != null) {
+          final intervalMs = now
+              .difference(_lastPcmReceiveTime!)
+              .inMilliseconds;
+          if (intervalMs > 100) {
+            debugPrint(
+              '[TRACK_AUDIO] APP 收包间隔过大 interval=${intervalMs}ms _pcmChunkCount=$_pcmChunkCount len=${audioBytes.length}',
+            );
+          }
+        }
+        _lastPcmReceiveTime = now;
+        _pcmChunkCount += 1;
+
         if (!_latencyLoggedFirstPcm) {
           _latencyLoggedFirstPcm = true;
           _latencyFirstPcmMs = _latencySw?.elapsedMilliseconds;
@@ -539,6 +558,8 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencyLoggedFirstPcm = false;
     _latencySw = Stopwatch()..start();
     _latencyLogClient('01_stopListening_submit_start');
+    _lastPcmReceiveTime = null;
+    _pcmChunkCount = 0;
     try {
       await _recorder.stop();
       _latencyLogClient('02_recorder_stopped');
@@ -558,7 +579,7 @@ class ChatNotifier extends Notifier<ChatState> {
         numChannels: 1,
         sampleRate: 24000,
         interleaved: true,
-        bufferSize: 8192,
+        bufferSize: 96000,
       );
       _latencyLogClient('03_player_stream_ready');
       final userId = await UserManager.getOrCreateUuid();
@@ -627,6 +648,8 @@ class ChatNotifier extends Notifier<ChatState> {
     // ── 4. 清零前端 PCM 追踪状态 ──────────────────────────────────────────
     _totalBytesReceived = 0;
     _playbackStartTime = null;
+    _lastPcmReceiveTime = null;
+    _pcmChunkCount = 0;
 
     // ── 5. 通知后端取消 TTS，同时清空后端 audio_buffer ────────────────────
     ref.read(websocketProvider).sendCommand("cancel_tts", {});

@@ -647,15 +647,27 @@ async def run_tts_turn_reused_from_queue(
                 segment_queue.task_done()
                 continue
 
+            logger.info(f"[TRACK_TTS] 开始请求 Azure 合成单句 text={clean_text[:40]}")
             synthesis_done.clear()
             synthesizer.start_speaking_text_async(clean_text)
 
+            last_chunk_time = time.perf_counter()
+            chunk_seq = 0
             first_yielded = False
             while True:
                 try:
                     chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
                     if chunk is None:
+                        logger.info(f"[TRACK_TTS] 句合成结束，总包数 chunk_seq={chunk_seq}")
                         break
+
+                    # 句内卡顿检测
+                    now = time.perf_counter()
+                    interval_ms = (now - last_chunk_time) * 1000.0
+                    last_chunk_time = now
+                    chunk_seq += 1
+                    if interval_ms > 200:
+                        logger.warning(f"[TRACK_TTS] 句内音频流生成卡顿! interval={interval_ms:.1f}ms chunk_seq={chunk_seq} len={len(chunk)}")
 
                     if not first_yielded and latency_hooks is not None:
                         first_yielded = True
