@@ -73,10 +73,16 @@ class _WarmTTSConnection:
     Manages a single TTS connection with proper handshake and state management.
     """
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, voice_name: str = None):
         self._config = config
+        self._voice_name = voice_name
         self._ws = None
         self._session_id = None
+        self._ready = False
+
+    def set_voice(self, voice_name: str) -> None:
+        """Set the voice name for this connection. Marks as not-ready to force reconnect with new voice."""
+        self._voice_name = voice_name
         self._ready = False
 
     async def connect(self) -> bool:
@@ -108,6 +114,7 @@ class _WarmTTSConnection:
                         config_payload = {
                             "app": {"appid": volc_app_id, "token": volc_api_key, "cluster": volc_cluster},
                             "audio": {"codec": "pcm", "sample_rate": 24000, "rate": 24000},
+                            "voice": {"voice_id": self._voice_name} if self._voice_name else {},
                             "request": {"reqid": self._session_id, "operation": "submit", "text": ""},
                         }
                         await self._ws.send(pack_tts_request(100, self._session_id, config_payload))
@@ -231,23 +238,32 @@ class TTSPool:
             else:
                 logger.warning(f"[VolcengineTTS] Connection {i + 1} failed, will retry on demand")
 
-    async def get_connection(self) -> Optional[_WarmTTSConnection]:
-        """Get a connection from the pool."""
+    async def get_connection(self, voice_name: str = None) -> Optional[_WarmTTSConnection]:
+        """Get a connection from the pool. If voice_name differs, create new connection."""
+        # Create a temporary connection to check if we need to recreate
+        temp_conn = None
         if self._connections.empty():
-            conn = _WarmTTSConnection(self._config)
+            conn = _WarmTTSConnection(self._config, voice_name=voice_name)
             if await conn.connect():
                 return conn
             return None
 
         try:
             conn = self._connections.get_nowait()
+            # Check if we need a different voice
+            if voice_name and conn._voice_name != voice_name:
+                await conn.close()
+                conn = _WarmTTSConnection(self._config, voice_name=voice_name)
+                if await conn.connect():
+                    return conn
+                return None
             if not conn.ready:
                 if await conn.connect():
                     return conn
                 return None
             return conn
         except asyncio.QueueEmpty:
-            conn = _WarmTTSConnection(self._config)
+            conn = _WarmTTSConnection(self._config, voice_name=voice_name)
             if await conn.connect():
                 return conn
             return None
@@ -315,6 +331,7 @@ class VolcengineTTSProvider(BaseTTSProvider):
         ws_lock: asyncio.Lock,
         config: dict,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Synthesize a single text segment and stream audio to websocket.
@@ -329,17 +346,20 @@ class VolcengineTTSProvider(BaseTTSProvider):
             ws_lock: asyncio.Lock for thread-safe operations
             config: Configuration dictionary (uses global CONFIG)
             latency_hooks: Optional latency tracking dict (t0, turn_id, _tts_first_pcm_logged)
+            voice_id: Optional voice identifier to override the default voice in config
         """
         from core.config import CONFIG
         effective_config = config if config else CONFIG
 
+        voice_name = voice_id if voice_id else effective_config.get("VOLC_VOICE", "BV001_streaming")
+
         conn = None
         try:
             if self._pool:
-                conn = await self._pool.get_connection()
+                conn = await self._pool.get_connection(voice_name=voice_name)
 
             if not conn:
-                conn = _WarmTTSConnection(effective_config)
+                conn = _WarmTTSConnection(effective_config, voice_name=voice_name)
                 if not await conn.connect():
                     logger.error("[VolcengineTTS] Failed to establish connection for single synthesis")
                     return
@@ -363,6 +383,7 @@ class VolcengineTTSProvider(BaseTTSProvider):
         config: dict,
         segment_queue: asyncio.Queue,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Consume text segments from queue and synthesize sequentially.
@@ -377,17 +398,20 @@ class VolcengineTTSProvider(BaseTTSProvider):
             config: Configuration dictionary (uses global CONFIG)
             segment_queue: asyncio.Queue containing text segments (None = end signal)
             latency_hooks: Optional latency tracking dict
+            voice_id: Optional voice identifier to override the default voice in config
         """
         from core.config import CONFIG
         effective_config = config if config else CONFIG
 
+        voice_name = voice_id if voice_id else effective_config.get("VOLC_VOICE", "BV001_streaming")
+
         conn = None
         try:
             if self._pool:
-                conn = await self._pool.get_connection()
+                conn = await self._pool.get_connection(voice_name=voice_name)
 
             if not conn:
-                conn = _WarmTTSConnection(effective_config)
+                conn = _WarmTTSConnection(effective_config, voice_name=voice_name)
                 if not await conn.connect():
                     logger.error("[VolcengineTTS] Failed to establish connection for queue synthesis")
                     return

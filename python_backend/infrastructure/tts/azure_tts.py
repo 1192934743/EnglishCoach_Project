@@ -63,6 +63,7 @@ class AzureTTSProvider(BaseTTSProvider):
         ws_lock: asyncio.Lock,
         config: dict,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Synthesize a single text segment and stream audio to websocket.
@@ -77,13 +78,14 @@ class AzureTTSProvider(BaseTTSProvider):
             ws_lock: asyncio.Lock for thread-safe operations
             config: Configuration dictionary with AZURE_SPEECH_KEY, AZURE_SPEECH_REGION, VOICE
             latency_hooks: Optional latency tracking dict (t0, turn_id, _tts_first_pcm_logged)
+            voice_id: Optional voice identifier to override the default voice in config
         """
         import logging
         logger = logging.getLogger("EnglishCoach")
 
         azure_key = config.get("AZURE_SPEECH_KEY", "").strip()
         azure_region = config.get("AZURE_SPEECH_REGION", "").strip()
-        voice_name = config.get("VOICE", "en-US-AriaNeural").strip()
+        voice_name = voice_id if voice_id else config.get("VOICE", "en-US-AriaNeural").strip()
 
         if not azure_key:
             logger.error("[AzureTTS] Missing AZURE_SPEECH_KEY, please check config.env")
@@ -166,6 +168,7 @@ class AzureTTSProvider(BaseTTSProvider):
         config: dict,
         segment_queue: asyncio.Queue,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Consume text segments from queue and synthesize sequentially.
@@ -181,13 +184,14 @@ class AzureTTSProvider(BaseTTSProvider):
             config: Configuration dictionary with AZURE_SPEECH_KEY, AZURE_SPEECH_REGION, VOICE
             segment_queue: asyncio.Queue containing text segments (None = end signal)
             latency_hooks: Optional latency tracking dict
+            voice_id: Optional voice identifier to override the default voice in config
         """
         import logging
         logger = logging.getLogger("EnglishCoach")
 
         azure_key = config.get("AZURE_SPEECH_KEY", "").strip()
         azure_region = config.get("AZURE_SPEECH_REGION", "").strip()
-        voice_name = config.get("VOICE", "en-US-AriaNeural").strip()
+        voice_name = voice_id if voice_id else config.get("VOICE", "en-US-AriaNeural").strip()
 
         if not azure_key:
             logger.error("[AzureTTS] Missing AZURE_SPEECH_KEY, please check config.env")

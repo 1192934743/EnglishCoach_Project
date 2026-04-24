@@ -2,6 +2,38 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+/// TTS 音色选项配置：{引擎名: {音色ID: 显示名称}}
+class VoiceOptions {
+  static const Map<String, Map<String, String>> byEngine = {
+    'azure': {
+      'en-US-AriaNeural': 'Aria (女声, 美音)',
+      'en-US-GuyNeural': 'Guy (男声, 美音)',
+      'en-US-JennyNeural': 'Jenny (女声, 美音)',
+      'en-GB-SoniaNeural': 'Sonia (女声, 英音)',
+      'en-GB-RyanNeural': 'Ryan (男声, 英音)',
+      'en-AU-NatashaNeural': 'Natasha (女声, 澳音)',
+    },
+    'volcengine': {
+      'BV001_streaming': 'BV001 (女声, 通用)',
+      'BV002_streaming': 'BV002 (男声, 通用)',
+      'BV003_streaming': 'BV003 (女声, 活泼)',
+    },
+  };
+
+  /// 获取指定引擎的默认音色 ID
+  static String defaultVoice(String engine) {
+    final voices = byEngine[engine];
+    if (voices == null || voices.isEmpty) return 'en-US-AriaNeural';
+    return voices.keys.first;
+  }
+
+  /// 检查音色 ID 是否属于指定引擎
+  static bool isVoiceValid(String engine, String voiceId) {
+    final voices = byEngine[engine];
+    return voices != null && voices.containsKey(voiceId);
+  }
+}
+
 class SettingsState {
   final bool isChinese;
   final bool autoMode;
@@ -15,10 +47,12 @@ class SettingsState {
   final double newTopicAppetite;
   // TTS 预热开关：启用后服务启动时预热 TTS 连接池，首句延迟降低 200-500ms
   final bool ttsPreWarming;
-  // 新增：用户英语熟练度等级
+  // 用户英语熟练度等级
   final String learnerLevel;
   // TTS 引擎选择：azure 或 volcengine
   final String ttsEngine;
+  // TTS 音色选择：对应的 voice_id
+  final String ttsVoice;
 
   SettingsState({
     required this.isChinese,
@@ -32,8 +66,9 @@ class SettingsState {
     this.depthPreference = 1.0,
     this.newTopicAppetite = 0.2,
     this.ttsPreWarming = true,
-    this.learnerLevel = "Intermediate", // 默认中级
-    this.ttsEngine = "azure", // 默认 Azure TTS
+    this.learnerLevel = "Intermediate",
+    this.ttsEngine = "azure",
+    this.ttsVoice = "en-US-AriaNeural",
   });
 
   SettingsState copyWith({
@@ -50,6 +85,7 @@ class SettingsState {
     bool? ttsPreWarming,
     String? learnerLevel,
     String? ttsEngine,
+    String? ttsVoice,
   }) {
     return SettingsState(
       isChinese: isChinese ?? this.isChinese,
@@ -65,6 +101,7 @@ class SettingsState {
       ttsPreWarming: ttsPreWarming ?? this.ttsPreWarming,
       learnerLevel: learnerLevel ?? this.learnerLevel,
       ttsEngine: ttsEngine ?? this.ttsEngine,
+      ttsVoice: ttsVoice ?? this.ttsVoice,
     );
   }
 }
@@ -101,10 +138,22 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(newTopicAppetite: val);
   void setTtsPreWarming(bool val) =>
       state = state.copyWith(ttsPreWarming: val);
-  // 新增：更新等级的方法
+  // 更新等级的方法
   void setLearnerLevel(String val) => state = state.copyWith(learnerLevel: val);
-  // TTS 引擎选择
-  void setTtsEngine(String val) => state = state.copyWith(ttsEngine: val);
+  // TTS 引擎选择 - 切换引擎时自动重置音色
+  void setTtsEngine(String val) {
+    final currentVoice = state.ttsVoice;
+    // 检查当前音色是否在新引擎的选项中
+    if (!VoiceOptions.isVoiceValid(val, currentVoice)) {
+      // 不在则重置为新引擎的默认音色
+      final newDefaultVoice = VoiceOptions.defaultVoice(val);
+      state = state.copyWith(ttsEngine: val, ttsVoice: newDefaultVoice);
+    } else {
+      state = state.copyWith(ttsEngine: val);
+    }
+  }
+  // TTS 音色选择
+  void setTtsVoice(String val) => state = state.copyWith(ttsVoice: val);
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(

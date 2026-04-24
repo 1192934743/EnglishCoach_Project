@@ -260,7 +260,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         appetite = data.get("new_topic_appetite")
                         learner_level = data.get("learner_level")
                         tts_engine = data.get("tts_engine")
-                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine)
+                        tts_voice = data.get("tts_voice")
+                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine, tts_voice)
                         current_user = await run_in_threadpool(init_or_get_user, current_user.id)
                         static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
                         chat_history[0]["content"] = static_sys
@@ -326,10 +327,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 if current_user and current_user.settings
                                 else None
                             )
+                            tts_voice = (
+                                current_user.settings.get("tts_voice")
+                                if current_user and current_user.settings
+                                else None
+                            )
                             provider = get_tts_factory().get_provider(tts_engine_name)
                             if provider:
                                 await provider.synthesize_single(
-                                    text_to_speak, websocket, ws_lock, CONFIG
+                                    text_to_speak, websocket, ws_lock, CONFIG, voice_id=tts_voice
                                 )
                             else:
                                 logger.error(f"[TTS] Provider not found for engine: {tts_engine_name}")
@@ -460,10 +466,15 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     if current_user and current_user.settings
                                     else None
                                 )
+                                tts_voice = (
+                                    current_user.settings.get("tts_voice")
+                                    if current_user and current_user.settings
+                                    else None
+                                )
                                 provider = get_tts_factory().get_provider(tts_engine_name)
                                 if provider:
                                     await provider.synthesize_queue(
-                                        websocket, ws_lock, CONFIG, queue, latency_hooks=lat
+                                        websocket, ws_lock, CONFIG, queue, latency_hooks=lat, voice_id=tts_voice
                                     )
                                 else:
                                     logger.error(f"[TTS] Provider not found for engine: {tts_engine_name}")

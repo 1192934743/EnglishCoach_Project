@@ -124,12 +124,86 @@ class SettingsScreen extends ConsumerWidget {
                   ],
                   onChanged: (v) async {
                     if (v == null) return;
+                    // setTtsEngine 会自动重置音色到新引擎的默认值
                     notifier.setTtsEngine(v);
+                    final newVoice = ref.read(settingsProvider).ttsVoice;
                     await chatNotifier.updateLmsSettings(
                       depthPreference: settings.depthPreference,
                       newTopicAppetite: settings.newTopicAppetite,
                       learnerLevel: settings.learnerLevel,
                       ttsEngine: v,
+                      ttsVoice: newVoice,
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
+          // TTS 音色选择器
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.person_outline_rounded, color: Colors.purple, size: 24),
+                    const SizedBox(width: 12),
+                    Text(
+                      tr(ref, "Coach Voice", "教练音色"),
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: baseSize),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  tr(
+                    ref,
+                    "Choose the voice for your AI conversation coach.",
+                    "选择 AI 教练的声音",
+                  ),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                ),
+                const SizedBox(height: 12),
+                Builder(
+                  builder: (context) {
+                    final voices = VoiceOptions.byEngine[settings.ttsEngine] ?? {};
+                    return DropdownButton<String>(
+                      value: voices.containsKey(settings.ttsVoice) ? settings.ttsVoice : VoiceOptions.defaultVoice(settings.ttsEngine),
+                      isExpanded: true,
+                      items: voices.entries.map((e) {
+                        final isMale = e.key.contains('Guy') || e.key.contains('Ryan') || e.key.contains('BV002');
+                        return DropdownMenuItem<String>(
+                          value: e.key,
+                          child: Row(
+                            children: [
+                              Icon(
+                                isMale ? Icons.face_rounded : Icons.face_2_rounded,
+                                size: 18,
+                                color: isMale ? Colors.blue : Colors.pink,
+                              ),
+                              const SizedBox(width: 8),
+                              Expanded(child: Text(e.value)),
+                            ],
+                          ),
+                        );
+                      }).toList(),
+                      onChanged: (v) async {
+                        if (v == null) return;
+                        notifier.setTtsVoice(v);
+                        await chatNotifier.updateLmsSettings(
+                          depthPreference: settings.depthPreference,
+                          newTopicAppetite: settings.newTopicAppetite,
+                          learnerLevel: settings.learnerLevel,
+                          ttsEngine: settings.ttsEngine,
+                          ttsVoice: v,
+                        );
+                      },
                     );
                   },
                 ),
@@ -351,6 +425,7 @@ class SettingsScreen extends ConsumerWidget {
                       newTopicAppetite: settings.newTopicAppetite,
                       learnerLevel: v,
                       ttsEngine: settings.ttsEngine,
+                      ttsVoice: settings.ttsVoice,
                     );
                   },
                 ),
@@ -372,6 +447,7 @@ class SettingsScreen extends ConsumerWidget {
                 newTopicAppetite: settings.newTopicAppetite,
                 learnerLevel: settings.learnerLevel,
                 ttsEngine: settings.ttsEngine,
+                ttsVoice: settings.ttsVoice,
               );
             },
           ),
@@ -391,6 +467,7 @@ class SettingsScreen extends ConsumerWidget {
                 newTopicAppetite: val,
                 learnerLevel: settings.learnerLevel,
                 ttsEngine: settings.ttsEngine,
+                ttsVoice: settings.ttsVoice,
               );
             },
           ),

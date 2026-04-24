@@ -41,6 +41,7 @@ class BaseTTSProvider(ABC):
         ws_lock: Any,
         config: dict,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Synthesize a single text segment and stream audio to websocket.
@@ -51,6 +52,7 @@ class BaseTTSProvider(ABC):
             ws_lock: asyncio.Lock for thread-safe websocket operations
             config: Configuration dictionary containing API keys and settings
             latency_hooks: Optional dict for latency tracking (e.g., t0, turn_id)
+            voice_id: Optional voice identifier to override the default voice in config
         """
         pass
 
@@ -62,6 +64,7 @@ class BaseTTSProvider(ABC):
         config: dict,
         segment_queue: Any,
         latency_hooks: Optional[dict] = None,
+        voice_id: Optional[str] = None,
     ) -> None:
         """
         Consume text segments from a queue and synthesize them sequentially.
@@ -76,5 +79,6 @@ class BaseTTSProvider(ABC):
             config: Configuration dictionary containing API keys and settings
             segment_queue: asyncio.Queue containing text segments (None = end signal)
             latency_hooks: Optional dict for latency tracking
+            voice_id: Optional voice identifier to override the default voice in config
         """
         pass
