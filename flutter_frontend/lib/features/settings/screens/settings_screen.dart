@@ -66,6 +66,76 @@ class SettingsScreen extends ConsumerWidget {
             Icons.bolt_rounded,
             baseSize,
           ),
+          // TTS 引擎选择器
+          Container(
+            margin: const EdgeInsets.only(bottom: 10),
+            padding: const EdgeInsets.all(16),
+            decoration: BoxDecoration(
+              color: Colors.white,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  children: [
+                    const Icon(Icons.record_voice_over_rounded, color: Colors.blueAccent, size: 24),
+                    const SizedBox(width: 12),
+                    Text(
+                      tr(ref, "TTS Voice Engine", "TTS 语音引擎"),
+                      style: TextStyle(fontWeight: FontWeight.bold, fontSize: baseSize),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  tr(
+                    ref,
+                    "Choose the voice synthesis engine for AI replies.",
+                    "选择 AI 语音合成的引擎",
+                  ),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                ),
+                const SizedBox(height: 12),
+                DropdownButton<String>(
+                  value: settings.ttsEngine,
+                  isExpanded: true,
+                  items: [
+                    DropdownMenuItem<String>(
+                      value: 'azure',
+                      child: Row(
+                        children: [
+                          const Icon(Icons.cloud_rounded, size: 18, color: Colors.blue),
+                          const SizedBox(width: 8),
+                          Text(tr(ref, 'Azure Voice (Default)', 'Azure 语音 (默认)')),
+                        ],
+                      ),
+                    ),
+                    DropdownMenuItem<String>(
+                      value: 'volcengine',
+                      child: Row(
+                        children: [
+                          const Icon(Icons.local_fire_department_rounded, size: 18, color: Colors.orange),
+                          const SizedBox(width: 8),
+                          Text(tr(ref, 'Volcengine Voice', '火山引擎语音')),
+                        ],
+                      ),
+                    ),
+                  ],
+                  onChanged: (v) async {
+                    if (v == null) return;
+                    notifier.setTtsEngine(v);
+                    await chatNotifier.updateLmsSettings(
+                      depthPreference: settings.depthPreference,
+                      newTopicAppetite: settings.newTopicAppetite,
+                      learnerLevel: settings.learnerLevel,
+                      ttsEngine: v,
+                    );
+                  },
+                ),
+              ],
+            ),
+          ),
 
           Container(
             padding: const EdgeInsets.all(16),
@@ -280,6 +350,7 @@ class SettingsScreen extends ConsumerWidget {
                       depthPreference: settings.depthPreference,
                       newTopicAppetite: settings.newTopicAppetite,
                       learnerLevel: v,
+                      ttsEngine: settings.ttsEngine,
                     );
                   },
                 ),
@@ -300,6 +371,7 @@ class SettingsScreen extends ConsumerWidget {
                 depthPreference: val,
                 newTopicAppetite: settings.newTopicAppetite,
                 learnerLevel: settings.learnerLevel,
+                ttsEngine: settings.ttsEngine,
               );
             },
           ),
@@ -318,6 +390,7 @@ class SettingsScreen extends ConsumerWidget {
                 depthPreference: settings.depthPreference,
                 newTopicAppetite: val,
                 learnerLevel: settings.learnerLevel,
+                ttsEngine: settings.ttsEngine,
               );
             },
           ),

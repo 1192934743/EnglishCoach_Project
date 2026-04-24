@@ -259,7 +259,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         depth = data.get("depth_preference")
                         appetite = data.get("new_topic_appetite")
                         learner_level = data.get("learner_level")
-                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level)
+                        tts_engine = data.get("tts_engine")
+                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine)
                         current_user = await run_in_threadpool(init_or_get_user, current_user.id)
                         static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
                         chat_history[0]["content"] = static_sys

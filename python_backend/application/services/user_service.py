@@ -21,7 +21,7 @@ def _fetch_user_settings_dict(user_id: str) -> dict:
         u = db.query(User).filter(User.id == user_id).first()
         return dict(u.settings or {}) if u else {}
 
-def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite=None, learner_level=None):
+def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite=None, learner_level=None, tts_engine=None):
     if not user_id:
         return
     with get_db() as db:
@@ -34,6 +34,8 @@ def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite
                 settings["new_topic_appetite"] = float(new_topic_appetite)
             if learner_level is not None:
                 settings["learner_level"] = str(learner_level).strip()
+            if tts_engine is not None:
+                settings["tts_engine"] = str(tts_engine).strip()
             user.settings = settings
             db.commit()
 

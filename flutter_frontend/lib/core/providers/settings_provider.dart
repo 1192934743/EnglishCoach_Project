@@ -13,10 +13,12 @@ class SettingsState {
   final bool showProgressBar;
   final double depthPreference;
   final double newTopicAppetite;
-  // 🌟 TTS 预热开关：启用后服务启动时预热 TTS 连接池，首句延迟降低 200-500ms
+  // TTS 预热开关：启用后服务启动时预热 TTS 连接池，首句延迟降低 200-500ms
   final bool ttsPreWarming;
-  // 🌟 新增：用户英语熟练度等级
+  // 新增：用户英语熟练度等级
   final String learnerLevel;
+  // TTS 引擎选择：azure 或 volcengine
+  final String ttsEngine;
 
   SettingsState({
     required this.isChinese,
@@ -31,6 +33,7 @@ class SettingsState {
     this.newTopicAppetite = 0.2,
     this.ttsPreWarming = true,
     this.learnerLevel = "Intermediate", // 默认中级
+    this.ttsEngine = "azure", // 默认 Azure TTS
   });
 
   SettingsState copyWith({
@@ -46,6 +49,7 @@ class SettingsState {
     double? newTopicAppetite,
     bool? ttsPreWarming,
     String? learnerLevel,
+    String? ttsEngine,
   }) {
     return SettingsState(
       isChinese: isChinese ?? this.isChinese,
@@ -60,6 +64,7 @@ class SettingsState {
       newTopicAppetite: newTopicAppetite ?? this.newTopicAppetite,
       ttsPreWarming: ttsPreWarming ?? this.ttsPreWarming,
       learnerLevel: learnerLevel ?? this.learnerLevel,
+      ttsEngine: ttsEngine ?? this.ttsEngine,
     );
   }
 }
@@ -96,8 +101,10 @@ class SettingsNotifier extends Notifier<SettingsState> {
       state = state.copyWith(newTopicAppetite: val);
   void setTtsPreWarming(bool val) =>
       state = state.copyWith(ttsPreWarming: val);
-  // 🌟 新增：更新等级的方法
+  // 新增：更新等级的方法
   void setLearnerLevel(String val) => state = state.copyWith(learnerLevel: val);
+  // TTS 引擎选择
+  void setTtsEngine(String val) => state = state.copyWith(ttsEngine: val);
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(

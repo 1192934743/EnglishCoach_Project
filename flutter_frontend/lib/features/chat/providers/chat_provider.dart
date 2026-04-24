@@ -218,6 +218,7 @@ class ChatNotifier extends Notifier<ChatState> {
         "depth_preference": settings.depthPreference,
         "new_topic_appetite": settings.newTopicAppetite,
         "learner_level": settings.learnerLevel,
+        "tts_engine": settings.ttsEngine,
       });
     } catch (_) {}
   }
@@ -241,6 +242,10 @@ class ChatNotifier extends Notifier<ChatState> {
     final ap = us['new_topic_appetite'];
     if (ap is num) {
       sn.setNewTopicAppetite(ap.toDouble());
+    }
+    final te = us['tts_engine'];
+    if (te is String && te.trim().isNotEmpty) {
+      sn.setTtsEngine(te.trim());
     }
   }
 
@@ -692,11 +697,12 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  // 🌟 修改：主动更新设置时也传 learnerLevel
+  // 修改：主动更新设置时也传 learnerLevel 和 tts_engine
   Future<void> updateLmsSettings({
     required double depthPreference,
     required double newTopicAppetite,
     required String learnerLevel,
+    required String ttsEngine,
   }) async {
     final wsClient = ref.read(websocketProvider);
     try {
@@ -707,6 +713,7 @@ class ChatNotifier extends Notifier<ChatState> {
         "depth_preference": depthPreference,
         "new_topic_appetite": newTopicAppetite,
         "learner_level": learnerLevel,
+        "tts_engine": ttsEngine,
       });
     } catch (_) {}
   }
