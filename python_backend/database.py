@@ -315,6 +315,12 @@ def ensure_schema_upgrades() -> None:
     if engine.dialect.name != "sqlite":
         return
     with engine.begin() as conn:
+        # 先确认 topics 表已存在（全新 DB 时表可能尚未创建）
+        table_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='topics'")
+        ).fetchone() is not None
+        if not table_exists:
+            return
         rows = conn.execute(text("PRAGMA table_info(topics)")).fetchall()
         colnames = {r[1] for r in rows}
         if "title_zh" not in colnames:
