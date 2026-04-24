@@ -241,6 +241,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         st = await run_in_threadpool(_fetch_user_settings_dict, uid)
                         if st:
                             ws_payload["user_settings"] = st
+                        logger.info(f"[Ping] Sending warmup_success to uid={uid}, user_settings={st}")
                     await safe_send_ws(websocket, ws_lock, ws_payload)
                     continue
 
@@ -261,8 +262,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         learner_level = data.get("learner_level")
                         tts_engine = data.get("tts_engine")
                         tts_voice = data.get("tts_voice")
+                        # 更新数据库
                         await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine, tts_voice)
-                        current_user = await run_in_threadpool(init_or_get_user, current_user.id)
+                        # 更新内存中的 current_user.settings（无需重新查询数据库）
+                        if tts_engine is not None:
+                            current_user.settings["tts_engine"] = str(tts_engine).strip()
+                        if tts_voice is not None:
+                            current_user.settings["tts_voice"] = str(tts_voice).strip()
                         static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
                         chat_history[0]["content"] = static_sys
                     continue
@@ -473,6 +479,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 )
                                 provider = get_tts_factory().get_provider(tts_engine_name)
                                 if provider:
+                                    logger.info(f"[TTS] Using engine={tts_engine_name}, voice={tts_voice}")
                                     await provider.synthesize_queue(
                                         websocket, ws_lock, CONFIG, queue, latency_hooks=lat, voice_id=tts_voice
                                     )

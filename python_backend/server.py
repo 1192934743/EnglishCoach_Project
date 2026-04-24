@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -26,8 +27,16 @@ async def lifespan(app: FastAPI):
     await warm_deepseek_connection("server_startup")
     logger.info("🔊 DeepSeek LLM connection warmed up.")
 
-    # Initialize and warm up TTS factory
+    # Initialize TTS factory and pool
     init_tts_factory(CONFIG)
+    # Initialize the TTS pool from audio_service.py (for volcengine)
+    from core.audio_service import init_tts_pool, warm_tts_pool, _TTS_POOL_SIZE as _TP_SIZE
+    pool = init_tts_pool(CONFIG)
+    # Warm up TTS pool in background (non-blocking)
+    asyncio.create_task(warm_tts_pool())
+    logger.info(f"🔥 TTS 连接池已初始化（大小={_TP_SIZE}），正在后台预热...")
+
+    # Warm up all TTS providers (for azure)
     await get_tts_factory().warm_up_all()
     logger.info("🔊 TTS Factory initialized and all providers warmed up.")
 
@@ -40,6 +49,14 @@ async def lifespan(app: FastAPI):
         logger.warning("[LLM] AsyncOpenAI close: %s", e)
 
     # Close all TTS providers
+    try:
+        from core.audio_service import get_tts_pool
+        pool = get_tts_pool()
+        if pool:
+            await pool.close()
+    except Exception as e:
+        logger.warning("[TTS] Pool close error: %s", e)
+
     try:
         factory = get_tts_factory()
         if factory:

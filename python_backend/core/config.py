@@ -28,6 +28,7 @@ CONFIG = {
     "DEEPSEEK_BASE": os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com"),
     "VOLC_API_KEY": os.getenv("VOLC_API_KEY"),
     "VOLC_RESOURCE_ID_ASR": os.getenv("VOLC_RESOURCE_ID"),
+    "VOLC_RESOURCE_ID_TTS": os.getenv("VOLC_RESOURCE_ID_TTS"),
     "AZURE_SPEECH_KEY": os.getenv("AZURE_SPEECH_KEY"),
     "AZURE_SPEECH_REGION": os.getenv("AZURE_SPEECH_REGION", "eastasia"),
     "ASR_LANGUAGE": os.getenv("ASR_LANGUAGE", "en-US"),

@@ -205,6 +205,8 @@ class ChatNotifier extends Notifier<ChatState> {
   }
 
   Future<void> warmUpConnection() async {
+    // 确保本地持久化设置已加载完成，避免竞态
+    await ref.read(settingsProvider.notifier).ensureInitialized();
     final wsClient = ref.read(websocketProvider);
     try {
       await wsClient.connect();
@@ -213,6 +215,8 @@ class ChatNotifier extends Notifier<ChatState> {
       // 等待服务端 warmup_success（可带 user_settings）先到达，再回写本地 LMS，减少竞态
       await Future<void>.delayed(const Duration(milliseconds: 200));
       final settings = ref.read(settingsProvider);
+      // 调试日志：追踪 warmup 时发送的设置
+      debugPrint('[Warmup] Sending update_lms_settings: tts_engine=${settings.ttsEngine}, tts_voice=${settings.ttsVoice}');
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": settings.depthPreference,
@@ -224,34 +228,46 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  /// 服务端 DB 中的 user.settings（握手时下发）。有字段才覆盖本地。
+  /// 服务端 DB 中的 user.settings（握手时下发）。仅用于初始化本地设置。
+  /// 重要：不覆盖用户已选择的 ttsEngine/ttsVoice 配置，只有当本地从未设置过某些字段时才使用后端值。
   Future<void> _applyUserSettingsFromServer(Object? raw) async {
     if (raw is! Map) return;
     final us = Map<String, dynamic>.from(raw);
     if (us.isEmpty) return;
     final sn = ref.read(settingsProvider.notifier);
     final prefs = await SharedPreferences.getInstance();
-    final lv = us['learner_level'];
-    if (lv is String && lv.trim().isNotEmpty) {
-      sn.setLearnerLevel(lv.trim());
-      await prefs.setString('learner_level', lv.trim());
+
+    // learner_level: 只有本地仍是默认值时才使用后端的
+    final currentLv = ref.read(settingsProvider).learnerLevel;
+    final defaultLv = "Intermediate";
+    if (currentLv == defaultLv) {
+      final lv = us['learner_level'];
+      if (lv is String && lv.trim().isNotEmpty) {
+        sn.setLearnerLevel(lv.trim());
+        await prefs.setString('learner_level', lv.trim());
+      }
     }
-    final dp = us['depth_preference'];
-    if (dp is num) {
-      sn.setDepthPreference(dp.toDouble());
+
+    // depth_preference: 只有本地仍是默认值时才使用后端的
+    final currentDp = ref.read(settingsProvider).depthPreference;
+    if (currentDp == 1.0) {
+      final dp = us['depth_preference'];
+      if (dp is num) {
+        sn.setDepthPreference(dp.toDouble());
+      }
     }
-    final ap = us['new_topic_appetite'];
-    if (ap is num) {
-      sn.setNewTopicAppetite(ap.toDouble());
+
+    // new_topic_appetite: 只有本地仍是默认值时才使用后端的
+    final currentAp = ref.read(settingsProvider).newTopicAppetite;
+    if (currentAp == 0.2) {
+      final ap = us['new_topic_appetite'];
+      if (ap is num) {
+        sn.setNewTopicAppetite(ap.toDouble());
+      }
     }
-    final te = us['tts_engine'];
-    if (te is String && te.trim().isNotEmpty) {
-      sn.setTtsEngine(te.trim());
-    }
-    final tv = us['tts_voice'];
-    if (tv is String && tv.trim().isNotEmpty) {
-      sn.setTtsVoice(tv.trim());
-    }
+
+    // tts_engine 和 tts_voice: 完全不覆盖，保留用户本地选择
+    // 只有用户主动修改设置页面时才更新后端，后端数据不应该反向覆盖用户选择
   }
 
   Future<void> swapRole() async {

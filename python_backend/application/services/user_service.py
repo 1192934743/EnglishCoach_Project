@@ -10,7 +10,7 @@ def init_or_get_user(user_id: str):
             user = User(id=user_id)
             db.add(user)
             db.commit()
-            db.refresh(user)
+        db.refresh(user)
         db.expunge(user)
         return user
 
@@ -40,6 +40,7 @@ def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite
                 settings["tts_voice"] = str(tts_voice).strip()
             user.settings = settings
             db.commit()
+            db.refresh(user)
 
 def update_user_politeness(user_id: str, level: int):
     if not user_id:

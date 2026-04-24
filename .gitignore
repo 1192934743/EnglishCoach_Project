@@ -11,7 +11,13 @@
 # Python caches
 **/__pycache__/
 **/*.py[cod]
+**/*.tmp
+**/*.swp
+**/*.pyc
 
 # OS/editor junk
 .DS_Store
 Thumbs.db
+
+# log files
+**/*.log

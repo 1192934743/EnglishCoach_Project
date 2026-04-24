@@ -1,6 +1,7 @@
 // lib/core/providers/settings_provider.dart
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// TTS 音色选项配置：{引擎名: {音色ID: 显示名称}}
 class VoiceOptions {
@@ -14,9 +15,8 @@ class VoiceOptions {
       'en-AU-NatashaNeural': 'Natasha (女声, 澳音)',
     },
     'volcengine': {
-      'BV001_streaming': 'BV001 (女声, 通用)',
-      'BV002_streaming': 'BV002 (男声, 通用)',
-      'BV003_streaming': 'BV003 (女声, 活泼)',
+      // 注意：此处的 speaker 必须与 config.env 中 VOLC_RESOURCE_ID_TTS 对应的服务支持的发音人匹配
+      'en_male_tim_uranus_bigtts': 'Tim (男声, 美音)',
     },
   };
 
@@ -107,8 +107,30 @@ class SettingsState {
 }
 
 class SettingsNotifier extends Notifier<SettingsState> {
+  SharedPreferences? _prefs;
+  bool _initialized = false;
+
+  /// 确保持久化设置已加载完成
+  Future<void> ensureInitialized() async {
+    if (_initialized && _prefs != null) return;
+    _prefs ??= await SharedPreferences.getInstance();
+    final engine = _prefs!.getString('tts_engine');
+    final voice = _prefs!.getString('tts_voice');
+    if (engine != null && VoiceOptions.byEngine.containsKey(engine)) {
+      if (state.ttsEngine == "azure" || !VoiceOptions.byEngine.containsKey(state.ttsEngine)) {
+        final validVoice = VoiceOptions.isVoiceValid(engine, voice ?? '')
+            ? voice!
+            : VoiceOptions.defaultVoice(engine);
+        state = state.copyWith(ttsEngine: engine, ttsVoice: validVoice);
+      }
+    }
+    _initialized = true;
+  }
+
   @override
   SettingsState build() {
+    // 触发异步初始化（非阻塞）
+    ensureInitialized();
     return SettingsState(
       isChinese: true,
       autoMode: true,
@@ -144,16 +166,27 @@ class SettingsNotifier extends Notifier<SettingsState> {
   void setTtsEngine(String val) {
     final currentVoice = state.ttsVoice;
     // 检查当前音色是否在新引擎的选项中
+    String newVoice;
     if (!VoiceOptions.isVoiceValid(val, currentVoice)) {
       // 不在则重置为新引擎的默认音色
-      final newDefaultVoice = VoiceOptions.defaultVoice(val);
-      state = state.copyWith(ttsEngine: val, ttsVoice: newDefaultVoice);
+      newVoice = VoiceOptions.defaultVoice(val);
     } else {
-      state = state.copyWith(ttsEngine: val);
+      newVoice = currentVoice;
     }
+    state = state.copyWith(ttsEngine: val, ttsVoice: newVoice);
+    _persistTtsSettings(val, newVoice);
   }
   // TTS 音色选择
-  void setTtsVoice(String val) => state = state.copyWith(ttsVoice: val);
+  void setTtsVoice(String val) {
+    state = state.copyWith(ttsVoice: val);
+    _persistTtsSettings(state.ttsEngine, val);
+  }
+
+  Future<void> _persistTtsSettings(String engine, String voice) async {
+    _prefs ??= await SharedPreferences.getInstance();
+    await _prefs!.setString('tts_engine', engine);
+    await _prefs!.setString('tts_voice', voice);
+  }
 }
 
 final settingsProvider = NotifierProvider<SettingsNotifier, SettingsState>(
