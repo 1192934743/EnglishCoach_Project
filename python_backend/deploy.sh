@@ -8,6 +8,7 @@ set -e
 APP_NAME="englishcoach"
 BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GIT_BRANCH="${1:-main}"  # 默认 main 分支，可传入参数指定
+DOCKER_SUDO=""
 
 # 颜色输出
 RED='\033[0;31m'
@@ -44,7 +45,15 @@ check_docker() {
         log_info "Docker 已安装: $(docker --version)"
     fi
 
-    if ! command -v docker-compose &> /dev/null && ! docker compose version &> /dev/null; then
+    if ! docker ps &> /dev/null; then
+        log_warn "Docker 已安装但当前用户无权限，正在尝试修复..."
+        sudo usermod -aG docker $USER
+        log_warn "已将用户 $USER 加入 docker 组。请重新登录后再次运行此脚本，或使用: newgrp docker"
+        log_warn "将以 sudo 运行 docker 命令..."
+        DOCKER_SUDO="sudo"
+    fi
+
+    if ! command -v docker-compose &> /dev/null || ! docker compose version &> /dev/null; then
         log_warn "Docker Compose 未安装，正在安装..."
         sudo apt-get update
         sudo apt-get install -y docker-compose
@@ -76,19 +85,19 @@ pull_code() {
 # 4. 构建并启动容器
 deploy() {
     log_info "停止旧容器（如有）..."
-    docker compose down || docker-compose down 2>/dev/null || true
+    $DOCKER_SUDO docker compose down || $DOCKER_SUDO docker-compose down 2>/dev/null || true
 
     log_info "构建 Docker 镜像..."
-    docker compose build --no-cache backend || docker-compose build --no-cache backend
+    $DOCKER_SUDO docker compose build --no-cache backend || $DOCKER_SUDO docker-compose build --no-cache backend
 
     log_info "启动容器（后台运行）..."
-    docker compose up -d backend || docker-compose up -d backend
+    $DOCKER_SUDO docker compose up -d backend || $DOCKER_SUDO docker-compose up -d backend
 
     log_info "等待服务启动..."
     sleep 5
 
     # 检查容器状态
-    if docker compose ps | grep -q "englishcoach-backend.*Up"; then
+    if $DOCKER_SUDO docker compose ps | grep -q "englishcoach-backend.*Up"; then
         log_info "容器启动成功!"
     else
         log_error "容器启动可能失败，请检查日志: docker compose logs backend"
@@ -100,7 +109,7 @@ show_status() {
     log_info "=========================================="
     log_info "部署完成！当前状态:"
     echo ""
-    docker compose ps || docker-compose ps
+    $DOCKER_SUDO docker compose ps || $DOCKER_SUDO docker-compose ps
     echo ""
     log_info "查看日志: docker compose logs -f backend"
     log_info "=========================================="
