@@ -31,6 +31,9 @@ CONFIG = {
     "AZURE_SPEECH_KEY": os.getenv("AZURE_SPEECH_KEY"),
     "AZURE_SPEECH_REGION": os.getenv("AZURE_SPEECH_REGION", "eastasia"),
     "ASR_LANGUAGE": os.getenv("ASR_LANGUAGE", "en-US"),
+    # TTS Configuration
+    "DEFAULT_TTS_ENGINE": os.getenv("DEFAULT_TTS_ENGINE", "azure"),
+    "VOICE": os.getenv("VOICE", "en-US-AriaNeural"),
 }
 
 if not CONFIG["DEEPSEEK_KEY"] or not CONFIG["VOLC_API_KEY"]:

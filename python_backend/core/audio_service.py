@@ -1,19 +1,13 @@
-import copy
-import json
 import asyncio
 import gzip
-import inspect
-import struct
-import uuid
+import json
 import logging
-import time
 import os
-import re
+import struct
 import threading
+import uuid
 import websockets
 from typing import Optional
-
-from fastapi import WebSocket
 
 logger = logging.getLogger("EnglishCoach")
 
@@ -27,10 +21,7 @@ ASR_RECEIVE_TIMEOUT = 5.0        # 发送完毕后，等待识别终稿的最长
 # 整段缓冲回放时不宜每包 sleep 200ms（会成倍拉长总耗时），用 200ms 分包 + 仅 yield 让接收协程跑满。
 ASR_PCM_CHUNK_BYTES = 6400       # 200ms @ 16kHz mono int16 (16000 * 2 * 0.2)
 
-MAX_ID_LEN = 1024                # TTS: 防止畸形包分配巨量内存的上限保护
 MAX_PAYLOAD_LEN = 10 * 1024 * 1024  # ASR: 单帧在链路上的最大长度 (压缩或未压缩)
-MAX_TTS_PAYLOAD_LEN = 5 * 1024 * 1024  # TTS: Event 352 音频单帧 payload 上限 (5MB)
-MAX_TTS_CONTROL_PAYLOAD_LEN = 512 * 1024  # TTS: 非音频帧 payload 上限 (512KB)
 # ASR: 解压后或未压缩时、进入 JSON 解析前的业务体最大长度 (防 Zip Bomb / 异常大 JSON)
 MAX_DECOMPRESS_LEN = 50 * 1024 * 1024
 
@@ -44,39 +35,13 @@ def generate_asr_header(message_type, flags, serialization, compression):
     header[3] = 0x00
     return bytes(header)
 
-def pack_tts_request(event_type, session_id="", payload_dict=None):
-    """
-    火山双向 TTS 二进制封包与事件号说明：
-    - Event 1: 建立连接请求 (Client -> Server)
-    - Event 2: 客户端发送完毕，请求结束会话 (Client -> Server)
-    - Event 50: 服务端建连就绪，请求配置 (Server -> Server)
-    - Event 100: 发送具体业务参数，如音色、采样率 (Client -> Server)
-    - Event 150: 鉴权/配置通过，会话正式启动 (Server -> Client)
-    - Event 200: 发送待合成文本 (Client -> Server)
-    - Event 102: 标记当前文本流发送完成 (Client -> Server)
-    - Event 352: 下发合成好的音频流 (Server -> Client)
-    - Event 152: 服务端告知当前文本已全部合成完毕 (Server -> Client)
-    - Event 52: 服务端确认会话关闭 (Server -> Client)
-    """
-    if payload_dict is None:
-        payload_dict = {}
-    payload_bytes = json.dumps(payload_dict).encode('utf-8')
-    header = bytearray(4)
-    header[0], header[1], header[2], header[3] = 0x11, 0x14, 0x10, 0x00
 
-    event_bytes = struct.pack('>i', event_type)
-    payload_len_bytes = struct.pack('>I', len(payload_bytes))
-
-    if event_type in [1, 2]:
-        return bytes(header) + event_bytes + payload_len_bytes + payload_bytes
-    else:
-        id_bytes = session_id.encode('utf-8')
-        id_len_bytes = struct.pack('>I', len(id_bytes))
-        return bytes(header) + event_bytes + id_len_bytes + id_bytes + payload_len_bytes + payload_bytes
-
-# ================= 1. 语音转文字 (ASR) =================
+# ================= 语音转文字 (ASR) =================
 
 async def run_volcengine_wss_asr(pcm_bytes: bytearray, config: dict, max_retries=3):
+    """
+    一次性 ASR：传入完整 PCM 音频，返回 (recognized_text, detected_emotion)。
+    """
     WSS_URL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     final_text, detected_emotion = "", "neutral"
 
@@ -283,7 +248,7 @@ async def _asr_handle_server_message(
             if text != prev:
                 holder["_partial_sig"] = text
                 pr = on_partial(text)
-                if inspect.isawaitable(pr):
+                if asyncio.iscoroutine(pr):
                     await pr
         if definite and text:
             holder["text"] = text
@@ -453,259 +418,3 @@ async def run_volc_streaming_asr_worker(
                 await asyncio.sleep(0.5)
 
     return holder.get("text") or "", holder.get("emotion") or "neutral"
-
-
-# ================= 2. 文本转流式语音 (TTS) — Azure Neural TTS =================
-"""
-Azure Neural TTS 流式合成模块。
-
-设计原则：
-- 使用 synthesizing 事件 + asyncio.Queue 实现真正线程安全流式推流，
-  彻底消除 PullAudioOutputStream + asyncio.to_thread 的线程漏
-- run_tts_to_ws：点读单句入口，audio_config=None，由 server.py 在 finally 中发送 tts_finished。
-- run_tts_turn_reused_from_queue：队列消费入口，引擎初始化在循环外，
-  整个 turn 复用同一个 SpeechSynthesizer，由 server.py 在 finally 中发送 tts_finished。
-- 不需要外部连接池（Azure SDK 内部维护 WebSocket 复用）。
-"""
-
-import azure.cognitiveservices.speech as speechsdk
-
-
-def _sanitize_tts_text(text: str) -> str:
-    """去除不可用于 TTS 合成的控制字符，保留标点与文字。"""
-    if not text:
-        return ""
-    return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text).strip()
-
-
-# ── 点读入口（server.py request_tts 调用）────────────────────────────────────
-
-async def run_tts_to_ws(
-    text: str,
-    client_ws: WebSocket,
-    ws_lock: asyncio.Lock,
-    config: dict,
-    latency_hooks: Optional[dict] = None,
-):
-    """
-    点读单句 TTS：调用 Azure Neural TTS，将 PCM 流实时推送到前端。
-    使用 synthesizing 事件 + asyncio.Queue 实现真正的线程安全流式推流，
-    彻底消除 PullAudioOutputStream + asyncio.to_thread 的线程泄漏。
-    tts_finished 信号由 server.py 调用方在 finally 块中统一发送，此函数不发送结束信号。
-    """
-    azure_key = config.get("AZURE_SPEECH_KEY", "").strip()
-    azure_region = config.get("AZURE_SPEECH_REGION", "").strip()
-    voice_name = config.get("VOICE", "en-US-AriaNeural").strip()
-
-    if not azure_key:
-        logger.error("[AzureTTS] 缺失 AZURE_SPEECH_KEY，请检查 config.env")
-        return
-
-    try:
-        speech_config = speechsdk.SpeechConfig(
-            subscription=azure_key, region=azure_region
-        )
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
-        )
-        speech_config.speech_synthesis_voice_name = voice_name
-
-        # audio_config=None：不推送到扬声器，只触发 synthesizing 回调
-        synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=speech_config, audio_config=None
-        )
-
-        audio_queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        synthesis_done = threading.Event()
-
-        def evt_synthesizing(evt):
-            audio_data = evt.result.audio_data
-            if audio_data:
-                loop.call_soon_threadsafe(audio_queue.put_nowait, audio_data)
-
-        def evt_completed(evt):
-            synthesis_done.set()
-            loop.call_soon_threadsafe(audio_queue.put_nowait, None)
-
-        def evt_canceled(evt):
-            synthesis_done.set()
-            loop.call_soon_threadsafe(audio_queue.put_nowait, None)
-
-        synthesizer.synthesizing.connect(evt_synthesizing)
-        synthesizer.synthesis_completed.connect(evt_completed)
-        synthesizer.synthesis_canceled.connect(evt_canceled)
-
-        clean_text = _sanitize_tts_text(text)
-        if not clean_text:
-            return
-
-        synthesis_done.clear()
-        synthesizer.start_speaking_text_async(clean_text)
-
-        first_yielded = False
-        while True:
-            try:
-                chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
-                if chunk is None:
-                    break
-
-                if not first_yielded and latency_hooks is not None:
-                    first_yielded = True
-                    latency_hooks["_tts_first_pcm_logged"] = True
-                    t0 = latency_hooks.get("t0")
-                    tid = latency_hooks.get("turn_id", "?")
-                    if isinstance(t0, (int, float)):
-                        ms = (time.perf_counter() - float(t0)) * 1000.0
-                        logger.info(
-                            "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
-                            tid, "07_first_pcm_to_client", ms, len(chunk),
-                        )
-
-                async with ws_lock:
-                    await client_ws.send_bytes(chunk)
-
-            except asyncio.TimeoutError:
-                if synthesis_done.is_set() and audio_queue.empty():
-                    break
-
-    except Exception as e:
-        logger.warning("[AzureTTS] 点读下发中断 (前端可能断开): %s", e)
-
-
-# ── 队列消费入口（server.py tts_consumer 调用）────────────────────────────────
-
-async def run_tts_turn_reused_from_queue(
-    client_ws: WebSocket,
-    ws_lock: asyncio.Lock,
-    config: dict,
-    segment_queue: asyncio.Queue,
-    latency_hooks: Optional[dict] = None,
-):
-    """
-    一轮对话 TTS：从 segment_queue 逐句取出文本，调用 Azure Neural TTS 合成，
-    将 PCM 流实时推送到前端。
-
-    引擎初始化在循环外——整个 turn 复用同一个 SpeechSynthesizer 实例，
-    每句只调用 start_speaking_text_async，彻底消灭每句重握手的 5s 延迟。
-    使用 synthesizing 事件 + asyncio.Queue 实现真正的线程安全流式推流，
-    彻底消除 PullAudioOutputStream + asyncio.to_thread 的线程泄漏。
-    tts_finished 信号由 server.py tts_consumer 调用方在 finally 块中统一发送，
-    此函数不发送结束信号。
-    """
-    azure_key = config.get("AZURE_SPEECH_KEY", "").strip()
-    azure_region = config.get("AZURE_SPEECH_REGION", "").strip()
-    voice_name = config.get("VOICE", "en-US-AriaNeural").strip()
-
-    if not azure_key:
-        logger.error("[AzureTTS] 缺失 AZURE_SPEECH_KEY，请检查 config.env")
-        return
-
-    try:
-        # ── 引擎初始化移到循环外：整个 turn 只握手一次 ──
-        speech_config = speechsdk.SpeechConfig(
-            subscription=azure_key, region=azure_region
-        )
-        speech_config.set_speech_synthesis_output_format(
-            speechsdk.SpeechSynthesisOutputFormat.Raw24Khz16BitMonoPcm
-        )
-        speech_config.speech_synthesis_voice_name = voice_name
-
-        synthesizer = speechsdk.SpeechSynthesizer(
-            speech_config=speech_config, audio_config=None
-        )
-
-        audio_queue: asyncio.Queue = asyncio.Queue()
-        loop = asyncio.get_running_loop()
-        synthesis_done = threading.Event()
-
-        def evt_synthesizing(evt):
-            audio_data = evt.result.audio_data
-            if audio_data:
-                loop.call_soon_threadsafe(audio_queue.put_nowait, audio_data)
-
-        def evt_completed(evt):
-            synthesis_done.set()
-            loop.call_soon_threadsafe(audio_queue.put_nowait, None)
-
-        def evt_canceled(evt):
-            synthesis_done.set()
-            loop.call_soon_threadsafe(audio_queue.put_nowait, None)
-
-        synthesizer.synthesizing.connect(evt_synthesizing)
-        synthesizer.synthesis_completed.connect(evt_completed)
-        synthesizer.synthesis_canceled.connect(evt_canceled)
-
-        while True:
-            text_chunk = await segment_queue.get()
-            if text_chunk is None:
-                segment_queue.task_done()
-                break
-
-            clean_text = _sanitize_tts_text(text_chunk)
-            if not clean_text:
-                segment_queue.task_done()
-                continue
-
-            logger.info(f"[TRACK_TTS] 开始请求 Azure 合成单句 text={clean_text[:40]}")
-            synthesis_done.clear()
-            synthesizer.start_speaking_text_async(clean_text)
-
-            last_chunk_time = time.perf_counter()
-            chunk_seq = 0
-            first_yielded = False
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(audio_queue.get(), timeout=1.0)
-                    if chunk is None:
-                        logger.info(f"[TRACK_TTS] 句合成结束，总包数 chunk_seq={chunk_seq}")
-                        break
-
-                    # 句内卡顿检测
-                    now = time.perf_counter()
-                    interval_ms = (now - last_chunk_time) * 1000.0
-                    last_chunk_time = now
-                    chunk_seq += 1
-                    if interval_ms > 200:
-                        logger.warning(f"[TRACK_TTS] 句内音频流生成卡顿! interval={interval_ms:.1f}ms chunk_seq={chunk_seq} len={len(chunk)}")
-
-                    if not first_yielded and latency_hooks is not None:
-                        first_yielded = True
-                        latency_hooks["_tts_first_pcm_logged"] = True
-                        t0 = latency_hooks.get("t0")
-                        tid = latency_hooks.get("turn_id", "?")
-                        if isinstance(t0, (int, float)):
-                            ms = (time.perf_counter() - float(t0)) * 1000.0
-                            logger.info(
-                                "[LATENCY] turn=%s stage=%-32s cum=%8.1fms pcm_bytes=%s",
-                                tid, "07_first_pcm_to_client", ms, len(chunk),
-                            )
-
-                    async with ws_lock:
-                        await client_ws.send_bytes(chunk)
-
-                except asyncio.TimeoutError:
-                    if synthesis_done.is_set() and audio_queue.empty():
-                        break
-
-            segment_queue.task_done()
-
-    except Exception as e:
-        logger.warning("[AzureTTS] 对话轮次 TTS 异常: %s", e)
-
-
-# ── 导出接口（兼容旧 import，server.py 无需大幅修改）───────────────────────────
-
-def init_tts_pool(config: dict):
-    """Azure TTS 无需外部连接池，保留函数签名兼容。"""
-    pass
-
-
-async def warm_tts_pool():
-    """Azure TTS 无需预热，保留函数签名兼容。"""
-    pass
-
-
-def get_tts_pool():
-    """Azure TTS 无需外部连接池，保留函数签名兼容。"""
-    return None

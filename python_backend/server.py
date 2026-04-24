@@ -4,8 +4,9 @@ from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
 
 # --- 引入配置与预热 ---
-from core.config import logger
+from core.config import logger, CONFIG
 from infrastructure.llm.client import client, warm_deepseek_connection
+from infrastructure.tts import init_tts_factory, get_tts_factory
 
 # --- 引入拆分好的路由 ---
 from api.http.routes import router as http_router
@@ -23,7 +24,12 @@ async def lifespan(app: FastAPI):
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
 
     await warm_deepseek_connection("server_startup")
-    logger.info("🔊 Azure Neural TTS 已就绪（无需预热）。")
+    logger.info("🔊 DeepSeek LLM connection warmed up.")
+
+    # Initialize and warm up TTS factory
+    init_tts_factory(CONFIG)
+    await get_tts_factory().warm_up_all()
+    logger.info("🔊 TTS Factory initialized and all providers warmed up.")
 
     yield  # --- 这里是分隔线，shutdown 代码在 yield 之后 ---
 
@@ -32,6 +38,14 @@ async def lifespan(app: FastAPI):
         await client.close()
     except Exception as e:
         logger.warning("[LLM] AsyncOpenAI close: %s", e)
+
+    # Close all TTS providers
+    try:
+        factory = get_tts_factory()
+        if factory:
+            await factory.close_all()
+    except Exception as e:
+        logger.warning("[TTS] Factory close error: %s", e)
 
 
 # 实例化 FastAPI (唯一的实例化地点)

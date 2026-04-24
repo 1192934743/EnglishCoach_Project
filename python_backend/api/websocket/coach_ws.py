@@ -26,10 +26,8 @@ from core.audio_service import (
     ASR_STREAM_START_BYTES,
     run_volcengine_wss_asr,
     run_volc_streaming_asr_worker,
-    run_tts_to_ws,
-    run_tts_turn_reused_from_queue,
-    init_tts_pool,
 )
+from infrastructure.tts import get_tts_factory
 from core.dialogue_engine import build_prompts, build_evaluator_prompt, advance_state_machine, evaluate_and_check_progress
 from domain.entities.session_context import SessionContext
 import application.services.session_planner as session_planner
@@ -322,7 +320,18 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     text_to_speak = data.get("text", "")
                     if text_to_speak:
                         try:
-                            await run_tts_to_ws(text_to_speak, websocket, ws_lock, CONFIG)
+                            tts_engine_name = (
+                                current_user.settings.get("tts_engine")
+                                if current_user and current_user.settings
+                                else None
+                            )
+                            provider = get_tts_factory().get_provider(tts_engine_name)
+                            if provider:
+                                await provider.synthesize_single(
+                                    text_to_speak, websocket, ws_lock, CONFIG
+                                )
+                            else:
+                                logger.error(f"[TTS] Provider not found for engine: {tts_engine_name}")
                         except Exception as e:
                             logger.error(f"主动点读 TTS 异常: {e}")
                         finally:
@@ -445,7 +454,18 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         tts_queue = asyncio.Queue()
                         async def tts_consumer(queue: asyncio.Queue):
                             try:
-                                await run_tts_turn_reused_from_queue(websocket, ws_lock, CONFIG, queue, latency_hooks=lat)
+                                tts_engine_name = (
+                                    current_user.settings.get("tts_engine")
+                                    if current_user and current_user.settings
+                                    else None
+                                )
+                                provider = get_tts_factory().get_provider(tts_engine_name)
+                                if provider:
+                                    await provider.synthesize_queue(
+                                        websocket, ws_lock, CONFIG, queue, latency_hooks=lat
+                                    )
+                                else:
+                                    logger.error(f"[TTS] Provider not found for engine: {tts_engine_name}")
                             except asyncio.CancelledError:
                                 raise
                             except Exception:
