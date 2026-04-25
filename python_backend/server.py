@@ -73,6 +73,11 @@ app = FastAPI(title="EnglishCoach API", lifespan=lifespan)
 # 挂载路由
 app.include_router(http_router)
 app.include_router(ws_router)
+@app.get("/health")
+async def health_check():
+    # 后期你可以在这里加入数据库连接检查
+    return {"status": "healthy", "service": "EnglishCoach Backend"}
+
 
 if __name__ == "__main__":
     import uvicorn
