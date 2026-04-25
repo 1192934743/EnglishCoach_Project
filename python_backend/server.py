@@ -38,6 +38,12 @@ async def lifespan(app: FastAPI):
     asyncio.create_task(warm_tts_pool())
     logger.info(f"🔥 TTS 连接池已初始化（大小={_TP_SIZE}），正在后台预热...")
 
+    # Initialize ASR pool (弹匣模式)
+    from core.audio_service import init_asr_pool, warm_asr_pool, _ASR_POOL_SIZE as _ASR_SIZE
+    asr_pool = init_asr_pool(CONFIG)
+    asyncio.create_task(warm_asr_pool())
+    logger.info(f"🎙️ ASR 连接池已初始化（大小={_ASR_SIZE}），正在后台预热...")
+
     # Warm up all TTS providers (for azure)
     await get_tts_factory().warm_up_all()
     logger.info("🔊 TTS Factory initialized and all providers warmed up.")
@@ -49,6 +55,15 @@ async def lifespan(app: FastAPI):
         await client.close()
     except Exception as e:
         logger.warning("[LLM] AsyncOpenAI close: %s", e)
+
+    # Close ASR pool
+    try:
+        from core.audio_service import get_asr_pool
+        asr_pool = get_asr_pool()
+        if asr_pool:
+            await asr_pool.close()
+    except Exception as e:
+        logger.warning("[ASR] Pool close error: %s", e)
 
     # Close all TTS providers
     try:
