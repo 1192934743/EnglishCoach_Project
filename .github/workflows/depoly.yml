@@ -23,19 +23,25 @@ jobs:
           # 如果你的 SSH 端口不是 22，请在这里指定
           port: 22
           script: |
-            # 1. 进入项目目录
+            # 1. 遇到任何错误立即停止执行，GitHub Actions 会直接标红报错
+            set -e
+
+            # 2. 进入目录
             cd /home/ubuntu/EnglishCoach_Project
 
-            # 2. 拉取最新代码
-            git pull origin azure
+            # 3. 强制修复可能的权限问题（双重保险）
+            sudo chown -R ubuntu:ubuntu .
 
-            # 3. 自动化部署 (核心步骤)
-            # --build: 表示如果代码变了，重新构建镜像
-            # -d: 后台运行
-            # backend: 仅针对你命令中指定的 backend 服务进行更新，不影响其他服务
+            # 4. 彻底同步代码
+            # fetch 远程分支，然后强制重置本地状态，解决所有冲突
+            git fetch origin azure
+            git reset --hard origin/azure
+
+            # 5. 重建并启动容器
+            # 确保这里是你 docker-compose.yml 所在的目录
             sudo docker compose up -d --build backend
 
-            # 4. (可选) 清理无用的旧镜像，释放磁盘空间
-            # sudo docker image prune -f
+            # 6. 清理残留的虚悬镜像（节省空间）
+            sudo docker image prune -f
 
-            echo "🚀 Docker container 'backend' has been updated and restarted!"
+            echo "🚀 Actual deployment success!"
