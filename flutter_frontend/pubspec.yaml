@@ -46,6 +46,8 @@ dependencies:
   lottie: ^3.3.3
   uuid: ^4.3.3                # 用来生成唯一的随机 ID
   http: ^1.6.0
+  vad: ^0.0.5
+  path_provider: ^2.1.5  # 用于获取应用文档目录
 
 dev_dependencies:
   flutter_test:

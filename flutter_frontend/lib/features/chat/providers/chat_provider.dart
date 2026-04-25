@@ -1,5 +1,6 @@
 // lib/features/chat/providers/chat_provider.dart
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -8,9 +9,11 @@ import 'package:record/record.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:audio_session/audio_session.dart';
 import 'package:uuid/uuid.dart';
+
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/network/user_manager.dart';
+import '../../../core/vad/silero_vad_service.dart'; // 引入自建的 VAD 服务
 import '../models/session_report_model.dart';
 
 export '../models/session_report_model.dart';
@@ -34,19 +37,11 @@ class ChatState {
   final bool isFlipped;
   final double masteryProgress;
   final String? errorMessage;
-  // ── LMS 新增字段 ───────────────────────────────────────────────────────
-  /// 非 null 时触发报告卡弹出；dismiss 后调用 clearSessionReport() 置 null
   final SessionReport? sessionReport;
   final String currentTopicTitle;
-
-  /// 来自后端 `topics.title_zh` / TaskPacket；空则界面用 `topicTitleUiLabel` 兜底。
   final String currentTopicTitleZh;
   final String currentRoleName;
-
-  /// true while backend is generating a user-requested topic
   final bool isGeneratingTopic;
-
-  // ── 主从分离架构新增：标识正在等待旁路的 JSON 辅导数据 ─────────────
   final bool isWaitingForTeachingData;
 
   ChatState({
@@ -97,53 +92,37 @@ class ChatState {
   }
 }
 
-// copyWith 的哨兵值，用于区分「未传参」与「显式传 null」
 const Object _sentinel = Object();
 
 class ChatNotifier extends Notifier<ChatState> {
   late AudioRecorder _recorder;
   final FlutterSoundPlayer _player = FlutterSoundPlayer();
 
+  // VAD 服务实例
+  late SileroVadService _vadService;
+
   StreamSubscription? _commandSubscription;
   StreamSubscription? _audioSubscription;
-  StreamSubscription<Amplitude>? _ampSubscription;
   StreamSubscription? _connectionSubscription;
   Timer? _silenceTimer;
 
   bool _hasSpoken = false;
-  int _noiseFrames = 0;
   bool _isAutoLooping = false;
   int _totalBytesReceived = 0;
   DateTime? _playbackStartTime;
 
-  /// 打断标志：true 期间，所有 TTS 回调（音频流 / tts_finished）均被忽略
   bool _isInterrupting = false;
-
-  /// 重连标志：上一次状态为 reconnecting，用于判断是否需要重新握手
   bool _wasReconnecting = false;
-
-  /// Fix B4: 防止 startListening() 并发调用的互斥标志
   bool _isStartingListen = false;
-
-  /// Fix B5: 最大录音计时器（静默超时保护）
   Timer? _maxListenTimer;
-
-  /// Fix B7: 报告卡展示期间暂停 autoMode 自动开始录音
   bool _reportShowing = false;
 
-  /// 端到端延迟排查：从 stopListeningAndSubmit 到首包 PCM 的客户端阶段
   Stopwatch? _latencySw;
   bool _latencyLoggedFirstPcm = false;
-
-  /// 与后端 [LATENCY]/[E2E] 对齐的轮次 id（随 user_finish_speaking 上报）
   String? _latencyTurnId;
   int? _latencyFirstPcmMs;
-
-  /// [TRACK_AUDIO] PCM 收包间隔追踪
   DateTime? _lastPcmReceiveTime;
-  int _pcmChunkCount = 0;
 
-  // ── 高频文本流局部刷新：避免 ListView 全局重绘 ─────────────
   final ValueNotifier<String> activeUserTextNotifier = ValueNotifier<String>(
     '',
   );
@@ -162,11 +141,12 @@ class ChatNotifier extends Notifier<ChatState> {
   @override
   ChatState build() {
     _recorder = AudioRecorder();
+    _vadService = SileroVadService(); // 初始化 VAD 服务
+
     _initAudioSessionAndPlayer();
     _initWebSocketListeners();
     Future.delayed(const Duration(milliseconds: 500), () => warmUpConnection());
 
-    // ── 监听 WS 连接状态，自动处理重连后的握手重建 ─────────────────────────
     final wsClient = ref.read(websocketProvider);
     _connectionSubscription = wsClient.connectionStateStream.listen((
       connState,
@@ -174,7 +154,7 @@ class ChatNotifier extends Notifier<ChatState> {
       debugPrint('[WS] connectionState → $connState  (status=${state.status})');
       if (connState == WsConnectionState.reconnecting) {
         _wasReconnecting = true;
-        forceIdle(); // 重连期间强制空闲，防止录音/播放残留
+        forceIdle();
       } else if (connState == WsConnectionState.connected && _wasReconnecting) {
         _wasReconnecting = false;
         Future.delayed(
@@ -187,12 +167,12 @@ class ChatNotifier extends Notifier<ChatState> {
     ref.onDispose(() {
       _commandSubscription?.cancel();
       _audioSubscription?.cancel();
-      _ampSubscription?.cancel();
       _connectionSubscription?.cancel();
       _silenceTimer?.cancel();
       _maxListenTimer?.cancel();
       _recorder.dispose();
       _player.closePlayer();
+      _vadService.stopListening();
       activeUserTextNotifier.dispose();
       activeAiTextNotifier.dispose();
     });
@@ -205,18 +185,21 @@ class ChatNotifier extends Notifier<ChatState> {
   }
 
   Future<void> warmUpConnection() async {
-    // 确保本地持久化设置已加载完成，避免竞态
     await ref.read(settingsProvider.notifier).ensureInitialized();
+
+    // 静默预热 VAD 模型（不阻塞主线程）
+    final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
+    _vadService.initialize(silenceThresholdMs: currentVadTimeout).then((_) {
+      debugPrint('[VAD] 后台预热加载完毕，随时可以秒开录音');
+    });
+
     final wsClient = ref.read(websocketProvider);
     try {
       await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
-      // 等待服务端 warmup_success（可带 user_settings）先到达，再回写本地 LMS，减少竞态
       await Future<void>.delayed(const Duration(milliseconds: 200));
       final settings = ref.read(settingsProvider);
-      // 调试日志：追踪 warmup 时发送的设置
-      debugPrint('[Warmup] Sending update_lms_settings: tts_engine=${settings.ttsEngine}, tts_voice=${settings.ttsVoice}');
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": settings.depthPreference,
@@ -228,8 +211,6 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  /// 服务端 DB 中的 user.settings（握手时下发）。仅用于初始化本地设置。
-  /// 重要：不覆盖用户已选择的 ttsEngine/ttsVoice 配置，只有当本地从未设置过某些字段时才使用后端值。
   Future<void> _applyUserSettingsFromServer(Object? raw) async {
     if (raw is! Map) return;
     final us = Map<String, dynamic>.from(raw);
@@ -237,7 +218,6 @@ class ChatNotifier extends Notifier<ChatState> {
     final sn = ref.read(settingsProvider.notifier);
     final prefs = await SharedPreferences.getInstance();
 
-    // learner_level: 只有本地仍是默认值时才使用后端的
     final currentLv = ref.read(settingsProvider).learnerLevel;
     final defaultLv = "Intermediate";
     if (currentLv == defaultLv) {
@@ -248,7 +228,6 @@ class ChatNotifier extends Notifier<ChatState> {
       }
     }
 
-    // depth_preference: 只有本地仍是默认值时才使用后端的
     final currentDp = ref.read(settingsProvider).depthPreference;
     if (currentDp == 1.0) {
       final dp = us['depth_preference'];
@@ -257,7 +236,6 @@ class ChatNotifier extends Notifier<ChatState> {
       }
     }
 
-    // new_topic_appetite: 只有本地仍是默认值时才使用后端的
     final currentAp = ref.read(settingsProvider).newTopicAppetite;
     if (currentAp == 0.2) {
       final ap = us['new_topic_appetite'];
@@ -265,9 +243,6 @@ class ChatNotifier extends Notifier<ChatState> {
         sn.setNewTopicAppetite(ap.toDouble());
       }
     }
-
-    // tts_engine 和 tts_voice: 完全不覆盖，保留用户本地选择
-    // 只有用户主动修改设置页面时才更新后端，后端数据不应该反向覆盖用户选择
   }
 
   Future<void> swapRole() async {
@@ -300,7 +275,8 @@ class ChatNotifier extends Notifier<ChatState> {
           avAudioSessionCategoryOptions:
               AVAudioSessionCategoryOptions.allowBluetooth |
               AVAudioSessionCategoryOptions.defaultToSpeaker,
-          avAudioSessionMode: AVAudioSessionMode.spokenAudio,
+          // 强行呼起 iOS 硬件降噪与 AEC
+          avAudioSessionMode: AVAudioSessionMode.voiceChat,
           avAudioSessionRouteSharingPolicy:
               AVAudioSessionRouteSharingPolicy.defaultPolicy,
           avAudioSessionSetActiveOptions: AVAudioSessionSetActiveOptions.none,
@@ -341,24 +317,20 @@ class ChatNotifier extends Notifier<ChatState> {
 
   void _initWebSocketListeners() {
     final wsClient = ref.read(websocketProvider);
-    // async 回调：允许在 error 分支 await forceIdle() 后再写 errorMessage
     _commandSubscription = wsClient.commandStream.listen((data) async {
       if (data['event'] == 'warmup_success') {
         await _applyUserSettingsFromServer(data['user_settings']);
       } else if (data['event'] == 'tts_finished') {
-        if (_isInterrupting) return; // 打断期间忽略来自后端的 tts_finished
+        if (_isInterrupting) return;
         _handleAudioFinished();
       } else if (data['event'] == 'asr_partial') {
-        // 捕获流式转写数据并展示
         activeUserTextNotifier.value = data['text'] ?? '';
       } else if (data['event'] == 'ai_text_stream') {
-        // ── 核心新增：捕获主 LLM 的流式回复，实现打字机效果 ──
         if (!state.isWaitingForTeachingData) {
           state = state.copyWith(isWaitingForTeachingData: true);
         }
         activeAiTextNotifier.value += (data['text'] ?? '');
       } else if (data['event'] == 'teaching_data') {
-        // ── 核心新增：捕获副 LLM 生成的分析结果，移除骨架屏并结算 ──
         final d = data['data'];
         if (d['user_text'] != null && d['ai_text'] != null) {
           final newTurn = ChatTurn(
@@ -406,32 +378,24 @@ class ChatNotifier extends Notifier<ChatState> {
         final en = (data['message'] as String?)?.trim();
         final message = (isZh && zh != null && zh.isNotEmpty)
             ? zh
-            : (en ??
-                  (isZh
-                      ? '出错了，请稍后再试。'
-                      : 'Something went wrong. Please try again.'));
+            : (en ?? (isZh ? '出错了，请稍后再试。' : 'Something went wrong.'));
         state = state.copyWith(errorMessage: message);
       }
     }, onError: (_) => forceIdle());
 
     _audioSubscription = wsClient.audioStream.listen((audioBytes) {
-      // 打断期间或非播放状态时，丢弃网络中残留的 PCM 包
       if (_isInterrupting) return;
       if (state.status == ChatStatus.speaking && _player.isPlaying) {
-        // [TRACK_AUDIO] 收包间隔检测
         final now = DateTime.now();
         if (_lastPcmReceiveTime != null) {
           final intervalMs = now
               .difference(_lastPcmReceiveTime!)
               .inMilliseconds;
           if (intervalMs > 100) {
-            debugPrint(
-              '[TRACK_AUDIO] APP 收包间隔过大 interval=${intervalMs}ms _pcmChunkCount=$_pcmChunkCount len=${audioBytes.length}',
-            );
+            debugPrint('[TRACK_AUDIO] 收包间隔过大 interval=${intervalMs}ms');
           }
         }
         _lastPcmReceiveTime = now;
-        _pcmChunkCount += 1;
 
         if (!_latencyLoggedFirstPcm) {
           _latencyLoggedFirstPcm = true;
@@ -487,7 +451,6 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencyTurnId = null;
     _latencyFirstPcmMs = null;
 
-    // Fix B7: do not auto-start while the session report card is visible
     if (ref.read(settingsProvider).autoMode && !_reportShowing) {
       startListening();
     } else {
@@ -496,43 +459,71 @@ class ChatNotifier extends Notifier<ChatState> {
   }
 
   Future<void> startListening() async {
-    // Fix B4: mutex guard — prevents concurrent calls from racing past the status check
     if (_isStartingListen) return;
     if (state.status == ChatStatus.listening) return;
     _isStartingListen = true;
 
     try {
       if (_player.isPlaying) await _player.stopPlayer();
-      final permStatus = await Permission.microphone.request();
-      if (!permStatus.isGranted) return;
 
-      // Fix B2: removed session.setActive(true) — the `record` package manages
-      // Android AudioFocus internally; calling setActive() here creates a double
-      // focus request that triggers onAudioFocusChange(-1) and breaks recording.
+      final permStatus = await Permission.microphone.request();
+      if (!permStatus.isGranted) {
+        _isStartingListen = false;
+        return;
+      }
+
       final wsClient = ref.read(websocketProvider);
-      await wsClient.connect();
+      // 不阻塞主线程连接，后台自动保障
+      wsClient.connect();
+
+      // 强力激活 Android/iOS 底层硬件降噪
       const config = RecordConfig(
         encoder: AudioEncoder.pcm16bits,
         sampleRate: 16000,
         numChannels: 1,
+        echoCancel: true,
+        noiseSuppress: true,
+        autoGain: true,
       );
+
       if (await _recorder.isRecording()) await _recorder.stop();
+
+      // 这里现在是秒开，如果是同样阈值，直接 return
+      final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
+      await _vadService.initialize(silenceThresholdMs: currentVadTimeout);
+
+      _vadService.setCallbacks(
+        onStart: () {
+          if (state.status == ChatStatus.listening) {
+            _hasSpoken = true;
+            _silenceTimer?.cancel();
+            debugPrint('[SileroVAD] - 人类开始说话');
+          }
+        },
+        onEnd: () {
+          if (state.status == ChatStatus.listening && _hasSpoken) {
+            debugPrint('[SileroVAD] - 人类语音中断，触发自动发送');
+            stopListeningAndSubmit();
+          }
+        },
+      );
+
       final stream = await _recorder.startStream(config);
+      final broadcastStream = stream.asBroadcastStream();
 
       state = state.copyWith(status: ChatStatus.listening);
       _hasSpoken = false;
-      _noiseFrames = 0;
 
-      stream.listen((data) {
-        if (state.status == ChatStatus.listening) wsClient.sendAudio(data);
+      broadcastStream.listen((data) {
+        if (state.status == ChatStatus.listening) {
+          wsClient.sendAudio(data);
+          _vadService.feedPCM(data);
+        }
       });
 
-      // Fix B5: max-listen safety timer — if no voice is detected within 30s,
-      // forceIdle() to prevent the UI from being permanently stuck in "Listening".
       _maxListenTimer?.cancel();
       _maxListenTimer = Timer(const Duration(seconds: 30), () {
         if (state.status == ChatStatus.listening) {
-          // If the user started speaking but silence timer never fired, submit anyway.
           if (_hasSpoken) {
             stopListeningAndSubmit();
           } else {
@@ -540,39 +531,11 @@ class ChatNotifier extends Notifier<ChatState> {
           }
         }
       });
-
-      _ampSubscription?.cancel();
-      _ampSubscription = _recorder
-          .onAmplitudeChanged(const Duration(milliseconds: 100))
-          .listen((amp) {
-            if (state.status != ChatStatus.listening) return;
-            final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-            // Fix B3: raised threshold -25 → -35 dBFS; min frames 5 → 4（约 400ms 有声）再判「已开口」，
-            // 略缩有效句长、更快进入静默计时。
-            if (amp.current > -35.0) {
-              _noiseFrames++;
-              if (_noiseFrames > 3) {
-                _hasSpoken = true;
-                _silenceTimer?.cancel();
-              }
-            } else {
-              _noiseFrames = 0;
-              if (_hasSpoken) {
-                if (_silenceTimer == null || !_silenceTimer!.isActive) {
-                  _silenceTimer = Timer(
-                    Duration(milliseconds: currentVadTimeout),
-                    () => stopListeningAndSubmit(),
-                  );
-                }
-              }
-            }
-          });
     } catch (e, st) {
       debugPrint('[startListening] EXCEPTION: $e');
       debugPrint('[startListening] STACKTRACE: $st');
       forceIdle();
     } finally {
-      // Fix B4: always release the mutex so future calls are not permanently blocked
       _isStartingListen = false;
     }
   }
@@ -585,15 +548,15 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencySw = Stopwatch()..start();
     _latencyLogClient('01_stopListening_submit_start');
     _lastPcmReceiveTime = null;
-    _pcmChunkCount = 0;
+
     try {
       await _recorder.stop();
-      _latencyLogClient('02_recorder_stopped');
-      _ampSubscription?.cancel();
-      _silenceTimer?.cancel();
-      _maxListenTimer?.cancel(); // Fix B5
+      _vadService.stopListening(); // 停止 VAD 监听
 
-      // 切换状态，唤起骨架屏，并重置本轮的 AI 流文本
+      _latencyLogClient('02_recorder_stopped');
+      _silenceTimer?.cancel();
+      _maxListenTimer?.cancel();
+
       state = state.copyWith(
         status: ChatStatus.speaking,
         isWaitingForTeachingData: true,
@@ -631,8 +594,7 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
     _isAutoLooping = false;
-    _isStartingListen =
-        false; // Fix B4: release mutex if we force-idle mid-start
+    _isStartingListen = false;
     _playbackStartTime = null;
     _totalBytesReceived = 0;
     try {
@@ -641,9 +603,13 @@ class ChatNotifier extends Notifier<ChatState> {
     try {
       if (await _recorder.isRecording()) await _recorder.stop();
     } catch (_) {}
-    _ampSubscription?.cancel();
+
+    try {
+      _vadService.stopListening(); // 清理模型内部状态
+    } catch (_) {}
+
     _silenceTimer?.cancel();
-    _maxListenTimer?.cancel(); // Fix B5: cancel the safety timer
+    _maxListenTimer?.cancel();
 
     state = state.copyWith(
       status: ChatStatus.idle,
@@ -653,31 +619,24 @@ class ChatNotifier extends Notifier<ChatState> {
     activeAiTextNotifier.value = '';
   }
 
-  /// P0 打断机制：AI 说话途中用户开口 → 立刻停播 + 清空 PCM + 通知后端 + 开始录音
   Future<void> interruptAndListen() async {
     if (state.status != ChatStatus.speaking) return;
 
-    // ── 1. 设置打断标志，屏蔽所有后续 TTS 回调 ───────────────────────────
     _isInterrupting = true;
     _isAutoLooping = false;
 
-    // ── 2. 关闭 PCM 输入 sink（清空 flutter_sound 内部缓冲区）─────────────
     try {
       await _player.uint8ListSink?.close();
     } catch (_) {}
 
-    // ── 3. 强制停止播放器（立刻停音）─────────────────────────────────────
     try {
       if (_player.isPlaying) await _player.stopPlayer();
     } catch (_) {}
 
-    // ── 4. 清零前端 PCM 追踪状态 ──────────────────────────────────────────
     _totalBytesReceived = 0;
     _playbackStartTime = null;
     _lastPcmReceiveTime = null;
-    _pcmChunkCount = 0;
 
-    // ── 5. 通知后端取消 TTS，同时清空后端 audio_buffer ────────────────────
     ref.read(websocketProvider).sendCommand("cancel_tts", {});
 
     _latencySw = null;
@@ -685,25 +644,20 @@ class ChatNotifier extends Notifier<ChatState> {
     _latencyFirstPcmMs = null;
     _latencyLoggedFirstPcm = false;
 
-    // 清理界面数据并重入录音
     state = state.copyWith(isWaitingForTeachingData: false);
     activeUserTextNotifier.value = '';
     activeAiTextNotifier.value = '';
 
-    // ── 6. 解除打断标志，切换到录音状态 ──────────────────────────────────
     _isInterrupting = false;
     await startListening();
   }
 
-  /// UI 展示错误 Snackbar 后调用，清空 errorMessage 防止重复弹出
   void clearError() {
     state = state.copyWith(errorMessage: null);
   }
 
-  /// 报告卡 dismiss 后调用，防止重复弹出，并恢复 autoMode 录音循环
   void clearSessionReport() {
-    _reportShowing =
-        false; // Fix B7: resume autoMode cycle after report dismissed
+    _reportShowing = false;
     state = state.copyWith(sessionReport: null);
   }
 
@@ -718,7 +672,6 @@ class ChatNotifier extends Notifier<ChatState> {
     } catch (_) {}
   }
 
-  // 修改：主动更新设置时也传 learnerLevel、tts_engine 和 tts_voice
   Future<void> updateLmsSettings({
     required double depthPreference,
     required double newTopicAppetite,
@@ -745,10 +698,8 @@ class ChatNotifier extends Notifier<ChatState> {
     final stage = data['stage'] as String? ?? 'preliminary';
 
     if (stage == 'preliminary') {
-      // Fix B7: pause autoMode while report card is visible, and stop any
-      // ongoing recording/playback so the UI is clean when the sheet appears.
       _reportShowing = true;
-      forceIdle(); // async, but fire-and-forget is fine here
+      forceIdle();
 
       final report = SessionReport.fromJson(data);
       final zh = report.topicTitleZh?.trim() ?? '';
@@ -772,7 +723,6 @@ class ChatNotifier extends Notifier<ChatState> {
     } else if (state.status == ChatStatus.listening) {
       await stopListeningAndSubmit();
     } else if (state.status == ChatStatus.speaking) {
-      // 🛑 打断：不再只是停到 idle，而是立刻开始新一轮录音
       await interruptAndListen();
     }
   }

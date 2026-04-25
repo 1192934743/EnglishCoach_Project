@@ -4,6 +4,7 @@ import 'dart:typed_data';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
+import '../logging/app_logger.dart';
 import 'backend_config.dart';
 
 // ── 连接状态枚举 ────────────────────────────────────────────────────────────
@@ -56,6 +57,7 @@ class WebSocketClient {
     }
     _intentionalDisconnect = false;
     _setState(WsConnectionState.connecting);
+    AppLogger.log('WS', 'Connecting to $_url');
 
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_url));
@@ -65,9 +67,11 @@ class WebSocketClient {
         onDone: () => _onLostConnection('server closed'),
       );
       _setState(WsConnectionState.connected);
+      AppLogger.log('WS', 'Connected successfully');
       _reconnectAttempts = 0;
       _startHeartbeat();
     } catch (e) {
+      AppLogger.instance.error('[WS] Connection failed: $e');
       _setState(WsConnectionState.disconnected);
       _scheduleReconnect();
     }
@@ -99,12 +103,14 @@ class WebSocketClient {
 
   void _scheduleReconnect() {
     if (_reconnectAttempts >= _maxReconnectAttempts) {
+      AppLogger.instance.error('[WS] Max reconnect attempts reached');
       _setState(WsConnectionState.disconnected);
       return;
     }
     _setState(WsConnectionState.reconnecting);
     // 指数退避：1s → 2s → 4s → 8s → 16s
     final delaySeconds = 1 << _reconnectAttempts;
+    AppLogger.log('WS', 'Scheduling reconnect attempt ${_reconnectAttempts + 1} in ${delaySeconds}s');
     _reconnectTimer?.cancel();
     _reconnectTimer = Timer(Duration(seconds: delaySeconds), () {
       _reconnectAttempts++;
@@ -143,6 +149,7 @@ class WebSocketClient {
   // ── 主动断开 ─────────────────────────────────────────────────────────────
   void disconnect() {
     _intentionalDisconnect = true;
+    AppLogger.log('WS', 'Intentional disconnect');
     _stopHeartbeat();
     _reconnectTimer?.cancel();
     _channel?.sink.close(1001);

@@ -449,7 +449,7 @@ packages:
     source: hosted
     version: "1.9.1"
   path_provider:
-    dependency: transitive
+    dependency: "direct main"
     description:
       name: path_provider
       sha256: "50c5dd5b6e1aaf6fb3a78b33f6aa3afca52bf903a8a5298f53101fdaee55bbcd"
@@ -869,6 +869,14 @@ packages:
       url: "https://pub.flutter-io.cn"
     source: hosted
     version: "4.5.3"
+  vad:
+    dependency: "direct main"
+    description:
+      name: vad
+      sha256: ef6c8b12c5af7a6a519ff5684f074b8a2ac00c434705f544af379ea77bccd258
+      url: "https://pub.flutter-io.cn"
+    source: hosted
+    version: "0.0.7+1"
   vector_math:
     dependency: transitive
     description:

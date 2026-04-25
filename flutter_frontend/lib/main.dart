@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'core/logging/app_logger.dart';
 import 'core/providers/settings_provider.dart';
 import 'features/chat/presentation/chat_screen.dart';
 import 'features/chat/providers/chat_provider.dart';
@@ -12,6 +13,11 @@ import 'features/onboarding/onboarding_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // 初始化日志系统
+  await AppLogger.instance.init();
+  AppLogger.instance.info('App started');
+
   runApp(const ProviderScope(child: EnglishCoachApp()));
 }
 

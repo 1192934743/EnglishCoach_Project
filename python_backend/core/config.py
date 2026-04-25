@@ -16,6 +16,7 @@ try:
     )
     if not any(isinstance(h, logging.FileHandler) and getattr(h, "baseFilename", "") == os.path.abspath(_log_path) for h in logger.handlers):
         logger.addHandler(_fh)
+        logger.propagate = False
     logger.info("EnglishCoach file log: %s", os.path.abspath(_log_path))
 except OSError as _e:
     logger.warning("Could not open server_output.log: %s", _e)
