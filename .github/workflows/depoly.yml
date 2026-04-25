@@ -27,7 +27,7 @@ jobs:
             set -e
 
             # 2. 进入目录
-            cd /home/ubuntu/EnglishCoach_Project
+            cd /home/ubuntu/EnglishCoach_Project/python_backend
 
             # 3. 强制修复可能的权限问题（双重保险）
             sudo chown -R ubuntu:ubuntu .
