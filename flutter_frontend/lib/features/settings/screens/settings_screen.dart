@@ -1,6 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../../core/network/backend_config.dart';
+import '../../../core/network/server_debug_config.dart';
+import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../chat/providers/chat_provider.dart';
 import '../../onboarding/onboarding_screen.dart';
@@ -22,6 +25,18 @@ class SettingsScreen extends ConsumerWidget {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
+          // ── 服务器配置 ────────────────────────────────────────────────────────
+          _buildSectionTitle(tr(ref, "Server", "服务器"), baseSize),
+          _ServerSelector(
+            onServerChanged: () {
+              // 切换服务器后强制重连 WebSocket
+              final wsClient = ref.read(websocketProvider);
+              wsClient.disconnect();
+              wsClient.connect();
+            },
+          ),
+          const SizedBox(height: 20),
+
           _buildSectionTitle(
             tr(ref, "Language & Interface", "语言与界面"),
             baseSize,
@@ -595,6 +610,267 @@ class SettingsScreen extends ConsumerWidget {
         value: value,
         activeColor: Colors.blueAccent,
         onChanged: onChanged,
+      ),
+    );
+  }
+}
+
+// ── 服务器选择器 Widget ──────────────────────────────────────────────────────
+class _ServerSelector extends ConsumerStatefulWidget {
+  final VoidCallback onServerChanged;
+  const _ServerSelector({required this.onServerChanged});
+
+  @override
+  ConsumerState<_ServerSelector> createState() => _ServerSelectorState();
+}
+
+class _ServerSelectorState extends ConsumerState<_ServerSelector> {
+  ServerPreset _currentPreset = ServerPreset.local;
+  String _customHost = '';
+  String _customPort = '8000';
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadPreset();
+  }
+
+  Future<void> _loadPreset() async {
+    final preset = await getServerPreset();
+    final customHost = await getCustomHost() ?? '';
+    final customPort = await getCustomPort() ?? 8000;
+    if (mounted) {
+      setState(() {
+        _currentPreset = preset;
+        _customHost = customHost;
+        _customPort = customPort.toString();
+        _initialized = true;
+      });
+    }
+  }
+
+  Future<void> _onPresetChanged(ServerPreset preset) async {
+    setState(() => _currentPreset = preset);
+    await switchServerPreset(preset);
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('${tr(ref, 'Server switched to:', '已切换到服务器：')} ${_presetLabel(preset)}'),
+          duration: const Duration(seconds: 2),
+        ),
+      );
+      widget.onServerChanged();
+    }
+  }
+
+  Future<void> _onCustomApply() async {
+    final host = _customHost.trim();
+    final port = int.tryParse(_customPort.trim()) ?? 8000;
+    if (host.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(tr(ref, 'Host cannot be empty', '服务器地址不能为空'))),
+      );
+      return;
+    }
+    final ok = await switchServerPreset(ServerPreset.custom, customHost: host, customPort: port);
+    if (ok && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('${tr(ref, 'Server switched to:', '已切换到服务器：')} $host:$port')),
+      );
+      widget.onServerChanged();
+    }
+  }
+
+  String _presetLabel(ServerPreset preset) {
+    switch (preset) {
+      case ServerPreset.local:
+        return '$kDefaultLocalHost:8000';
+      case ServerPreset.remote:
+        return '$kDefaultRemoteHost:8000';
+      case ServerPreset.custom:
+        return 'Custom';
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_initialized) {
+      return Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+        child: const Center(child: CircularProgressIndicator()),
+      );
+    }
+
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.grey.shade200),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.dns_rounded, color: Colors.green, size: 22),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  '${tr(ref, 'Current:', '当前：')} $kBackendHost:$kBackendPort',
+                  style: const TextStyle(fontWeight: FontWeight.w500, fontSize: 14),
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: Colors.green.withValues(alpha: 0.1),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  _currentPreset == ServerPreset.custom ? 'Custom' : _currentPreset.name,
+                  style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold, fontSize: 12),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Divider(height: 1),
+          const SizedBox(height: 14),
+
+          // 预设选项
+          ...[
+            (ServerPreset.local, '$kDefaultLocalHost:8000', Icons.home_rounded, '本地服务器'),
+            (ServerPreset.remote, '$kDefaultRemoteHost:8000', Icons.cloud_rounded, '远端服务器'),
+          ].map((item) {
+            final preset = item.$1;
+            final address = item.$2;
+            final icon = item.$3;
+            final label = item.$4;
+            final isSelected = _currentPreset == preset;
+            return InkWell(
+              onTap: () => _onPresetChanged(preset),
+              borderRadius: BorderRadius.circular(10),
+              child: Container(
+                margin: const EdgeInsets.only(bottom: 8),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                decoration: BoxDecoration(
+                  color: isSelected ? Colors.blue.withValues(alpha: 0.08) : Colors.grey.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(
+                    color: isSelected ? Colors.blue : Colors.grey.shade300,
+                    width: isSelected ? 1.5 : 1,
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    Icon(icon, size: 18, color: isSelected ? Colors.blue : Colors.grey),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(label, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: isSelected ? Colors.blue : Colors.black87)),
+                          Text(address, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+                        ],
+                      ),
+                    ),
+                    if (isSelected)
+                      const Icon(Icons.check_circle, color: Colors.blue, size: 18),
+                  ],
+                ),
+              ),
+            );
+          }),
+
+          // 自定义选项
+          Container(
+            margin: const EdgeInsets.only(bottom: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: _currentPreset == ServerPreset.custom ? Colors.blue.withValues(alpha: 0.08) : Colors.grey.withValues(alpha: 0.05),
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(
+                color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.grey.shade300,
+                width: _currentPreset == ServerPreset.custom ? 1.5 : 1,
+              ),
+            ),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                InkWell(
+                  onTap: () => _onPresetChanged(ServerPreset.custom),
+                  child: Row(
+                    children: [
+                      Icon(Icons.edit_rounded, size: 18, color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.grey),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          tr(ref, 'Custom', '自定义'),
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.black87),
+                        ),
+                      ),
+                      if (_currentPreset == ServerPreset.custom)
+                        const Icon(Icons.check_circle, color: Colors.blue, size: 18),
+                    ],
+                  ),
+                ),
+                if (_currentPreset == ServerPreset.custom) ...[
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        flex: 2,
+                        child: TextField(
+                          controller: TextEditingController(text: _customHost),
+                          decoration: InputDecoration(
+                            hintText: 'IP / Host',
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          style: const TextStyle(fontSize: 13),
+                          onChanged: (v) => _customHost = v,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      const Text(':', style: TextStyle(fontSize: 16)),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: TextField(
+                          controller: TextEditingController(text: _customPort),
+                          decoration: InputDecoration(
+                            hintText: 'Port',
+                            isDense: true,
+                            contentPadding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                            border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
+                          ),
+                          style: const TextStyle(fontSize: 13),
+                          keyboardType: TextInputType.number,
+                          onChanged: (v) => _customPort = v,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      ElevatedButton(
+                        onPressed: _onCustomApply,
+                        style: ElevatedButton.styleFrom(
+                          backgroundColor: Colors.blue,
+                          foregroundColor: Colors.white,
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                          minimumSize: Size.zero,
+                          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                        ),
+                        child: Text(tr(ref, 'Apply', '应用'), style: const TextStyle(fontSize: 13)),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }

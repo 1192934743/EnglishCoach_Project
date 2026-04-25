@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/logging/app_logger.dart';
+import 'core/network/backend_config.dart';
 import 'core/providers/settings_provider.dart';
 import 'features/chat/presentation/chat_screen.dart';
 import 'features/chat/providers/chat_provider.dart';
@@ -17,6 +18,9 @@ void main() async {
   // 初始化日志系统
   await AppLogger.instance.init();
   AppLogger.instance.info('App started');
+
+  // 初始化服务器配置（加载持久化的预设）
+  await initServerConfig();
 
   runApp(const ProviderScope(child: EnglishCoachApp()));
 }

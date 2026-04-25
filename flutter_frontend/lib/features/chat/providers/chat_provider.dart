@@ -145,7 +145,7 @@ class ChatNotifier extends Notifier<ChatState> {
 
     _initAudioSessionAndPlayer();
     _initWebSocketListeners();
-    Future.delayed(const Duration(milliseconds: 500), () => warmUpConnection());
+    warmUpConnection();
 
     final wsClient = ref.read(websocketProvider);
     _connectionSubscription = wsClient.connectionStateStream.listen((
@@ -186,16 +186,36 @@ class ChatNotifier extends Notifier<ChatState> {
 
   Future<void> warmUpConnection() async {
     await ref.read(settingsProvider.notifier).ensureInitialized();
+    final settings = ref.read(settingsProvider);
 
-    // 静默预热 VAD 模型（不阻塞主线程）
-    final currentVadTimeout = ref.read(settingsProvider).vadTimeout;
-    _vadService.initialize(silenceThresholdMs: currentVadTimeout).then((_) {
-      debugPrint('[VAD] 后台预热加载完毕，随时可以秒开录音');
-    });
+    debugPrint('[Warmup] 🚀 开始并行预热引擎...');
 
-    final wsClient = ref.read(websocketProvider);
+    await Future.wait([
+      // 任务1：VAD 纯本地加载，极少失败，但加上兜底
+      _vadService.initialize(silenceThresholdMs: settings.vadTimeout).catchError((e) {
+        debugPrint('[Warmup] ⚠️ VAD 初始化异常: $e');
+      }),
+
+      // 任务2：音频系统配置
+      _initAudioSessionAndPlayer().catchError((e) {
+        debugPrint('[Warmup] ⚠️ AudioSession 异常: $e');
+      }),
+
+      // 任务3：WebSocket 建连（最容易因为网络波动）
+      ref.read(websocketProvider).connect().catchError((e) {
+        debugPrint('[Warmup] ⚠️ WebSocket 初始连线失败 (将由断线重连机制接管): $e');
+      }),
+    ]);
+
+    debugPrint('[Warmup] ✅ 底层并行加载结束');
+
+    // Fire and forget: 同步 LMS 设置
+    _syncLmsSettings();
+  }
+
+  Future<void> _syncLmsSettings() async {
     try {
-      await wsClient.connect();
+      final wsClient = ref.read(websocketProvider);
       final userId = await UserManager.getOrCreateUuid();
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
       await Future<void>.delayed(const Duration(milliseconds: 200));

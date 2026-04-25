@@ -61,6 +61,13 @@ class WebSocketClient {
 
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_url));
+      await _channel!.ready.timeout(
+        const Duration(seconds: 8),
+        onTimeout: () {
+          _channel?.sink.close(1008, 'connection timeout');
+          throw TimeoutException('WebSocket handshake timeout');
+        },
+      );
       _channel!.stream.listen(
         _onMessage,
         onError: (error) => _onLostConnection('error: $error'),
