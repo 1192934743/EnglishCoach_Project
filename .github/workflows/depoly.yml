@@ -1,0 +1,41 @@
+name: Azure VM Auto Deploy
+
+# 只有当代码 push 到 azure 分支时才触发
+on:
+  push:
+    branches:
+      - azure
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Execute Remote SSH Commands
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.AZURE_VM_HOST }}
+          username: ${{ secrets.AZURE_VM_USER }}
+          key: ${{ secrets.AZURE_VM_SSH_KEY }}
+          # 如果你的 SSH 端口不是 22，请在这里指定
+          port: 22
+          script: |
+            # 1. 进入项目目录
+            cd /home/ubuntu/EnglishCoach_Project
+
+            # 2. 拉取最新代码
+            git pull origin azure
+
+            # 3. 自动化部署 (核心步骤)
+            # --build: 表示如果代码变了，重新构建镜像
+            # -d: 后台运行
+            # backend: 仅针对你命令中指定的 backend 服务进行更新，不影响其他服务
+            sudo docker compose up -d --build backend
+
+            # 4. (可选) 清理无用的旧镜像，释放磁盘空间
+            # sudo docker image prune -f
+
+            echo "🚀 Docker container 'backend' has been updated and restarted!"

@@ -66,9 +66,15 @@ docker compose ps
 
 # 查看实时日志
 docker compose logs -f backend
+sudo docker compose logs --tail=50 backend
+
+# 启动容器
+sudo docker compose up -d backend
 
 # 停止容器
 docker compose down
+
+sudo docker compose build --no-cache backend
 
 # 重新部署
 ./deploy.sh <branch>
