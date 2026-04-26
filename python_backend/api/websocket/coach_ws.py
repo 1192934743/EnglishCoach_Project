@@ -10,7 +10,8 @@ from fastapi.concurrency import run_in_threadpool
 
 # --- 引入我们前两阶段拆分好的底层设施 ---
 from core.config import CONFIG, TEACHING_CONFIG, LLM_MAX_TOKENS, MAX_AUDIO_BYTES, DEFAULT_TOPIC_ID
-from infrastructure.llm.client import client, warm_deepseek_connection
+from infrastructure.llm.client import warm_llm_connection
+from infrastructure.llm import llm_router
 from core.telemetry import _latency_log, _coerce_turn_trace_id, _e2e_log_client_report
 from api.dependencies import get_db
 from application.services.user_service import (
@@ -66,12 +67,14 @@ async def _run_background_evaluator(
     feedback_data = None
     try:
         # 强制要求副 LLM 输出工具 JSON，保证 99.9% 稳定性
-        response = await client.chat.completions.create(
-            model="deepseek-chat",
+        # 使用 stream=False，直接获取完整响应
+        response = await llm_router.chat(
             messages=eval_messages,
+            model=None,  # 副 LLM 始终走自动容灾，不受开发者模式影响
             tools=EVALUATOR_TOOLS,
             tool_choice={"type": "function", "function": {"name": "submit_analysis_and_feedback"}},
             max_tokens=400,
+            stream=False,  # 副 LLM 不需要流式
         )
         msg = response.choices[0].message
         if msg.tool_calls:
@@ -108,7 +111,7 @@ async def _run_background_evaluator(
 async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None):
     await websocket.accept()
     logger.info(f"📱 客户端已连接: {websocket.client.host}")
-    asyncio.create_task(warm_deepseek_connection(f"ws_accept:{websocket.client.host}"))
+    asyncio.create_task(warm_llm_connection(f"ws_accept:{websocket.client.host}"))
 
     ws_lock = asyncio.Lock()
     audio_buffer = bytearray()
@@ -506,9 +509,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         nonlocal raw_full_reply, sentence_buffer
                         _latency_log(lat, "04_llm_api_request_start", chat_messages=len(messages_to_send))
 
+                        # 从 debug 参数获取模型（开发者模式），否则走自动容灾
+                        debug_info = data.get("debug", {}) if isinstance(data, dict) else {}
+                        debug_model = debug_info.get("model")
+
                         # 🚨 此处删除了 Tools 参数，完全让其自由对话
-                        response = await client.chat.completions.create(
-                            model="deepseek-chat",
+                        # 使用 llm_router 支持开发者模式和自动容灾
+                        response = await llm_router.chat(
+                            model=debug_model,
                             messages=messages_to_send,
                             max_tokens=LLM_MAX_TOKENS,
                             stream=True

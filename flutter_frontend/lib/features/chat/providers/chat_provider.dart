@@ -13,7 +13,8 @@ import 'package:uuid/uuid.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/network/user_manager.dart';
-import '../../../core/vad/silero_vad_service.dart'; // 引入自建的 VAD 服务
+import '../../../core/vad/silero_vad_service.dart';
+import '../../../core/config/dev_panel_config.dart';
 import '../models/session_report_model.dart';
 
 export '../models/session_report_model.dart';
@@ -592,12 +593,25 @@ class ChatNotifier extends Notifier<ChatState> {
       );
       _latencyLogClient('03_player_stream_ready');
       final userId = await UserManager.getOrCreateUuid();
-      final wallMs = DateTime.now().millisecondsSinceEpoch;
-      ref.read(websocketProvider).sendCommand("user_finish_speaking", {
+
+      // 构建消息，开发者模式携带 debug 参数
+      final message = <String, dynamic>{
         "user_id": userId,
         "trace_id": _latencyTurnId,
-        "client_submit_wall_ms": wallMs,
-      });
+        "client_submit_wall_ms": DateTime.now().millisecondsSinceEpoch,
+      };
+
+      // 检查开发者模式
+      final prefs = await SharedPreferences.getInstance();
+      final devModeEnabled = prefs.getBool(DevPanelConfig.devModeKey) ?? false;
+      if (devModeEnabled) {
+        final debugModel = prefs.getString(DevPanelConfig.llmModelKey);
+        if (debugModel != null && debugModel.isNotEmpty) {
+          message["debug"] = {"model": debugModel};
+        }
+      }
+
+      ref.read(websocketProvider).sendCommand("user_finish_speaking", message);
       _latencyLogClient('04_ws_user_finish_sent');
     } catch (_) {
       _latencySw = null;

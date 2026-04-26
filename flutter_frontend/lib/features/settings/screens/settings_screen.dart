@@ -5,14 +5,20 @@ import '../../../core/network/backend_config.dart';
 import '../../../core/network/server_debug_config.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
+import '../../../core/config/dev_panel_config.dart';
 import '../../chat/providers/chat_provider.dart';
 import '../../onboarding/onboarding_screen.dart';
 
-class SettingsScreen extends ConsumerWidget {
+class SettingsScreen extends ConsumerStatefulWidget {
   const SettingsScreen({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends ConsumerState<SettingsScreen> {
+  @override
+  Widget build(BuildContext context) {
     final settings = ref.watch(settingsProvider);
     final notifier = ref.read(settingsProvider.notifier);
     final chatNotifier = ref.read(chatProvider.notifier);
@@ -25,9 +31,9 @@ class SettingsScreen extends ConsumerWidget {
         child: ListView(
           padding: const EdgeInsets.all(20),
           children: [
-          // ── 服务器配置 ────────────────────────────────────────────────────────
-          _buildSectionTitle(tr(ref, "Server", "服务器"), baseSize),
-          _ServerSelector(
+          // ── 开发者模式面板 ─────────────────────────────────────────────────────
+          const SizedBox(height: 8),
+          _DevModePanel(
             onServerChanged: () {
               // 切换服务器后强制重连 WebSocket
               final wsClient = ref.read(websocketProvider);
@@ -615,6 +621,181 @@ class SettingsScreen extends ConsumerWidget {
   }
 }
 
+// ── 开发者模式面板 Widget ──────────────────────────────────────────────────────
+class _DevModePanel extends ConsumerStatefulWidget {
+  final VoidCallback onServerChanged;
+  const _DevModePanel({required this.onServerChanged});
+
+  @override
+  ConsumerState<_DevModePanel> createState() => _DevModePanelState();
+}
+
+class _DevModePanelState extends ConsumerState<_DevModePanel> {
+  bool _devModeEnabled = false;
+  String _selectedModel = 'deepseek-chat';
+  bool _initialized = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSettings();
+  }
+
+  Future<void> _loadSettings() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (mounted) {
+      setState(() {
+        _devModeEnabled = prefs.getBool(DevPanelConfig.devModeKey) ?? false;
+        final savedModel = prefs.getString(DevPanelConfig.llmModelKey) ?? 'deepseek-chat';
+        final availableModels = DevPanelConfig.panels[0].options ?? [];
+        _selectedModel = availableModels.contains(savedModel) ? savedModel : (availableModels.isNotEmpty ? availableModels.first : 'deepseek-chat');
+        _initialized = true;
+      });
+    }
+  }
+
+  Future<void> _saveDevMode(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(DevPanelConfig.devModeKey, value);
+    setState(() => _devModeEnabled = value);
+  }
+
+  Future<void> _saveModel(String model) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(DevPanelConfig.llmModelKey, model);
+    setState(() => _selectedModel = model);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (!_initialized) {
+      return const SizedBox.shrink();
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        _buildSectionTitle('开发者模式', 14),
+        Container(
+          decoration: BoxDecoration(
+            color: Colors.white,
+            borderRadius: BorderRadius.circular(16),
+            border: Border.all(color: Colors.orange.shade200, width: 1.5),
+          ),
+          child: Column(
+            children: [
+              SwitchListTile(
+                secondary: Icon(Icons.bug_report_rounded, color: Colors.orange.shade700),
+                title: const Text(
+                  '开发者模式',
+                  style: TextStyle(fontWeight: FontWeight.bold),
+                ),
+                subtitle: const Text(
+                  '开启后可调试 LLM 模型配置',
+                  style: TextStyle(fontSize: 12),
+                ),
+                value: _devModeEnabled,
+                activeColor: Colors.orange,
+                onChanged: _saveDevMode,
+              ),
+              if (_devModeEnabled) ...[
+                const Divider(height: 1),
+                Padding(
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        '调试选项',
+                        style: TextStyle(
+                          fontWeight: FontWeight.w600,
+                          fontSize: 13,
+                          color: Colors.grey,
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      // LLM 模型选择
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        leading: Icon(
+                          DevPanelConfig.panels[0].icon,
+                          color: DevPanelConfig.panels[0].iconColor,
+                        ),
+                        title: Text(
+                          DevPanelConfig.panels[0].label,
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                        subtitle: Text(
+                          DevPanelConfig.panels[0].subtitle ?? '',
+                          style: const TextStyle(fontSize: 11),
+                        ),
+                        trailing: DropdownButton<String>(
+                          value: _selectedModel,
+                          underline: const SizedBox(),
+                          items: DevPanelConfig.panels[0].options!
+                              .map((m) => DropdownMenuItem(
+                                    value: m,
+                                    child: Text(m, style: const TextStyle(fontSize: 12)),
+                                  ))
+                              .toList(),
+                          onChanged: (v) {
+                            if (v != null) _saveModel(v);
+                          },
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      // 服务器配置
+                      _ServerSelector(
+                        onServerChanged: widget.onServerChanged,
+                      ),
+                      const SizedBox(height: 8),
+                      Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.orange.shade50,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.orange.shade200),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(Icons.info_outline, size: 16, color: Colors.orange.shade700),
+                            const SizedBox(width: 8),
+                            Expanded(
+                              child: Text(
+                                '开发者模式不走容灾，直接调用指定模型',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: Colors.orange.shade900,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSectionTitle(String title, double baseSize) => Padding(
+    padding: const EdgeInsets.only(bottom: 10, left: 5),
+    child: Text(
+      title,
+      style: TextStyle(
+        fontWeight: FontWeight.bold,
+        color: Colors.orange.shade700,
+        fontSize: baseSize,
+      ),
+    ),
+  );
+}
+
 // ── 服务器选择器 Widget ──────────────────────────────────────────────────────
 class _ServerSelector extends ConsumerStatefulWidget {
   final VoidCallback onServerChanged;
@@ -706,8 +887,8 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
+        color: Colors.grey.shade50,
+        borderRadius: BorderRadius.circular(12),
         border: Border.all(color: Colors.grey.shade200),
       ),
       child: Column(

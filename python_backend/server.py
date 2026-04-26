@@ -6,7 +6,7 @@ from fastapi.concurrency import run_in_threadpool
 
 # --- 引入配置与预热 ---
 from core.config import logger, CONFIG
-from infrastructure.llm.client import client, warm_deepseek_connection
+from infrastructure.llm.client import warm_llm_connection
 from infrastructure.tts import init_tts_factory, get_tts_factory
 
 # --- 引入拆分好的路由 ---
@@ -26,8 +26,8 @@ async def lifespan(app: FastAPI):
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
 
-    await warm_deepseek_connection("server_startup")
-    logger.info("🔊 DeepSeek LLM connection warmed up.")
+    await warm_llm_connection("server_startup")
+    logger.info("🔊 LLM connection warmed up.")
 
     # Initialize TTS factory and pool
     init_tts_factory(CONFIG)

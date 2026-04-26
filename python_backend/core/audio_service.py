@@ -919,6 +919,20 @@ class TTSPool:
             logger.warning(f"[TTSPool] 建连异常: {e}")
         return None
 
+    async def _replenish_one(self) -> None:
+        """后台异步补充一条新连接"""
+        if self._closed:
+            return
+        try:
+            conn = await self._build_one_connection()
+            if conn is not None:
+                await self._idle.put(conn)
+                logger.debug(f"[TTSPool] 补充连接成功: {conn.connect_id[:8]}")
+            else:
+                logger.warning("[TTSPool] 补充连接失败，将在下次取用时重试")
+        except Exception as e:
+            logger.warning(f"[TTSPool] 补充连接异常: {e}")
+
     async def acquire(self) -> _WarmTTSConnection:
         """获取一条就绪连接（已在 ConnectionStarted 状态）。若池为空则新建一条（同步等待）。"""
         if self._closed:
@@ -927,8 +941,9 @@ class TTSPool:
             try:
                 conn = self._idle.get_nowait()
                 if time.monotonic() - conn.created_at > _TTS_WARM_TIMEOUT_SEC:
-                    logger.debug(f"[TTSPool] 连接过期，丢弃并重建: {conn.connect_id[:8]}")
+                    logger.debug(f"[TTSPool] 连接过期，丢弃并补充: {conn.connect_id[:8]}")
                     await self._close_one(conn)
+                    asyncio.create_task(self._replenish_one())
                     continue
                 self._in_use += 1
                 return conn
@@ -955,11 +970,12 @@ class TTSPool:
         try:
             await asyncio.wait_for(conn.ws.ping(), timeout=3.0)
         except Exception:
-            logger.debug(f"[TTSPool] 连接已失效，丢弃: {conn.connect_id[:8]}")
+            logger.debug(f"[TTSPool] 连接已失效，丢弃并补充: {conn.connect_id[:8]}")
             await self._close_one(conn)
             async with self._lock:
                 if self._total_created > 0:
                     self._total_created -= 1
+            asyncio.create_task(self._replenish_one())
             return
         await self._idle.put(conn)
 
@@ -1162,6 +1178,7 @@ async def iter_tts_pcm_chunks(
                                 "format": "pcm",
                                 "sample_rate": 24000,
                                 "enable_timestamp": True,
+                                "loudness_rate": 100,
                             },
                             "additions": json.dumps({
                                 "disable_markdown_filter": False,
@@ -1215,6 +1232,7 @@ async def iter_tts_pcm_chunks(
                         "format": "pcm",
                         "sample_rate": 24000,
                         "enable_timestamp": True,
+                        "loudness_rate": 100,
                     },
                     "additions": json.dumps({
                         "disable_markdown_filter": False,
@@ -1312,6 +1330,7 @@ async def run_tts_turn_reused_from_queue(
                 "format": "pcm",
                 "sample_rate": 24000,
                 "enable_timestamp": True,
+                "loudness_rate": 100,
             },
             "additions": json.dumps({
                 "disable_markdown_filter": False,

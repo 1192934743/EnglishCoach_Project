@@ -37,6 +37,10 @@ CONFIG = {
     "DEFAULT_TTS_ENGINE": os.getenv("DEFAULT_TTS_ENGINE", "azure"),
     "AZURE_VOICE": os.getenv("AZURE_VOICE", "en-GB-RyanNeural"),
     "VOLC_VOICE": os.getenv("VOLC_VOICE", "en_male_tim_uranus_bigtts"),
+    # Doubao LLM Configuration
+    "DOUBAO_ARK_KEY": os.getenv("VOLC_ARK_API_KEY"),
+    "DOUBAO_MODEL": os.getenv("DOUBAO_MODEL", "doubao-seed-2-0-pro-260215"),
+    "DOUBAO_BASE": "https://ark.cn-beijing.volces.com/api/v3",
 }
 
 if not CONFIG["DEEPSEEK_KEY"] or not CONFIG["VOLC_API_KEY"]:
