@@ -1,7 +1,7 @@
 """
 TopicProvider — 话题 / 场景数据来源抽象接口（Phase 3 预留）
 
-当前实现：JsonFileTopicProvider（读 scenes.json，永久解锁）。
+当前实现：DatabaseTopicProvider（读 Topic DB，已完成迁移）。
 未来可替换为：RemoteCMSTopicProvider / DatabaseTopicProvider，
 调用方（dialogue_engine / server）无需改动。
 """

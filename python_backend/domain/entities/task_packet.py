@@ -4,7 +4,7 @@ TaskPacket — LMS 与对话引擎之间的唯一契约
 职责分工：
 - LMS（session_planner.py）负责构建 TaskPacket
 - 对话引擎（dialogue_engine.py）只负责消费 TaskPacket，不做任何学习决策
-- 一旦 TaskPacket 传入 build_dynamic_prompt，引擎就不再读取 scenes.json
+- 一旦 TaskPacket 传入 build_prompts，引擎不读取任何 JSON 配置文件
 
 字段设计原则：
 - 所有字段均有默认值，确保部分字段缺失时系统能降级运行

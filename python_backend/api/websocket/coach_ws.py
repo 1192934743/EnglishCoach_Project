@@ -160,6 +160,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         mastery_snapshot = await run_in_threadpool(
             _take_mastery_snapshot, current_user.id, current_task_packet
         )
+    else:
+        from database import SessionLocal as _DB
+        _db = _DB()
+        try:
+            current_task_packet = session_planner._fallback_task_packet(_db)
+        finally:
+            _db.close()
+        mastery_snapshot = {}
 
     topic_id_for_progress = (
         current_task_packet.topic_id
@@ -283,6 +291,41 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         current_user = await run_in_threadpool(init_or_get_user, current_user.id)
                         static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
                         chat_history[0]["content"] = static_sys
+                    continue
+
+                if action == "switch_topic":
+                    topic_id = data.get("topic_id")
+                    if topic_id and current_user:
+                        try:
+                            current_task_packet = await run_in_threadpool(
+                                session_planner.build_task_packet_for_topic,
+                                current_user.id,
+                                topic_id
+                            )
+                            if current_task_packet:
+                                topic_id_for_progress = current_task_packet.topic_id
+                                session_id = str(uuid.uuid4())
+                                session_hits.clear()
+                                session_transcript.clear()
+                                session_ctx = SessionContext()
+                                mastery_snapshot = await run_in_threadpool(
+                                    _take_mastery_snapshot, current_user.id, current_task_packet
+                                )
+                                static_sys, dynamic_turn = build_prompts(
+                                    current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                                )
+                                chat_history = [{"role": "system", "content": static_sys}]
+                                await safe_send_ws(websocket, ws_lock, {
+                                    "event": "topic_changed",
+                                    "topic_id": current_task_packet.topic_id,
+                                    "topic_title": current_task_packet.topic_title,
+                                    "topic_title_zh": getattr(current_task_packet, "topic_title_zh", None) or "",
+                                    "role_name": current_task_packet.role_name,
+                                    "depth_tier": current_task_packet.depth_tier,
+                                    "session_id": session_id,
+                                })
+                        except Exception as e:
+                            logger.error(f"[SwitchTopic] Failed: {e}", exc_info=True)
                     continue
 
                 if action == "request_topic":

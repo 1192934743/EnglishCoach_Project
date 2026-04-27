@@ -38,7 +38,6 @@ ROUNDS_PER_LEVEL = 3  # 每个段位需要完成的局数
 MAX_TURNS_PER_PHASE = 25  # 兜底机制：每个阶段最大互动轮数，超时强制推进
 
 _BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))  # python_backend/
-SCENES_FILE_PATH = os.path.join(_BACKEND_DIR, "scenes.json")
 GLOBAL_RULES_FILE_PATH = os.path.join(_BACKEND_DIR, "prompts", "global_rules.json")
 
 EVENT_POOL = [
@@ -143,23 +142,7 @@ Scene: {{ scene_name }}
 
 # ================= 辅助工具 =================
 
-def load_active_scene(file_path=SCENES_FILE_PATH):
-    """动态读取场景，支持绝对路径与热更新，修改配置无需重启服务"""
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        active_id = data.get("current_active_id")
-        scene_info = data["templates"].get(active_id)
-        if not scene_info:
-            raise ValueError(f"Scene ID '{active_id}' not found.")
-        return scene_info
-    except Exception as e:
-        logger.warning(f"⚠️ Could not load scenes.json ({e}). Using default.")
-        return {"scene": "McDonald's Ordering", "level": "Intermediate", "role": "McDonald's Cashier"}
-
-
 def load_global_rules(file_path=GLOBAL_RULES_FILE_PATH):
-    """加载全局 Prompt 配置，支持热更新；加载失败时返回空字典，prompt 降级但不崩溃"""
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -232,26 +215,21 @@ def build_prompts(
         session_hits: Optional[set] = None,
 ) -> Tuple[str, str]:
     """构建发给主 LLM（演员）的 Prompt"""
+    if task_packet is None:
+        raise ValueError("build_prompts requires a non-None TaskPacket. "
+                         "Callers must ensure task_packet is set before invoking this function.")
+
     rules = load_global_rules()
     if session_hits is None:
         session_hits = set()
 
     # 1. 提取基础变量
-    if task_packet is not None:
-        scene_name = task_packet.scene_prompt
-        role_name = task_packet.role_name
-        user_level = task_packet.learner_level
-        scene_specific_rules = task_packet.scene_specific_rules
-        depth_tier_val = int(task_packet.depth_tier or 1)
-        session_goal_line = (f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else "")
-    else:
-        active_scene = load_active_scene()
-        scene_name = active_scene.get("scene", "Daily Conversation")
-        role_name = active_scene.get("role", "Assistant")
-        user_level = active_scene.get("level", "Intermediate")
-        scene_specific_rules = active_scene.get("scene_specific_rules", [])
-        session_goal_line = ""
-        depth_tier_val = 1
+    scene_name = task_packet.scene_prompt
+    role_name = task_packet.role_name
+    user_level = task_packet.learner_level
+    scene_specific_rules = task_packet.scene_specific_rules
+    depth_tier_val = int(task_packet.depth_tier or 1)
+    session_goal_line = (f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else "")
 
     settings_dict = (user.settings or {}) if user and getattr(user, "settings", None) else None
     canonical_level = effective_learner_label(settings_dict, task_packet.learner_level if task_packet else None,
@@ -324,7 +302,7 @@ def build_prompts(
 def build_evaluator_prompt(session_ctx: dict, task_packet: Optional[TaskPacket] = None) -> str:
     """构建发给旁路副 LLM（导演）的系统 Prompt"""
     phase = session_ctx.get("phase", "ICE_BREAKING")
-    scene_name = task_packet.scene_prompt if task_packet else load_active_scene().get("scene", "Conversation")
+    scene_name = task_packet.scene_prompt if task_packet else "Conversation"
     return EVALUATOR_SYSTEM_TEMPLATE.render(phase=phase, scene_name=scene_name)
 
 
