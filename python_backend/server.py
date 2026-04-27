@@ -17,12 +17,14 @@ from api.websocket.coach_ws import router as ws_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # --- Startup ---
-    from database import ensure_schema_upgrades, Base, engine
+    from database import ensure_schema_upgrades, init_db, Base, engine
     import application.services.session_planner as session_planner
 
     # 首次启动时确保所有表存在（不会删旧数据）
     Base.metadata.create_all(bind=engine)
     await run_in_threadpool(ensure_schema_upgrades)
+    # 如果数据库为空，自动初始化种子话题
+    await run_in_threadpool(init_db)
     await run_in_threadpool(session_planner.warm_up)
     logger.info("🧠 SessionPlanner VectorStore 已就绪。")
 

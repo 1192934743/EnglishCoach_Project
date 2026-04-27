@@ -239,49 +239,63 @@ class LearningSession(Base):
     session_summary = Column(JSON, nullable=True)
 
 
-def init_db():
+def init_db(safe: bool = True):
     """
-    重建数据库并注入完整的种子数据（含新 LMS 字段）。
-    调用前请删除旧的 english_coach.db 文件。
-    """
-    print("[INFO] Rebuilding database with LMS schema...")
-    Base.metadata.create_all(bind=engine)
-    db = SessionLocal()
+    初始化数据库并注入种子数据。
 
-    # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
-    mcdonalds = Topic(
-        title="McDonald's Ordering",
-        title_zh="麦当劳点餐",
-        category="Food & Drink",
-        role_name="Fast-food Server",
-        learner_level="Beginner",
-        voice="Stanley",
-        system_prompt=(
-            "You are a friendly fast-food server at McDonald's drive-thru. "
-            "Follow the specific persona instructions provided in the dynamic prompt."
-        ),
-        vocab_tags=["burger", "fries", "combo", "meal", "drink", "order", "receipt", "change"],
-        sentence_patterns=[
-            "I would like to order",
-            "Can I get",
-            "for here or to go",
-            "Would you like to upsize",
-            "That will be",
-        ],
-        scene_specific_rules=[
-            "If the user says they are not hungry or do not want food, suggest a small side item or a drink instead of ending the conversation.",
-            "Always confirm the complete order before proceeding to payment.",
-            "If the user's order is unclear, politely ask them to repeat or clarify each item.",
-        ],
-        difficulty_tiers={
-            "1": {"rules": ["Focus only on basic food ordering vocabulary. Keep sentences short."]},
-            "2": {"rules": ["Introduce combo meals, upsizing, and payment options."]},
-            "3": {"rules": ["Add dietary restrictions, customizations, and complaint handling."]},
-        },
-    )
-    db.add(mcdonalds)
-    db.commit()
-    db.refresh(mcdonalds)
+    Args:
+        safe: True 时为幂等模式——若已有话题则跳过；False 时强制重建（会清空数据）。
+    """
+    db = SessionLocal()
+    try:
+        existing_count = db.query(Topic).count()
+        if existing_count > 0:
+            print(f"[INFO] DB already has {existing_count} topics, skipping init_db (safe mode).")
+            return
+        if safe:
+            print("[INFO] init_db: topics exist, skipping seed.")
+            return
+
+        print("[INFO] Rebuilding database with LMS schema...")
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
+        db.close()
+        db = SessionLocal()
+
+        # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
+        mcdonalds = Topic(
+            title="McDonald's Ordering",
+            title_zh="麦当劳点餐",
+            category="Food & Drink",
+            role_name="Fast-food Server",
+            learner_level="Beginner",
+            voice="Stanley",
+            system_prompt=(
+                "You are a friendly fast-food server at McDonald's drive-thru. "
+                "Follow the specific persona instructions provided in the dynamic prompt."
+            ),
+            vocab_tags=["burger", "fries", "combo", "meal", "drink", "order", "receipt", "change"],
+            sentence_patterns=[
+                "I would like to order",
+                "Can I get",
+                "for here or to go",
+                "Would you like to upsize",
+                "That will be",
+            ],
+            scene_specific_rules=[
+                "If the user says they are not hungry or do not want food, suggest a small side item or a drink instead of ending the conversation.",
+                "Always confirm the complete order before proceeding to payment.",
+                "If the user's order is unclear, politely ask them to repeat or clarify each item.",
+            ],
+            difficulty_tiers={
+                "1": {"rules": ["Focus only on basic food ordering vocabulary. Keep sentences short."]},
+                "2": {"rules": ["Introduce combo meals, upsizing, and payment options."]},
+                "3": {"rules": ["Add dietary restrictions, customizations, and complaint handling."]},
+            },
+        )
+        db.add(mcdonalds)
+        db.commit()
+        db.refresh(mcdonalds)
 
     nodes_mcdonalds = [
         # depth_level=1: 绝对基础，第一次练习必须覆盖
@@ -390,8 +404,9 @@ def init_db():
     db.add_all(nodes_casual)
 
     db.commit()
-    db.close()
     print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
+    finally:
+        db.close()
 
 
 # 旧库升级 / API 展示：英文 canonical 标题 → 中文名（与 Flutter `_kTopicTitleZh` 对齐）
