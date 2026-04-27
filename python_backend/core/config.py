@@ -43,9 +43,13 @@ CONFIG = {
     "DOUBAO_BASE": "https://ark.cn-beijing.volces.com/api/v3",
 }
 
-if not CONFIG["DEEPSEEK_KEY"] or not CONFIG["VOLC_API_KEY"]:
-    logger.error("🚨 致命错误: 缺少必要的环境变量 (DEEPSEEK_KEY 或 VOLC_API_KEY)。请检查 config.env 文件。")
+if not CONFIG.get("DOUBAO_ARK_KEY"):
+    logger.error("🚨 致命错误: 缺少必要的环境变量 (VOLC_ARK_API_KEY / DOUBAO_ARK_KEY)。请检查 config.env 文件。")
     raise RuntimeError("Missing essential API keys in config.")
+
+# 保留 DEEPSEEK_KEY 检查（备用）
+if not CONFIG.get("DEEPSEEK_KEY"):
+    logger.warning("⚠️ 未设置 DEEPSEEK_KEY：DeepSeek 备用 LLM 将不可用。")
 
 if not CONFIG.get("VOLC_RESOURCE_ID_ASR"):
     logger.warning("⚠️ 未设置 VOLC_RESOURCE_ID（ASR）：语音转写将在调用时失败，请检查 config.env。")
