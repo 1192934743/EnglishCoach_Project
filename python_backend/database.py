@@ -249,18 +249,17 @@ def init_db(safe: bool = True):
     db = SessionLocal()
     try:
         existing_count = db.query(Topic).count()
-        if existing_count > 0:
+
+        if existing_count > 0 and safe:
             print(f"[INFO] DB already has {existing_count} topics, skipping init_db (safe mode).")
             return
-        if safe:
-            print("[INFO] init_db: topics exist, skipping seed.")
-            return
 
-        print("[INFO] Rebuilding database with LMS schema...")
-        Base.metadata.drop_all(bind=engine)
-        Base.metadata.create_all(bind=engine)
-        db.close()
-        db = SessionLocal()
+        if not safe:
+            print("[INFO] Rebuilding database with LMS schema...")
+            Base.metadata.drop_all(bind=engine)
+            Base.metadata.create_all(bind=engine)
+            db.close()
+            db = SessionLocal()
 
         # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
         mcdonalds = Topic(
