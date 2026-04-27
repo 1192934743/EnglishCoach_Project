@@ -296,114 +296,114 @@ def init_db(safe: bool = True):
         db.commit()
         db.refresh(mcdonalds)
 
-    nodes_mcdonalds = [
-        # depth_level=1: 绝对基础，第一次练习必须覆盖
-        TargetNode(topic_id=mcdonalds.id, node_text="burger", node_type="word", depth_level=1, weight=1.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="fries", node_type="word", depth_level=1, weight=1.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="I would like to order", node_type="sentence", depth_level=1, weight=3.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="Can I get", node_type="phrase", depth_level=1, weight=2.0),
-        # depth_level=2: 进阶表达，掌握 tier-1 后解锁
-        TargetNode(topic_id=mcdonalds.id, node_text="for here or to go", node_type="phrase", depth_level=2, weight=2.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="combo meal", node_type="phrase", depth_level=2, weight=2.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="upsize", node_type="word", depth_level=2, weight=1.5),
-        # depth_level=3: 高阶，能处理意外情况
-        TargetNode(topic_id=mcdonalds.id, node_text="I have a food allergy", node_type="sentence", depth_level=3, weight=2.0),
-        TargetNode(topic_id=mcdonalds.id, node_text="Could you make that without", node_type="phrase", depth_level=3, weight=2.0),
-    ]
-    db.add_all(nodes_mcdonalds)
+        nodes_mcdonalds = [
+            # depth_level=1: 绝对基础，第一次练习必须覆盖
+            TargetNode(topic_id=mcdonalds.id, node_text="burger", node_type="word", depth_level=1, weight=1.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="fries", node_type="word", depth_level=1, weight=1.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="I would like to order", node_type="sentence", depth_level=1, weight=3.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="Can I get", node_type="phrase", depth_level=1, weight=2.0),
+            # depth_level=2: 进阶表达，掌握 tier-1 后解锁
+            TargetNode(topic_id=mcdonalds.id, node_text="for here or to go", node_type="phrase", depth_level=2, weight=2.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="combo meal", node_type="phrase", depth_level=2, weight=2.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="upsize", node_type="word", depth_level=2, weight=1.5),
+            # depth_level=3: 高阶，能处理意外情况
+            TargetNode(topic_id=mcdonalds.id, node_text="I have a food allergy", node_type="sentence", depth_level=3, weight=2.0),
+            TargetNode(topic_id=mcdonalds.id, node_text="Could you make that without", node_type="phrase", depth_level=3, weight=2.0),
+        ]
+        db.add_all(nodes_mcdonalds)
 
-    # ── 话题2：技术面试（专业级）────────────────────────────────────────────
-    interview = Topic(
-        title="Technical Job Interview",
-        title_zh="技术岗位面试",
-        category="Career & Professional",
-        role_name="Senior Tech Lead",
-        learner_level="Professional",
-        voice="Stanley",
-        system_prompt=(
-            "You are conducting a technical interview for a Python Algorithm Engineer position. "
-            "Follow the specific persona instructions provided in the dynamic prompt."
-        ),
-        vocab_tags=["algorithm", "complexity", "optimize", "implement", "trade-off", "scalable", "edge case"],
-        sentence_patterns=[
-            "Could you walk me through your approach",
-            "What is the time complexity",
-            "How would you handle edge cases",
-            "In my experience",
-            "I would approach this by",
-        ],
-        scene_specific_rules=[
-            "If the user gives a one-word answer, probe for more detail: 'Could you walk me through your reasoning?'",
-            "Acknowledge correct technical answers with brief positive feedback before moving on.",
-            "If the user seems stuck, offer a single small hint rather than giving the full answer.",
-        ],
-        difficulty_tiers={
-            "1": {"rules": ["Ask simple behavioral questions. Focus on past experience."]},
-            "2": {"rules": ["Introduce algorithm questions. Expect Big-O analysis."]},
-            "3": {"rules": ["Add system design questions. Expect trade-off discussions."]},
-        },
-    )
-    db.add(interview)
-    db.commit()
-    db.refresh(interview)
+        # ── 话题2：技术面试（专业级）────────────────────────────────────────────
+        interview = Topic(
+            title="Technical Job Interview",
+            title_zh="技术岗位面试",
+            category="Career & Professional",
+            role_name="Senior Tech Lead",
+            learner_level="Professional",
+            voice="Stanley",
+            system_prompt=(
+                "You are conducting a technical interview for a Python Algorithm Engineer position. "
+                "Follow the specific persona instructions provided in the dynamic prompt."
+            ),
+            vocab_tags=["algorithm", "complexity", "optimize", "implement", "trade-off", "scalable", "edge case"],
+            sentence_patterns=[
+                "Could you walk me through your approach",
+                "What is the time complexity",
+                "How would you handle edge cases",
+                "In my experience",
+                "I would approach this by",
+            ],
+            scene_specific_rules=[
+                "If the user gives a one-word answer, probe for more detail: 'Could you walk me through your reasoning?'",
+                "Acknowledge correct technical answers with brief positive feedback before moving on.",
+                "If the user seems stuck, offer a single small hint rather than giving the full answer.",
+            ],
+            difficulty_tiers={
+                "1": {"rules": ["Ask simple behavioral questions. Focus on past experience."]},
+                "2": {"rules": ["Introduce algorithm questions. Expect Big-O analysis."]},
+                "3": {"rules": ["Add system design questions. Expect trade-off discussions."]},
+            },
+        )
+        db.add(interview)
+        db.commit()
+        db.refresh(interview)
 
-    nodes_interview = [
-        TargetNode(topic_id=interview.id, node_text="In my experience", node_type="phrase", depth_level=1, weight=2.0),
-        TargetNode(topic_id=interview.id, node_text="I would approach this by", node_type="sentence", depth_level=1, weight=3.0),
-        TargetNode(topic_id=interview.id, node_text="time complexity", node_type="phrase", depth_level=2, weight=2.5),
-        TargetNode(topic_id=interview.id, node_text="edge case", node_type="phrase", depth_level=2, weight=2.0),
-        TargetNode(topic_id=interview.id, node_text="trade-off", node_type="word", depth_level=2, weight=2.0),
-        TargetNode(topic_id=interview.id, node_text="scalable", node_type="word", depth_level=3, weight=1.5),
-        TargetNode(topic_id=interview.id, node_text="bottleneck", node_type="word", depth_level=3, weight=1.5),
-    ]
-    db.add_all(nodes_interview)
+        nodes_interview = [
+            TargetNode(topic_id=interview.id, node_text="In my experience", node_type="phrase", depth_level=1, weight=2.0),
+            TargetNode(topic_id=interview.id, node_text="I would approach this by", node_type="sentence", depth_level=1, weight=3.0),
+            TargetNode(topic_id=interview.id, node_text="time complexity", node_type="phrase", depth_level=2, weight=2.5),
+            TargetNode(topic_id=interview.id, node_text="edge case", node_type="phrase", depth_level=2, weight=2.0),
+            TargetNode(topic_id=interview.id, node_text="trade-off", node_type="word", depth_level=2, weight=2.0),
+            TargetNode(topic_id=interview.id, node_text="scalable", node_type="word", depth_level=3, weight=1.5),
+            TargetNode(topic_id=interview.id, node_text="bottleneck", node_type="word", depth_level=3, weight=1.5),
+        ]
+        db.add_all(nodes_interview)
 
-    # ── 话题3：日常闲聊（中级）──────────────────────────────────────────────
-    casual = Topic(
-        title="Daily Casual Conversation",
-        title_zh="日常闲聊",
-        category="Daily Life",
-        role_name="Language Partner",
-        learner_level="Intermediate",
-        voice="Stanley",
-        system_prompt=(
-            "You are a friendly British language partner practicing daily conversation. "
-            "Follow the specific persona instructions provided in the dynamic prompt."
-        ),
-        vocab_tags=["weekend", "hobby", "plan", "recommend", "prefer", "actually", "honestly"],
-        sentence_patterns=[
-            "What do you think about",
-            "To be honest",
-            "Have you ever tried",
-            "That reminds me of",
-            "I was wondering if",
-        ],
-        scene_specific_rules=[
-            "Occasionally echo back a rephrased version of what the user said to model natural British English.",
-            "If the user makes a grammatical error, gently model the correct version in your own reply without explicitly pointing it out.",
-        ],
-        difficulty_tiers={
-            "1": {"rules": ["Keep topics simple: weather, hobbies, food."]},
-            "2": {"rules": ["Discuss opinions, preferences, and past experiences."]},
-            "3": {"rules": ["Debate abstract topics, hypotheticals, and current events."]},
-        },
-    )
-    db.add(casual)
-    db.commit()
-    db.refresh(casual)
+        # ── 话题3：日常闲聊（中级）──────────────────────────────────────────────
+        casual = Topic(
+            title="Daily Casual Conversation",
+            title_zh="日常闲聊",
+            category="Daily Life",
+            role_name="Language Partner",
+            learner_level="Intermediate",
+            voice="Stanley",
+            system_prompt=(
+                "You are a friendly British language partner practicing daily conversation. "
+                "Follow the specific persona instructions provided in the dynamic prompt."
+            ),
+            vocab_tags=["weekend", "hobby", "plan", "recommend", "prefer", "actually", "honestly"],
+            sentence_patterns=[
+                "What do you think about",
+                "To be honest",
+                "Have you ever tried",
+                "That reminds me of",
+                "I was wondering if",
+            ],
+            scene_specific_rules=[
+                "Occasionally echo back a rephrased version of what the user said to model natural British English.",
+                "If the user makes a grammatical error, gently model the correct version in your own reply without explicitly pointing it out.",
+            ],
+            difficulty_tiers={
+                "1": {"rules": ["Keep topics simple: weather, hobbies, food."]},
+                "2": {"rules": ["Discuss opinions, preferences, and past experiences."]},
+                "3": {"rules": ["Debate abstract topics, hypotheticals, and current events."]},
+            },
+        )
+        db.add(casual)
+        db.commit()
+        db.refresh(casual)
 
-    nodes_casual = [
-        TargetNode(topic_id=casual.id, node_text="What do you think about", node_type="sentence", depth_level=1, weight=2.5),
-        TargetNode(topic_id=casual.id, node_text="To be honest", node_type="phrase", depth_level=1, weight=2.0),
-        TargetNode(topic_id=casual.id, node_text="Have you ever tried", node_type="sentence", depth_level=2, weight=2.5),
-        TargetNode(topic_id=casual.id, node_text="That reminds me of", node_type="phrase", depth_level=2, weight=2.0),
-        TargetNode(topic_id=casual.id, node_text="I was wondering if", node_type="sentence", depth_level=3, weight=2.0),
-        TargetNode(topic_id=casual.id, node_text="hypothetically speaking", node_type="phrase", depth_level=3, weight=1.5),
-    ]
-    db.add_all(nodes_casual)
+        nodes_casual = [
+            TargetNode(topic_id=casual.id, node_text="What do you think about", node_type="sentence", depth_level=1, weight=2.5),
+            TargetNode(topic_id=casual.id, node_text="To be honest", node_type="phrase", depth_level=1, weight=2.0),
+            TargetNode(topic_id=casual.id, node_text="Have you ever tried", node_type="sentence", depth_level=2, weight=2.5),
+            TargetNode(topic_id=casual.id, node_text="That reminds me of", node_type="phrase", depth_level=2, weight=2.0),
+            TargetNode(topic_id=casual.id, node_text="I was wondering if", node_type="sentence", depth_level=3, weight=2.0),
+            TargetNode(topic_id=casual.id, node_text="hypothetically speaking", node_type="phrase", depth_level=3, weight=1.5),
+        ]
+        db.add_all(nodes_casual)
 
-    db.commit()
-    print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
+        db.commit()
+        print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
     finally:
         db.close()
 
