@@ -35,11 +35,17 @@ from database import (
     UserProgress,
     LearningSession,
     effective_topic_title_zh,
+    # 阶段三新增：微场景图谱
+    MicroScenario,
+    ScenarioConstraint,
+    ScenarioTransition,
 )
 
 from domain.entities.task_packet import (
     TaskPacket,
     DifficultyConfig,
+    ScenarioConstraintItem,
+    MicroScenarioInfo,
     compute_max_reply_sentences,
     effective_learner_label,
 )
@@ -194,6 +200,255 @@ def add_topic_to_store(topic) -> None:
         logger.warning(f"[SessionPlanner] add_topic_to_store failed (non-critical): {e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# 阶段三新增：微场景图谱发牌接口
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def build_task_packet_for_next_scenario(
+    user_id: str,
+    next_scenario_id: int,
+    db: Optional[Session] = None,
+) -> TaskPacket:
+    """
+    阶段三新增：微场景流转时，根据 next_scenario_id 构建新版 TaskPacket。
+
+    职责：
+    1. 根据 scenario_id 加载 MicroScenario
+    2. 查询关联的 ScenarioConstraint，填充 constraints
+    3. 查询 ScenarioTransition 出边，填充 available_transitions
+    4. 计算 depth_tier、max_reply_sentences 等
+    5. 加载复习约束（低于 current_depth 的未掌握节点）
+
+    若 scenario_id 对应场景不存在，捕获异常降级到 _fallback_task_packet。
+    """
+    should_close = db is None
+    db = db or SessionLocal()
+    try:
+        scenario = db.query(MicroScenario).filter(
+            MicroScenario.id == next_scenario_id
+        ).first()
+        if scenario is None:
+            logger.error(
+                f"[SessionPlanner] MicroScenario id={next_scenario_id} not found"
+            )
+            return _fallback_task_packet(db)
+
+        topic = db.query(Topic).filter(Topic.id == scenario.topic_id).first()
+        if topic is None:
+            logger.error(f"[SessionPlanner] Topic id={scenario.topic_id} not found")
+            return _fallback_task_packet(db)
+
+        logger.info(
+            f"[SessionPlanner] Transition to scenario: "
+            f"'{scenario.scenario_code}' ({scenario.scenario_name}) "
+            f"topic='{topic.title}'"
+        )
+        return _build_micro_task_packet(user_id, topic, scenario, db)
+
+    except Exception as e:
+        logger.error(
+            f"[SessionPlanner] build_task_packet_for_next_scenario error: {e}",
+            exc_info=True,
+        )
+        return _fallback_task_packet(db)
+    finally:
+        if should_close:
+            db.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 阶段三新增：内部函数
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _has_micro_scenarios(db: Session, topic_id: int) -> bool:
+    """
+    判断某 topic 下是否有微场景数据（用于双模式路由）。
+    若有，返回 True，优先使用微场景图谱模式。
+    """
+    return db.query(MicroScenario).filter(
+        MicroScenario.topic_id == topic_id
+    ).first() is not None
+
+
+def _build_micro_task_packet(
+    user_id: str,
+    topic: Topic,
+    micro_scenario: MicroScenario,
+    db: Session,
+) -> TaskPacket:
+    """
+    为单个微场景构建完整的新版 TaskPacket。
+
+    填充字段：
+    - current_scenario: MicroScenarioInfo（含 available_transitions）
+    - constraints: 该场景绑定的所有 ScenarioConstraint
+    - review_constraints: 低于 current_depth 的未掌握约束（最多 3 个）
+    - current_intent: 微场景的 intent_desc
+    """
+    depth_tier = micro_scenario.depth_level
+
+    constraints_orm = db.query(ScenarioConstraint).filter(
+        ScenarioConstraint.micro_scenario_id == micro_scenario.id
+    ).all()
+
+    constraint_items = [
+        ScenarioConstraintItem(
+            constraint_id=c.id,
+            constraint_text=c.constraint_text,
+            constraint_type=c.constraint_type,
+            depth_level=c.depth_level,
+            weight=c.weight,
+            hint_cn=c.hint_cn,
+        )
+        for c in constraints_orm
+    ]
+
+    transitions = db.query(ScenarioTransition).filter(
+        ScenarioTransition.from_scenario_id == micro_scenario.id,
+        ScenarioTransition.trigger_type.in_(["auto", "intent_driven"]),
+    ).all()
+
+    to_ids = [t.to_scenario_id for t in transitions]
+    to_scenarios_map = (
+        {s.id: s for s in db.query(MicroScenario).filter(MicroScenario.id.in_(to_ids)).all()}
+        if to_ids else {}
+    )
+
+    available_transitions = [
+        {
+            "scenario_id": t.to_scenario_id,
+            "scenario_code": (
+                to_scenarios_map[t.to_scenario_id].scenario_code
+                if t.to_scenario_id in to_scenarios_map else ""
+            ),
+            "scenario_name": (
+                to_scenarios_map[t.to_scenario_id].scenario_name
+                if t.to_scenario_id in to_scenarios_map else ""
+            ),
+            "overlap_ratio": t.overlap_ratio,
+            "required_hit_rate": t.required_hit_rate,
+        }
+        for t in transitions
+    ]
+
+    scenario_info = MicroScenarioInfo(
+        scenario_id=micro_scenario.id,
+        scenario_code=micro_scenario.scenario_code,
+        scenario_name=micro_scenario.scenario_name,
+        intent_desc=micro_scenario.intent_desc,
+        scene_desc=micro_scenario.scene_desc,
+        depth_level=micro_scenario.depth_level,
+        step_order=micro_scenario.step_order,
+        max_turns=micro_scenario.max_turns,
+        available_transitions=available_transitions,
+    )
+
+    review_items = _load_review_constraints(user_id, topic.id, depth_tier, db)
+
+    diff_config = DifficultyConfig(
+        first_turn_depth=depth_tier,
+        bonus_node_unlock_after=3,
+        correction_frequency=min(0.5, 0.1 + depth_tier * 0.1),
+    )
+
+    user = db.query(User).filter(User.id == user_id).first()
+    settings = dict(user.settings or {}) if user else None
+    topic_lv = topic.learner_level or "Intermediate"
+    eff_label = effective_learner_label(settings, topic_lv, topic_lv)
+    max_reply = compute_max_reply_sentences(eff_label, depth_tier)
+
+    difficulty_tiers_cfg: dict = topic.difficulty_tiers or {}
+    tier_rules: list = difficulty_tiers_cfg.get(str(depth_tier), {}).get("rules", [])
+    scene_rules: list = (topic.scene_specific_rules or []) + tier_rules
+
+    tzh = effective_topic_title_zh(topic)
+    return TaskPacket(
+        topic_id=topic.id,
+        topic_title=topic.title,
+        topic_title_zh=tzh,
+        scene_prompt=topic.system_prompt or topic.title,
+        role_name=topic.role_name or topic.category or "English Coach",
+        learner_level=eff_label,
+        voice=topic.voice or "Stanley",
+        depth_tier=depth_tier,
+        max_reply_sentences=max_reply,
+        current_scenario=scenario_info,
+        constraints=constraint_items,
+        bonus_constraints=[],
+        review_constraints=review_items,
+        current_intent=micro_scenario.intent_desc,
+        difficulty_config=diff_config,
+        scene_specific_rules=scene_rules,
+        vocab_tags=topic.vocab_tags or [],
+        sentence_patterns=topic.sentence_patterns or [],
+        session_goal=_build_micro_session_goal(micro_scenario, constraint_items),
+    )
+
+
+def _load_review_constraints(
+    user_id: str,
+    topic_id: int,
+    current_depth: int,
+    db: Session,
+) -> list[ScenarioConstraintItem]:
+    """
+    加载低于 current_depth 的未掌握约束（最多 3 个）。
+
+    匹配逻辑：
+    - ScenarioConstraint.depth_level < current_depth
+    - legacy_node_id 在 UserProgress 中，且 mastery < 80
+    """
+    lower_constraints = db.query(ScenarioConstraint).join(
+        MicroScenario,
+        ScenarioConstraint.micro_scenario_id == MicroScenario.id,
+    ).filter(
+        MicroScenario.topic_id == topic_id,
+        ScenarioConstraint.depth_level < current_depth,
+    ).all()
+
+    if not lower_constraints:
+        return []
+
+    legacy_ids = [c.legacy_node_id for c in lower_constraints if c.legacy_node_id]
+    progress_map = {}
+    if legacy_ids:
+        progresses = db.query(UserProgress).filter(
+            UserProgress.user_id == user_id,
+            UserProgress.node_id.in_(legacy_ids),
+        ).all()
+        progress_map = {p.node_id: p.mastery_score for p in progresses}
+
+    review = []
+    for c in lower_constraints:
+        legacy_id = c.legacy_node_id
+        if legacy_id and progress_map.get(legacy_id, 0) < 80.0:
+            review.append(ScenarioConstraintItem(
+                constraint_id=c.id,
+                constraint_text=c.constraint_text,
+                constraint_type=c.constraint_type,
+                depth_level=c.depth_level,
+                weight=c.weight,
+                hint_cn=c.hint_cn,
+            ))
+
+    return review[:3]
+
+
+def _build_micro_session_goal(
+    scenario: MicroScenario,
+    constraints: list[ScenarioConstraintItem],
+) -> str:
+    """
+    为微场景生成 session_goal（人类可读的练习目标）。
+    """
+    names = [f"'{c.constraint_text}'" for c in constraints[:3]]
+    if names:
+        return f"Practice: {scenario.scenario_name}. Try to use: {', '.join(names)}."
+    return f"Practice: {scenario.scenario_name}."
+
+
 def save_learning_session(
     user_id: str,
     task_packet: TaskPacket,
@@ -249,7 +504,72 @@ def _build_packet_for_topic(
 ) -> TaskPacket:
     """
     Shared core: build TaskPacket for a specific topic.
-    Called by both build_task_packet (after scoring) and build_task_packet_for_topic (direct).
+    双模式路由：
+    - 若 topic 下有 MicroScenario 数据，走新版微场景逻辑（阶段三）
+    - 否则走旧版 TargetNode 逻辑（向后兼容）
+    """
+    if _has_micro_scenarios(db, topic.id):
+        return _build_packet_for_topic_micro(user_id, topic, depth_preference, db)
+    else:
+        return _build_packet_for_topic_legacy(user_id, topic, depth_preference, db)
+
+
+def _build_packet_for_topic_micro(
+    user_id: str,
+    topic: Topic,
+    depth_preference: float,
+    db: Session,
+) -> TaskPacket:
+    """
+    微场景模式：选择入口微场景并构建 TaskPacket。
+
+    选择策略：
+    1. 根据用户在该话题的有效掌握度，计算 earned_tier
+    2. 在该 tier 下，优先选 is_entry_point=True 的场景
+    3. 若没有 entry point，选 step_order 最小的场景
+    4. 若彻底没有微场景，降级到旧逻辑
+    """
+    earned_tier = _compute_depth_tier(user_id, topic.id, db)
+    max_allowed = max(1, min(MAX_DEPTH_TIER, int(depth_preference)))
+    depth_tier = min(earned_tier, max_allowed)
+
+    entry = db.query(MicroScenario).filter(
+        MicroScenario.topic_id == topic.id,
+        MicroScenario.depth_level == depth_tier,
+        MicroScenario.is_entry_point == True,
+    ).first()
+
+    if entry is None:
+        entry = db.query(MicroScenario).filter(
+            MicroScenario.topic_id == topic.id,
+            MicroScenario.depth_level == depth_tier,
+        ).order_by(MicroScenario.step_order).first()
+
+    if entry is None:
+        logger.warning(
+            f"[SessionPlanner] No MicroScenario for topic={topic.id}, depth={depth_tier}. "
+            f"Falling back to legacy mode."
+        )
+        return _build_packet_for_topic_legacy(user_id, topic, depth_preference, db)
+
+    logger.info(
+        f"[SessionPlanner] Micro mode: topic='{topic.title}' "
+        f"scenario='{entry.scenario_code}' depth={depth_tier}"
+    )
+    return _build_micro_task_packet(user_id, topic, entry, db)
+
+
+def _build_packet_for_topic_legacy(
+    user_id: str,
+    topic: Topic,
+    depth_preference: float,
+    db: Session,
+) -> TaskPacket:
+    """
+    旧版 TargetNode 模式（向后兼容）。
+
+    当 topic 下没有 MicroScenario 数据时使用此路径。
+    完全保留原有的目标节点选取逻辑。
     """
     earned_tier = _compute_depth_tier(user_id, topic.id, db)
     max_allowed = max(1, min(MAX_DEPTH_TIER, int(depth_preference)))
@@ -257,7 +577,7 @@ def _build_packet_for_topic(
 
     all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic.id).all()
     target_nodes = [n for n in all_nodes if n.depth_level == depth_tier]
-    bonus_nodes  = [n for n in all_nodes if n.depth_level == depth_tier + 1]
+    bonus_nodes = [n for n in all_nodes if n.depth_level == depth_tier + 1]
 
     progresses = db.query(UserProgress).filter(UserProgress.user_id == user_id).all()
     low_mastery = {p.node_id for p in progresses if p.mastery_score < 80.0}

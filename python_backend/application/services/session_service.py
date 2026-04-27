@@ -31,10 +31,45 @@ EVALUATOR_TOOLS = [
                     },
                     "should_advance_phase": {
                         "type": "boolean",
-                        "description": "True ONLY if the current phase goal is fulfilled and the coach is moving to the next phase."
+                        "description": "Legacy field (Phase 1): True ONLY if the current phase goal is fulfilled."
+                    },
+                    "intent_achieved": {
+                        "type": "boolean",
+                        "description": "Phase 2 — Dual-Track: Did the user's reply demonstrate that they fulfilled the teaching intent described in current_intent?"
+                    },
+                    "constraints_hit": {
+                        "type": "boolean",
+                        "description": "Phase 2 — Dual-Track: Did the user naturally use at least ONE target expression from the constraints list (either this turn OR in previous turns, i.e. hit_constraints)?"
+                    },
+                    "constraints_hit_details": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "constraint_text": {"type": "string"},
+                                "quality": {"type": "number", "description": "0.0-1.0: 1.0=exact in context, 0.8=stem variant, 0.0=not hit"},
+                                "note": {"type": "string", "description": "Brief note about how/where the constraint was hit."}
+                            }
+                        },
+                        "description": "Details for each constraint that was hit."
+                    },
+                    "scenario_completed": {
+                        "type": "boolean",
+                        "description": "Phase 2 — Signal: Set to TRUE when BOTH intent_achieved==TRUE AND constraints_hit==TRUE. This triggers micro-scenario completion and transition."
                     }
                 },
-                "required": ["ai_translation_cn", "suggested_hints_en", "coach_correction_cn", "should_advance_phase"]
+                "required": [
+                    "ai_translation_cn",
+                    "suggested_hints_en",
+                    "coach_correction_cn",
+                    # Old schema required
+                    "should_advance_phase",
+                    # New Phase 2 fields
+                    "intent_achieved",
+                    "constraints_hit",
+                    "constraints_hit_details",
+                    "scenario_completed",
+                ]
             }
         }
     }

@@ -13,33 +13,45 @@ SessionContext — 会话状态领域对象
 """
 
 from __future__ import annotations
+
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, fields
 from typing import Any
 
 
 @dataclass
 class SessionContext:
     # ── 阶段机 ────────────────────────────────────────────────────────────
-    phase: str = "ICE_BREAKING"          # 当前阶段
-    phase_turns: int = 0                 # 本阶段已互动轮数（防卡死用）
-    loop_count: int = 1                  # 完成整局的次数（WRAP_UP 后 +1）
-    llm_wants_to_advance: bool = False   # 上一轮 AI 是否在末尾输出 [ADVANCE]
+    phase: str = "ICE_BREAKING"
+    phase_turns: int = 0
+    loop_count: int = 1
+    llm_wants_to_advance: bool = False
 
     # ── 词表 ──────────────────────────────────────────────────────────────
-    new_targets: list = field(default_factory=list)      # 本轮新词 [{"id", "node_text"}]
-    history_targets: list = field(default_factory=list)  # 历史词（滚雪球累积）
-    active_targets: list = field(default_factory=list)   # 预留字段
-    current_event: str = ""                              # EVENT_EXTENSION 阶段的剧情文本
+    new_targets: list = field(default_factory=list)
+    history_targets: list = field(default_factory=list)
+    active_targets: list = field(default_factory=list)
+    current_event: str = ""
 
     # ── 段位与计分 ────────────────────────────────────────────────────────
-    current_level: int = 1                    # 用户当前段位（Lv）
-    chat_score: float = 0.0                  # 本轮闲聊分（上限 40）
-    task_score: float = 0.0                  # 本轮任务分（上限 60）
-    chat_interaction_count: int = 0          # 闲聊曲线已消费的步数
-    completed_rounds_in_level: int = 0       # 本段位已完整跑完的局数（满 3 升级）
+    current_level: int = 1
+    chat_score: float = 0.0
+    task_score: float = 0.0
+    chat_interaction_count: int = 0
+    completed_rounds_in_level: int = 0
 
-    # ── 兼容层：支持 ctx["key"] 读写，降低 server.py 迁移成本 ─────────────
+    # ── 【阶段二新增】微场景流转 ──────────────────────────────────────────
+    turn_count_in_scenario: int = 0
+    scenario_completed: bool = False
+    _constraint_hits: set = field(default_factory=set)
+
+    # ── 【阶段二新增】Director 双轨信号 ─────────────────────────────────
+    director_scenario_completed: bool = False
+    director_constraints_hit: bool = False
+    director_intent_achieved: bool = False
+    next_scenario: Any = None
+
+    # ── 兼容层：支持 ctx["key"] 读写 ─────────────────────────────────────
     def __getitem__(self, key: str) -> Any:
         return getattr(self, key)
 
@@ -48,6 +60,22 @@ class SessionContext:
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
+
+    def pop(self, key: str, default: Any = ...) -> Any:
+        """
+        模拟 dict.pop() 行为：读取并删除属性。
+        支持 declared 字段和 extra 字段。
+
+        注意：dataclass 默认字段在声明时存在，所以 extra 字段需要用 hasattr 判断。
+        """
+        has_attr = hasattr(self, key)
+        if default is ...:
+            value = getattr(self, key)
+        else:
+            value = getattr(self, key, default)
+        if has_attr:
+            delattr(self, key)
+        return value
 
     # ── 序列化 ────────────────────────────────────────────────────────────
     def to_dict(self) -> dict:
@@ -59,7 +87,7 @@ class SessionContext:
     @classmethod
     def from_dict(cls, data: dict) -> "SessionContext":
         """从字典重建（兼容旧 session_ctx dict，忽略未知键）"""
-        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
 
     @classmethod

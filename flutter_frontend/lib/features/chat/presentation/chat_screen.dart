@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:lottie/lottie.dart';
 import 'dart:ui' as ui;
 import '../providers/chat_provider.dart';
+import '../widgets/scenario_goal_card.dart';
 import '../../../core/providers/settings_provider.dart';
 import 'session_report_sheet.dart';
 
@@ -237,6 +238,72 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           });
         });
       }
+
+      // 🌟 【阶段三新增】微场景流转 SnackBar：
+      //   当 currentScenarioName 发生变化时（说明后端刚下发 scenario_transition 事件），
+      //   触发一个 Floating SnackBar 闯关庆祝提示。
+      //
+      //   Riverpod 最佳实践：
+      //     - 纯状态（ChatState）只存储数据，不含任何一次性动作标记
+      //     - 一次性 UI 副作用（SnackBar）统一在 ref.listen 中处理，
+      //       不污染 State，也不引入不必要的 Widget 重建
+      //
+      //   修正意见 1：使用 ref.listen 而非状态 boolean 标志
+      //   修正意见 2：每次 showSnackBar 前先 clearSnackBars()，防止排队堆积
+      //   修正意见 3： SnackBar behavior=floating + margin 抬高，不遮挡聊天记录
+      final prevScenario = previous?.currentScenarioName ?? '';
+      final nextScenario = next.currentScenarioName;
+      if (prevScenario.isNotEmpty && prevScenario != nextScenario) {
+        // 场景名称发生变化（previous 非空说明不是初始化，而是真正的流转）
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!context.mounted) return;
+          final messenger = ScaffoldMessenger.of(context);
+          messenger.clearSnackBars();
+          messenger.showSnackBar(
+            SnackBar(
+              content: Row(
+                children: [
+                  const Text('🎯 ', style: TextStyle(fontSize: 20)),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          '场景通关！',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14,
+                          ),
+                        ),
+                        Text(
+                          '即将进入: $nextScenario',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.white70,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+              behavior: SnackBarBehavior.floating,
+              duration: const Duration(seconds: 3),
+              margin: const EdgeInsets.only(
+                left: 16,
+                right: 16,
+                bottom: 80,
+              ),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              backgroundColor: const Color(0xFF1A1A2E),
+            ),
+          );
+        });
+      }
     });
 
     // ── 控制显示进行中状态的标识 ──
@@ -344,6 +411,11 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
             Column(
               children: [
                 if (chatState.isGeneratingTopic) _TopicGeneratingBanner(),
+
+                // ── 【阶段三新增】微场景目标卡片 ──────────────────────────────
+                // 当 currentScenarioName 非空时显示，通过 AnimatedSwitcher 实现平滑过渡
+                const ScenarioGoalCard(),
+
                 if (settings.showProgressBar)
                   _buildMasteryTracker(ref, chatState.masteryProgress),
 

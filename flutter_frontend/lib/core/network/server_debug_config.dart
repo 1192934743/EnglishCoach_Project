@@ -5,13 +5,13 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 /// 预设服务器枚举
 enum ServerPreset {
-  local,   // 本地默认：172.20.10.4
-  remote,  // 远端：20.2.80.19
-  custom,  // 自定义
+  local, // 本地默认：172.20.10.2
+  remote, // 远端：20.2.80.19
+  custom, // 自定义
 }
 
 /// 默认值常量（编译时常量）
-const String kDefaultLocalHost = '172.20.10.4';
+const String kDefaultLocalHost = '172.20.10.2';
 const String kDefaultRemoteHost = '20.2.80.19';
 const int kDefaultPort = 8000;
 

@@ -2,9 +2,14 @@
 Dialogue Engine - English Coach
 核心状态机、计分与对话引擎模块。
 
-[终极演进 - 主从分离架构 (Dual-LLM Actor-Director Model)]:
+[阶段二演进 — 双轨校验微场景图谱架构]:
 - LLM 1 (Actor): 纯粹的对话者，剥离所有 Tools，实现 TTFB < 1秒 的极速语音秒回。
-- LLM 2 (Director/Evaluator): 后台旁路运行，调用强制 Tool，生成翻译/提示，并裁定是否推进状态机。
+- LLM 2 (Director/Evaluator): 后台旁路运行，调用强制 Tool，生成翻译/提示，
+  并进行双轨校验 (Intent + Constraints) 决定是否推进微场景流转。
+
+双模式共存：
+- micro_mode=True: 基于 turn_count_in_scenario 的渐进诱导 + 双轨校验
+- micro_mode=False: 维持原四阶段线性状态机（向后兼容）
 """
 
 import os
@@ -14,7 +19,7 @@ import logging
 import re
 import asyncio
 import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Any
 from sqlalchemy.orm import Session
 from fastapi import WebSocket
 import jinja2
@@ -24,6 +29,7 @@ from domain.entities.task_packet import (
     TaskPacket,
     compute_max_reply_sentences,
     effective_learner_label,
+    ScenarioConstraintItem,
 )
 from application.services.mastery_scorer import (
     update_mastery, L1_EXACT_QUALITY, L1_STEM_QUALITY,
@@ -34,10 +40,10 @@ logger = logging.getLogger("EnglishCoach")
 
 # ================= 业务全局常量 =================
 
-ROUNDS_PER_LEVEL = 3  # 每个段位需要完成的局数
-MAX_TURNS_PER_PHASE = 25  # 兜底机制：每个阶段最大互动轮数，超时强制推进
+ROUNDS_PER_LEVEL = 3
+MAX_TURNS_PER_PHASE = 25
 
-_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))  # python_backend/
+_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
 GLOBAL_RULES_FILE_PATH = os.path.join(_BACKEND_DIR, "prompts", "global_rules.json")
 
 EVENT_POOL = [
@@ -47,15 +53,44 @@ EVENT_POOL = [
     "A system glitch means the user has to switch their payment method or split the bill. Ask them how they want to handle it."
 ]
 
-# 闲聊得分的心流曲线 (非线性：前后慢，中间快。总和正好 40 分)
 CHAT_SCORE_CURVE = [2.0, 3.0, 5.0, 8.0, 10.0, 6.0, 3.0, 2.0, 1.0]
+
+# Depth Level → CEFR 难度压制级别映射
+DEPTH_TO_CEFR = {
+    1: "Beginner",
+    2: "Elementary",
+    3: "Advanced",
+}
+
+# Depth Level → 极简词汇强制压制指令（追加到 cognitive_load_levels 之后）
+DEPTH_FORCE_RULES = {
+    1: (
+        "MANDATORY RESTRICTIONS for Depth Level 1 (Beginner/A1):\n"
+        "- Use ONLY single-word or very short two-word phrases.\n"
+        "- Avoid ALL compound sentences, subclauses, and complex structures.\n"
+        "- Never use words longer than 6 letters unless the scene demands it.\n"
+        "- Keep each sentence to under 10 words total."
+    ),
+    2: (
+        "MANDATORY RESTRICTIONS for Depth Level 2 (Elementary/A2):\n"
+        "- Prefer short simple sentences with one main clause.\n"
+        "- Use common daily vocabulary only.\n"
+        "- Avoid idioms, slang, or advanced academic expressions."
+    ),
+    3: (
+        "MANDATORY RESTRICTIONS for Depth Level 3 (Advanced/B2-C1+):\n"
+        "- Encourage idiomatic expressions and nuanced vocabulary.\n"
+        "- Allow complex sentence structures when naturally appropriate.\n"
+        "- Support advanced topic-specific terminology."
+    ),
+}
 
 # ================= Jinja2 模板引擎配置 =================
 JINJA_ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
 
-# 【主 LLM 演员静态模板】：只关注沉浸式角色扮演，彻底无格式负担
+# 【主 LLM 演员静态模板 V1】：旧模式（向后兼容）
 STATIC_SYSTEM_TEMPLATE = JINJA_ENV.from_string("""
-You are an expert English Coach. 
+You are an expert English Coach.
 Learner Level: {{ canonical_level }} | Practice content tier (target nodes): {{ depth_tier_val }}
 Coach turn length cap: {{ max_reply_sentences }} short in-character sentences per reply.
 
@@ -83,17 +118,17 @@ Coach turn length cap: {{ max_reply_sentences }} short in-character sentences pe
 {% endif %}
 
 {% if session_goal_line %}
-[SESSION GOAL] 
+[SESSION GOAL]
 {{ session_goal_line }}
 {% endif %}
 
 [OUTPUT BUDGET & QUESTION POLICY]
 - Within your {{ max_reply_sentences }} sentence allowance: ask at most ONE question that expects an answer from the learner this turn.
-- Do NOT put two answerable questions in the same sentence. 
+- Do NOT put two answerable questions in the same sentence.
 - No bullet lists, no lecture-style multi-paragraph answers. Use plain conversational text only.
 """)
 
-# 【主 LLM 演员动态模板】：每轮的任务引导，剥离了所有 Tool Calling 命令
+# 【主 LLM 演员动态模板 V1】：旧模式（向后兼容）
 DYNAMIC_TURN_TEMPLATE = JINJA_ENV.from_string("""
 [SYSTEM DIRECTIVE FOR CURRENT TURN]
 Current Phase: {{ phase }}
@@ -105,7 +140,7 @@ Goal: Build rapport. Briefly greet the user and set the scene for {{ scene_name 
 PHASE 2: CORE TASK (Language Practice)
 Goal: Guide the user through the main task of the {{ scene_name }} while focusing on practice.
 Mandatory Practice: You MUST naturally guide the user to say these REMAINING target words: {{ unhit_targets }}.
-Bonus Review: The user already used these words: {{ hit_targets }}. 
+Bonus Review: The user already used these words: {{ hit_targets }}.
 Action: Keep the conversation flowing naturally toward completing the task.
 {% elif phase == 'EVENT_EXTENSION' %}
 PHASE 3: EVENT EXTENSION (The Twist)
@@ -119,7 +154,105 @@ Goal: Conclude naturally. Give one sentence of positive feedback and say a final
 Just speak your English reply. DO NOT output any tags, JSON, or tool calls. Reply as fast and naturally as possible.
 """)
 
-# 【副 LLM 导演评估模板】：专职负责翻译、提示与状态推进，高内聚高稳定
+# 【主 LLM 演员静态模板 V2】：微场景模式（阶段二）
+STATIC_SYSTEM_TEMPLATE_V2 = JINJA_ENV.from_string("""
+You are an expert English Coach.
+Learner Level: {{ canonical_level }} | Practice content tier: {{ depth_tier_val }}
+Coach turn length cap: {{ max_reply_sentences }} short in-character sentences per reply.
+
+[ROLE AND PERSONALITY]
+{{ role_desc }}
+{{ personality_desc }}
+
+{% if cog_line %}
+[COGNITIVE LOAD GUIDELINE]
+{{ cog_line }}
+{% endif %}
+
+{% if cefr_force_block %}
+[CEFR DIFFICULTY ENFORCEMENT — {{ cefr_level }}]
+{{ cefr_force_block }}
+{% endif %}
+
+{% if universal_rules %}
+[UNIVERSAL COACHING RULES]
+{% for rule in universal_rules %}
+{{ loop.index }}. {{ rule }}
+{% endfor %}
+{% endif %}
+
+{% if scene_specific_rules %}
+[SCENE-SPECIFIC RULES]
+{% for rule in scene_specific_rules %}
+- {{ rule }}
+{% endfor %}
+{% endif %}
+
+{% if session_goal_line %}
+[SESSION GOAL]
+{{ session_goal_line }}
+{% endif %}
+
+{% if micro_scene_block %}
+[MICRO-SCENE CONTEXT]
+Scenario: {{ scenario_name }}
+Teaching Intent: {{ current_intent }}
+{% if unhit_constraints %}
+TARGET EXPRESSIONS (learner should naturally use at least one): {{ unhit_constraints }}
+{% endif %}
+{% if hit_constraints %}
+ALREADY PRACTICED (these were used successfully before — do not force repetition): {{ hit_constraints }}
+{% endif %}
+{% endif %}
+
+[OUTPUT BUDGET & QUESTION POLICY]
+- Within your {{ max_reply_sentences }} sentence allowance: ask at most ONE question that expects an answer from the learner this turn.
+- Do NOT put two answerable questions in the same sentence.
+- No bullet lists, no lecture-style multi-paragraph answers. Use plain conversational text only.
+""")
+
+# 【主 LLM 演员动态模板 V2】：微场景模式渐进诱导
+DYNAMIC_TURN_V2_TEMPLATE = JINJA_ENV.from_string("""
+{% if turn_count == 1 %}
+[SITUATION — TURN {{ turn_count }} / {{ max_turns }}]
+{{ scene_desc }}
+
+Action: Start the conversation naturally and set the scene for the learner.
+Give them space to respond. Do NOT push practice vocabulary yet.
+{% elif turn_count == 2 %}
+[SITUATION — TURN {{ turn_count }} / {{ max_turns }}]
+{{ scene_desc }}
+
+{% if current_constraint %}
+Action: If the user has NOT yet naturally used the target expression '{{ current_constraint }}',
+use a gentle prompt that makes saying it feel like the most natural choice.
+For example, offer a simple yes/no or choice question that leads toward the target word.
+DO NOT directly mention or spell out the target expression.
+{% else %}
+Action: The user seems engaged. Continue naturally guiding the conversation.
+{% endif %}
+{% else %}
+[SITUATION — TURN {{ turn_count }} / {{ max_turns }} — RESCUE MODE]
+{{ scene_desc }}
+
+{% if current_constraint %}
+Action: The learner has not yet naturally used the target expression.
+You MUST guide them to it more directly. Choose ONE of the following:
+  1. Complete their sentence and ask them to repeat: "You can say: '{{ current_constraint }}'"
+  2. Offer a forced-choice: "Do you mean small, medium, or large?"
+  3. Model the phrase clearly and invite repetition: "Could you try saying: '{{ current_constraint }}'?"
+
+Do NOT give up. Keep encouraging them until they succeed.
+{% else %}
+Action: The learner seems stuck. Gently help them move forward with a simple rephrasing.
+{% endif %}
+{% endif %}
+
+[CRITICAL INSTRUCTION]
+Reply with ONLY your in-character English dialogue. No tags, no JSON, no tool calls.
+""")
+
+# 【副 LLM 导演评估模板 V1】：旧模式（向后兼容）
 EVALUATOR_SYSTEM_TEMPLATE = JINJA_ENV.from_string("""
 You are the backend AI Director for an English coaching application.
 You will be provided with the last exchange between the User and the AI Coach.
@@ -160,14 +293,76 @@ Learner Level: {{ learner_level }}
 {% endif %}
 """)
 
+# 【副 LLM 导演评估模板 V2】：微场景双轨校验模式
+# 隐患1修复：在模板中注入 hit_constraints，防止"视野失忆"
+EVALUATOR_V2_TEMPLATE = JINJA_ENV.from_string("""
+You are the backend AI Director for an English coaching application.
+You will be provided with the last exchange between the User and the AI Coach.
+
+Your job is to use the `submit_analysis_and_feedback` tool to output a JSON object containing:
+
+1. `ai_translation_cn`: Natural Chinese translation of the AI Coach's reply (not literal).
+
+2. `suggested_hints_en`: 2 short replies the User could say next.
+   - Beginner: 2-4 word phrases only
+   - Intermediate: 4-7 word responses
+   - Advanced: 6-10 word idiomatic responses
+   - At least 1 hint should naturally use a word from the target list.
+   - Format: string array, e.g. ["Sure.", "That sounds good."]
+
+3. `coach_correction_cn`: If the user made a grammar/vocabulary error, correct it in Chinese.
+   Otherwise leave empty.
+
+=== DUAL-TRACK VALIDATION ===
+
+4. `intent_achieved`: BOOLEAN
+   Set to TRUE if the user's reply demonstrates that they have fulfilled the teaching intent:
+   "{{ current_intent }}"
+   Consider: Did they meaningfully engage with the scenario goal? Was the conversation productive?
+
+5. `constraints_hit`: BOOLEAN
+   IMPORTANT — Prevailing Rule: Check BOTH this turn AND the conversation history.
+   Set to TRUE if the user has EVER naturally used AT LEAST ONE of these target expressions:
+   {% for c in constraint_texts %}
+   - "{{ c }}"{% endfor %}
+   {% if hit_constraints %}
+   NOTE — Already Practiced (do NOT penalize if absent this turn):
+   {{ hit_constraints }}
+   If ANY of the above were used in PREVIOUS turns, this should be TRUE.
+   {% endif %}
+   "Naturally" means they used the expression in context, not just in a forced repetition.
+   "This turn OR history" — as long as the constraint was used at some point, return TRUE.
+
+6. `constraints_hit_details`: ARRAY of objects
+   For each constraint that was hit (this turn OR history), report:
+   [
+     {
+       "constraint_text": "...",
+       "quality": 0.0-1.0,
+       "note": "..."
+     }
+   ]
+   - quality 1.0 = exact use in perfect context
+   - quality 0.8 = stem/close variant in good context
+   - quality 0.0 = not hit yet
+
+7. `scenario_completed`: BOOLEAN
+   Set to TRUE ONLY when BOTH:
+     intent_achieved == TRUE AND constraints_hit == TRUE.
+   This signals the engine to trigger micro-scenario transition.
+
+Learner Level: {{ learner_level }}
+Current Scenario: {{ scenario_name }}
+""")
+
 # ================= 辅助工具 =================
 
-def load_global_rules(file_path=GLOBAL_RULES_FILE_PATH):
+def load_global_rules(file_path: str = GLOBAL_RULES_FILE_PATH) -> dict:
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception as e:
-        logger.error(f"🚨 Could not load global_rules.json ({e}). Prompt will be degraded.")
+        logger.error(f"Could not load global_rules.json ({e}). Prompt will be degraded.")
         return {}
 
 
@@ -179,13 +374,41 @@ def _cognitive_load_line(rules: dict, canonical: str) -> Optional[str]:
     return None
 
 
+def _build_cefr_force_block(rules: dict, depth_level: int) -> str:
+    """根据 depth_level 追加极简词汇强制压制指令"""
+    cefr_level = DEPTH_TO_CEFR.get(depth_level, "Elementary")
+    base_cog = _cognitive_load_line(rules, cefr_level) or ""
+    force_rules = DEPTH_FORCE_RULES.get(depth_level, "")
+    if force_rules:
+        return f"{base_cog}\n\n{force_rules}"
+    return base_cog
+
+
+def _get_constraint_id(constraint: Any) -> Any:
+    """提取约束的 ID，支持新旧两种格式"""
+    if isinstance(constraint, ScenarioConstraintItem):
+        return constraint.constraint_id
+    if isinstance(constraint, dict):
+        return constraint.get("constraint_id", constraint.get("id"))
+    return None
+
+
+def _get_constraint_text(constraint: Any) -> str:
+    """提取约束的文本，支持新旧两种格式"""
+    if isinstance(constraint, ScenarioConstraintItem):
+        return constraint.constraint_text
+    if isinstance(constraint, dict):
+        return constraint.get("constraint_text", constraint.get("node_text", ""))
+    return str(constraint) if constraint else ""
+
+
 def _preload_new_targets_if_empty(
         db: Session,
         session_ctx: dict,
         task_packet: Optional[TaskPacket],
         topic_id: int,
 ) -> None:
-    """本局 new_targets 为空时，从 TaskPacket 或 DB 预取最多 3 个节点（排除已在 history 中的 id）。"""
+    """本局 new_targets 为空时，从 TaskPacket 或 DB 预取最多 3 个节点（排除已在 history 中的 id）"""
     if session_ctx.get("new_targets"):
         return
     used_ids = {n.get("id") for n in session_ctx.get("history_targets", []) if n.get("id") is not None}
@@ -199,7 +422,7 @@ def _preload_new_targets_if_empty(
         if session_ctx["new_targets"]:
             logger.info(
                 f"[L1] Preloaded new_targets from TaskPacket: "
-                f"{[n.get('node_text') for n in session_ctx['new_targets']]}"
+                f"{[n.get('node_text') or n.get('constraint_text', '') for n in session_ctx['new_targets']]}"
             )
         return
     if not topic_id:
@@ -234,34 +457,51 @@ def build_prompts(
         task_packet: Optional[TaskPacket] = None,
         session_hits: Optional[set] = None,
 ) -> Tuple[str, str]:
-    """构建发给主 LLM（演员）的 Prompt"""
+    """
+    构建发给主 LLM（演员）的 Prompt。
+
+    双模式自动选择：
+    - micro_mode=True: 微场景模式，使用 V2 模板
+    - micro_mode=False: 旧四阶段模式，使用 V1 模板
+    """
     if task_packet is None:
-        raise ValueError("build_prompts requires a non-None TaskPacket. "
-                         "Callers must ensure task_packet is set before invoking this function.")
+        logger.warning(
+            "[Prompt] task_packet is None — returning fallback prompt. "
+            "Callers should ensure task_packet is set before build_prompts."
+        )
+        return (
+            "You are an English conversation partner. Please have a friendly chat in English.",
+            "Hello! How are you today? What would you like to practice?"
+        )
 
     rules = load_global_rules()
     if session_hits is None:
         session_hits = set()
 
-    # 1. 提取基础变量
+    # 判断运行模式
+    micro_mode = task_packet.has_constraints()
+
+    # 基础变量
     scene_name = task_packet.scene_prompt
     role_name = task_packet.role_name
     user_level = task_packet.learner_level
     scene_specific_rules = task_packet.scene_specific_rules
-    depth_tier_val = int(task_packet.depth_tier or 1)
-    session_goal_line = (f"\n[SESSION GOAL] {task_packet.session_goal}" if task_packet.session_goal else "")
+    depth_level = int(task_packet.depth_tier or 1)
 
     settings_dict = (user.settings or {}) if user and getattr(user, "settings", None) else None
-    canonical_level = effective_learner_label(settings_dict, task_packet.learner_level if task_packet else None,
-                                              user_level)
-    max_reply_sentences = compute_max_reply_sentences(canonical_level, depth_tier_val)
+    canonical_level = effective_learner_label(
+        settings_dict,
+        task_packet.learner_level,
+        user_level,
+    )
+    max_reply_sentences = compute_max_reply_sentences(canonical_level, depth_level)
 
     logger.info(
-        f"[Prompt] canonical_level={canonical_level} tier={depth_tier_val} "
-        f"max_reply={max_reply_sentences} phase={session_ctx.get('phase', 'ICE_BREAKING')}"
+        f"[Prompt] mode={'micro' if micro_mode else 'legacy'} "
+        f"canonical_level={canonical_level} depth={depth_level} "
+        f"max_reply={max_reply_sentences} "
+        f"turn={session_ctx.get('turn_count_in_scenario', 1)}"
     )
-
-    phase = session_ctx.get("phase", "ICE_BREAKING")
 
     # 角色与性格
     role_desc = (
@@ -273,183 +513,526 @@ def build_prompts(
     politeness_key = str(user.politeness_level) if user else "1"
     personality_desc = personality_levels.get(politeness_key, personality_levels.get("1", ""))
 
-    # 认知负荷与全局规则
+    # 认知负荷
     cog_line = _cognitive_load_line(rules, canonical_level)
     if not cog_line:
         cog_line = _cognitive_load_line(rules, "Intermediate")
 
+    # 全局规则
     by_level = rules.get("universal_rules_by_level") or {}
     universal_rules = by_level.get(canonical_level) or rules.get("universal_rules", [])
 
-    # 2. 准备动态变量 (打靶词汇与事件)
-    new_targets_list = session_ctx.get("new_targets", [])
-    history_targets_list = session_ctx.get("history_targets", [])
-    all_active = new_targets_list + history_targets_list
-
-    unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
-    hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
-
-    unhit_targets = ", ".join(
-        [f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]) or "(none — great job)"
-    hit_targets = ", ".join([f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]) or "(none yet)"
-    current_event = session_ctx.get("current_event", "There is a small problem with your request.")
-
-    # 3. 渲染静态模板
-    static_system_prompt = STATIC_SYSTEM_TEMPLATE.render(
-        canonical_level=canonical_level,
-        depth_tier_val=depth_tier_val,
-        max_reply_sentences=max_reply_sentences,
-        role_desc=role_desc,
-        personality_desc=personality_desc,
-        cog_line=cog_line,
-        universal_rules=universal_rules,
-        scene_specific_rules=scene_specific_rules,
-        session_goal_line=session_goal_line,
+    # 会话目标
+    session_goal_line = (
+        f"\n[SESSION GOAL] {task_packet.session_goal}"
+        if task_packet.session_goal
+        else ""
     )
 
-    # 4. 渲染动态模板
-    dynamic_turn_prompt = DYNAMIC_TURN_TEMPLATE.render(
-        phase=phase,
-        scene_name=scene_name,
-        unhit_targets=unhit_targets,
-        hit_targets=hit_targets,
-        current_event=current_event,
+    # 微场景变量
+    cefr_level = DEPTH_TO_CEFR.get(depth_level, "Elementary")
+    cefr_force_block = _build_cefr_force_block(rules, depth_level) if micro_mode else ""
+
+    scenario_name_str = (
+        task_packet.current_scenario.scenario_name
+        if task_packet.current_scenario and task_packet.current_scenario.scenario_name
+        else scene_name
+    )
+    current_intent_str = (
+        task_packet.current_intent or task_packet.session_goal
+    )
+    scene_desc_str = (
+        task_packet.current_scenario.scene_desc
+        if task_packet.current_scenario and task_packet.current_scenario.scene_desc
+        else scene_name
+    )
+    max_turns = (
+        task_packet.current_scenario.max_turns
+        if task_packet.current_scenario
+        else 8
     )
 
-    return static_system_prompt, dynamic_turn_prompt
+    # 渲染静态模板
+    if micro_mode:
+        # 约束命中状态
+        all_constraints = task_packet.constraints + task_packet.review_constraints
+        unhit = [
+            c for c in all_constraints
+            if _get_constraint_id(c) not in session_hits
+        ]
+        hit = [
+            c for c in all_constraints
+            if _get_constraint_id(c) in session_hits
+        ]
+        unhit_str = ", ".join(
+            f"'{_get_constraint_text(c)}'" for c in unhit
+        ) or "(none — great job)"
+        hit_str = ", ".join(
+            f"'{_get_constraint_text(c)}'" for c in hit
+        ) or "(none yet)"
+        current_constraint_str = _get_constraint_text(unhit[0]) if unhit else ""
+
+        static_prompt = STATIC_SYSTEM_TEMPLATE_V2.render(
+            canonical_level=canonical_level,
+            depth_tier_val=depth_level,
+            max_reply_sentences=max_reply_sentences,
+            role_desc=role_desc,
+            personality_desc=personality_desc,
+            cog_line=cog_line,
+            cefr_force_block=cefr_force_block,
+            cefr_level=cefr_level,
+            universal_rules=universal_rules,
+            scene_specific_rules=scene_specific_rules,
+            session_goal_line=session_goal_line,
+            micro_scene_block=bool(task_packet.current_scenario),
+            scenario_name=scenario_name_str,
+            current_intent=current_intent_str,
+            unhit_constraints=unhit_str,
+            hit_constraints=hit_str,
+        )
+    else:
+        # 旧模式 fallback
+        new_targets_list = session_ctx.get("new_targets", [])
+        history_targets_list = session_ctx.get("history_targets", [])
+        all_active = new_targets_list + history_targets_list
+        unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
+        hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
+        unhit_targets = ", ".join(
+            [f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]
+        ) or "(none — great job)"
+        hit_targets = ", ".join(
+            [f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]
+        ) or "(none yet)"
+
+        static_prompt = STATIC_SYSTEM_TEMPLATE.render(
+            canonical_level=canonical_level,
+            depth_tier_val=depth_level,
+            max_reply_sentences=max_reply_sentences,
+            role_desc=role_desc,
+            personality_desc=personality_desc,
+            cog_line=cog_line,
+            universal_rules=universal_rules,
+            scene_specific_rules=scene_specific_rules,
+            session_goal_line=session_goal_line,
+        )
+
+    # 渲染动态模板
+    if micro_mode:
+        turn_count = session_ctx.get("turn_count_in_scenario", 1)
+        dynamic_prompt = DYNAMIC_TURN_V2_TEMPLATE.render(
+            turn_count=turn_count,
+            max_turns=max_turns,
+            scene_desc=scene_desc_str,
+            current_constraint=current_constraint_str,
+        )
+    else:
+        phase = session_ctx.get("phase", "ICE_BREAKING")
+        current_event = session_ctx.get("current_event", "There is a small problem with your request.")
+        dynamic_prompt = DYNAMIC_TURN_TEMPLATE.render(
+            phase=phase,
+            scene_name=scene_name,
+            unhit_targets=unhit_targets,
+            hit_targets=hit_targets,
+            current_event=current_event,
+        )
+
+    return static_prompt, dynamic_prompt
 
 
 def build_evaluator_prompt(
     session_ctx: dict,
     task_packet: Optional[TaskPacket] = None,
 ) -> str:
-    """构建发给旁路副 LLM（导演）的系统 Prompt"""
-    phase = session_ctx.get("phase", "ICE_BREAKING")
-    scene_name = task_packet.scene_prompt if task_packet else "General Conversation"
-    learner_level = task_packet.learner_level if task_packet else "Intermediate"
-    vocab_tags = task_packet.vocab_tags if task_packet else []
-    sentence_patterns = task_packet.sentence_patterns if task_packet else []
+    """
+    构建发给旁路副 LLM（导演）的系统 Prompt。
 
-    return EVALUATOR_SYSTEM_TEMPLATE.render(
-        phase=phase,
-        scene_name=scene_name,
-        learner_level=learner_level,
-        vocab_tags=vocab_tags,
-        sentence_patterns=sentence_patterns,
+    双模式自动选择：
+    - micro_mode=True: EVALUATOR_V2_TEMPLATE（含双轨校验）
+    - micro_mode=False: EVALUATOR_SYSTEM_TEMPLATE（旧四阶段）
+    """
+    learner_level = task_packet.learner_level if task_packet else "Intermediate"
+    micro_mode = task_packet.has_constraints() if task_packet else False
+
+    if micro_mode:
+        all_constraints = (task_packet.constraints + task_packet.review_constraints) if task_packet else []
+        constraint_texts = [_get_constraint_text(c) for c in all_constraints]
+
+        # 获取已命中约束文本（用于注入 Evaluator，防止视野失忆）
+        session_hits_set = session_ctx.get("_constraint_hits", set())
+        hit_constraints_list = [
+            _get_constraint_text(c)
+            for c in all_constraints
+            if _get_constraint_id(c) in session_hits_set
+        ]
+        hit_constraints_str = ", ".join(f"'{t}'" for t in hit_constraints_list) if hit_constraints_list else ""
+
+        scenario_name_str = (
+            task_packet.current_scenario.scenario_name
+            if task_packet.current_scenario and task_packet.current_scenario.scenario_name
+            else (task_packet.scene_prompt if task_packet else "General Conversation")
+        )
+        current_intent_str = (
+            task_packet.current_intent or task_packet.session_goal or "Complete the conversation naturally."
+        )
+
+        return EVALUATOR_V2_TEMPLATE.render(
+            learner_level=learner_level,
+            scenario_name=scenario_name_str,
+            current_intent=current_intent_str,
+            constraint_texts=constraint_texts,
+            hit_constraints=hit_constraints_str,
+        )
+    else:
+        return EVALUATOR_SYSTEM_TEMPLATE.render(
+            phase=session_ctx.get("phase", "ICE_BREAKING"),
+            scene_name=task_packet.scene_prompt if task_packet else "General Conversation",
+            learner_level=learner_level,
+            vocab_tags=task_packet.vocab_tags if task_packet else [],
+            sentence_patterns=task_packet.sentence_patterns if task_packet else [],
+        )
+
+
+# ================= Director 信号解析（阶段二新增）====================
+
+def parse_director_signal(director_json: dict) -> dict:
+    """
+    解析 Director LLM 的 JSON 输出，返回标准化信号字典。
+
+    新格式（含双轨信号）：
+    {
+        "ai_translation_cn": "...",
+        "suggested_hints_en": ["...", "..."],
+        "coach_correction_cn": "...",
+        "intent_achieved": bool,
+        "constraints_hit": bool,
+        "scenario_completed": bool,
+        "constraints_hit_details": [...],
+        ...
+    }
+
+    旧格式（无双轨信号）：
+    {
+        "ai_translation_cn": "...",
+        "suggested_hints_en": ["...", "..."],
+        "coach_correction_cn": "...",
+        "should_advance_phase": bool,
+    }
+    """
+    result = {
+        "ai_translation_cn": director_json.get("ai_translation_cn", ""),
+        "suggested_hints_en": director_json.get("suggested_hints_en", []),
+        "coach_correction_cn": director_json.get("coach_correction_cn", ""),
+    }
+
+    # 检测是否为新格式（Phase 2）
+    if "intent_achieved" in director_json:
+        intent_achieved = bool(director_json.get("intent_achieved", False))
+        constraints_hit = bool(director_json.get("constraints_hit", False))
+        scenario_completed = intent_achieved and constraints_hit
+        result.update({
+            "intent_achieved": intent_achieved,
+            "constraints_hit": constraints_hit,
+            "scenario_completed": scenario_completed,
+            "constraints_hit_details": director_json.get("constraints_hit_details", []),
+        })
+    else:
+        # 旧格式兼容
+        result["should_advance_phase"] = director_json.get("should_advance_phase", False)
+
+    return result
+
+
+def check_scenario_completion(
+    session_ctx: dict,
+    task_packet: Optional[TaskPacket],
+    director_signal: Optional[dict] = None,
+) -> bool:
+    """
+    判断是否触发微场景通关。
+
+    通关条件（三选一）：
+    1. Director 双轨信号均为 True（主路径）
+    2. 轮数超限（max_turns exceeded，强制通关保底）
+    3. 所有 constraints 均已命中（提前通关）
+
+    Returns:
+        True if scenario should complete and trigger transition.
+    """
+    micro_mode = task_packet.has_constraints() if task_packet else False
+    if not micro_mode:
+        return False
+
+    # 条件1：Director 双轨信号
+    if director_signal and director_signal.get("scenario_completed"):
+        logger.info("[SCENARIO] 双轨校验通过，触发微场景通关")
+        return True
+
+    # 条件2：轮数超限
+    turn_count = session_ctx.get("turn_count_in_scenario", 0)
+    max_turns = (
+        task_packet.current_scenario.max_turns
+        if task_packet and task_packet.current_scenario
+        else 8
     )
+    if turn_count >= max_turns:
+        logger.info(f"[SCENARIO] 轮数超限（{turn_count}>={max_turns}），强制通关")
+        return True
+
+    # 条件3：所有约束已命中
+    all_constraints = (
+        (task_packet.constraints + task_packet.review_constraints)
+        if task_packet
+        else []
+    )
+    if all_constraints:
+        constraint_hits_set = session_ctx.get("_constraint_hits", set())
+        all_hit = all(
+            _get_constraint_id(c) in constraint_hits_set
+            for c in all_constraints
+            if _get_constraint_id(c) is not None
+        )
+        if all_hit:
+            logger.info("[SCENARIO] 所有约束已命中，提前通关")
+            return True
+
+    return False
 
 
 # ================= 核心计分与状态机 =================
 
-async def evaluate_and_check_progress(db: Session, user_id: str, _topic_id: int, user_text: str, session_hits: set,
-                                      session_ctx: dict, websocket: WebSocket, ws_lock: asyncio.Lock,
-                                      task_packet: Optional[TaskPacket] = None):
+async def evaluate_and_check_progress(
+    db: Session,
+    user_id: str,
+    topic_id: int,
+    user_text: str,
+    session_hits: set,
+    session_ctx: dict,
+    websocket: WebSocket,
+    ws_lock: asyncio.Lock,
+    task_packet: Optional[TaskPacket] = None,
+):
     """
-    L1 评估层：轻量同步，每轮对话触发。
-    保留原版词干提取、计分逻辑和 WS 进度推送。
+    L1 评估层：每轮对话触发。
+
+    新模式（L1 约束命中检测）：
+    - 遍历 constraints（含 review_constraints）
+    - 使用 normalize_text + simple_stem 匹配
+    - 更新 session_hits 和 task_score
+    - 推送 WebSocket 进度
     """
     try:
-        _preload_new_targets_if_empty(db, session_ctx, task_packet, _topic_id)
+        _preload_new_targets_if_empty(db, session_ctx, task_packet, topic_id)
 
+        micro_mode = task_packet.has_constraints() if task_packet else False
         phase = session_ctx.get("phase", "ICE_BREAKING")
 
-        # --- 计分模块 1：闲聊分 (40%) ---
-        if phase in ["ICE_BREAKING", "EVENT_EXTENSION", "WRAP_UP"]:
-            if user_text.strip():
-                chat_idx = session_ctx.get("chat_interaction_count", 0)
-                if chat_idx < len(CHAT_SCORE_CURVE):
-                    added_score = CHAT_SCORE_CURVE[chat_idx]
-                    session_ctx["chat_score"] = min(40.0, session_ctx.get("chat_score", 0.0) + added_score)
-                    session_ctx["chat_interaction_count"] = chat_idx + 1
-                    logger.info(
-                        f"[L1] Chat curve step {chat_idx + 1} (+{added_score:.1f}) | total={session_ctx['chat_score']:.1f}/40")
+        # 闲聊分（所有模式共享）
+        if user_text.strip():
+            chat_idx = session_ctx.get("chat_interaction_count", 0)
+            if chat_idx < len(CHAT_SCORE_CURVE):
+                added_score = CHAT_SCORE_CURVE[chat_idx]
+                session_ctx["chat_score"] = min(
+                    40.0, session_ctx.get("chat_score", 0.0) + added_score
+                )
+                session_ctx["chat_interaction_count"] = chat_idx + 1
+                logger.info(
+                    f"[L1] Chat curve step {chat_idx + 1} (+{added_score:.1f}) "
+                    f"| total={session_ctx['chat_score']:.1f}/40"
+                )
 
-        # --- 计分模块 2：核心任务 L1 命中检测 (60%) ---
-        new_targets = session_ctx.get("new_targets", [])
-        history_targets = session_ctx.get("history_targets", [])
-        all_active_targets = new_targets + history_targets
+        # 微场景模式：L1 约束命中检测
+        if micro_mode and user_text.strip():
+            all_constraints = task_packet.constraints + task_packet.review_constraints
+            _check_constraint_hits(
+                db, user_id, user_text, all_constraints,
+                session_hits, session_ctx,
+            )
 
-        if user_text.strip() and all_active_targets:
-            denom = max(1, len(new_targets) if new_targets else len(all_active_targets))
-            points_per_new_word = 60.0 / denom
+        # 旧模式：L1 节点命中检测（向后兼容）
+        elif not micro_mode and user_text.strip():
+            new_targets = session_ctx.get("new_targets", [])
+            history_targets = session_ctx.get("history_targets", [])
+            all_active_targets = new_targets + history_targets
 
-            user_normalized = normalize_text(user_text)
-            hit_info: list[tuple[int, float]] = []
+            if all_active_targets:
+                denom = max(1, len(new_targets) if new_targets else len(all_active_targets))
+                points_per_new_word = 60.0 / denom
 
-            for node in all_active_targets:
-                node_id = node.get("id")
-                node_text = node.get("node_text", "")
-                if node_id is None or not node_text or node_id in session_hits:
-                    continue
+                user_normalized = normalize_text(user_text)
+                hit_info: list[tuple[int, float]] = []
 
-                node_normalized = normalize_text(node_text)
-                quality = _l1_match_quality(node_normalized, user_normalized)
-                if quality > 0:
-                    session_hits.add(node_id)
-                    hit_info.append((node_id, quality))
+                for node in all_active_targets:
+                    node_id = node.get("id")
+                    node_text = node.get("node_text", "")
+                    if node_id is None or not node_text or node_id in session_hits:
+                        continue
 
-                    is_new = any(n.get("id") == node_id for n in new_targets)
-                    added_task = points_per_new_word if is_new else (points_per_new_word * 0.5)
-                    added_task *= quality
-                    session_ctx["task_score"] = min(60.0, session_ctx.get("task_score", 0.0) + added_task)
-                    logger.info(f"[L1] Hit '{node_text}' quality={quality:.2f} +{added_task:.1f}pts")
+                    node_normalized = normalize_text(node_text)
+                    quality = _l1_match_quality(node_normalized, user_normalized)
+                    if quality > 0:
+                        session_hits.add(node_id)
+                        hit_info.append((node_id, quality))
 
-            if hit_info:
-                hit_ids = [h[0] for h in hit_info]
-                existing = db.query(UserProgress).filter(
-                    UserProgress.user_id == user_id,
-                    UserProgress.node_id.in_(hit_ids),
-                ).all()
-                progress_map = {p.node_id: p for p in existing}
-
-                for node_id, quality in hit_info:
-                    progress = progress_map.get(node_id)
-                    if not progress:
-                        progress = UserProgress(
-                            user_id=user_id, node_id=node_id,
-                            mastery_score=0.0, practice_count=0,
+                        is_new = any(n.get("id") == node_id for n in new_targets)
+                        added_task = points_per_new_word if is_new else (points_per_new_word * 0.5)
+                        added_task *= quality
+                        session_ctx["task_score"] = min(
+                            60.0, session_ctx.get("task_score", 0.0) + added_task
                         )
-                        db.add(progress)
-                    progress.practice_count += 1
-                    progress.mastery_score = update_mastery(
-                        progress.mastery_score, was_correct=True, quality=quality
-                    )
-                    progress.last_practiced_at = datetime.datetime.utcnow()
+                        logger.info(f"[L1] Hit '{node_text}' quality={quality:.2f} +{added_task:.1f}pts")
 
-                db.commit()
+                if hit_info:
+                    hit_ids = [h[0] for h in hit_info]
+                    existing = db.query(UserProgress).filter(
+                        UserProgress.user_id == user_id,
+                        UserProgress.node_id.in_(hit_ids),
+                    ).all()
+                    progress_map = {p.node_id: p for p in existing}
 
-        # --- 计分模块 3：计算并下发总进度 ---
+                    for node_id, quality in hit_info:
+                        progress = progress_map.get(node_id)
+                        if not progress:
+                            progress = UserProgress(
+                                user_id=user_id, node_id=node_id,
+                                mastery_score=0.0, practice_count=0,
+                            )
+                            db.add(progress)
+                        progress.practice_count += 1
+                        progress.mastery_score = update_mastery(
+                            progress.mastery_score, was_correct=True, quality=quality
+                        )
+                        progress.last_practiced_at = datetime.datetime.utcnow()
+
+                    db.commit()
+
+        # WebSocket 进度推送
         completed_rounds = session_ctx.get("completed_rounds_in_level", 0)
         current_round_score = session_ctx.get("chat_score", 0.0) + session_ctx.get("task_score", 0.0)
-        overall_progress = min(100.0, ((completed_rounds * 100.0) + current_round_score) / float(ROUNDS_PER_LEVEL))
+        overall_progress = min(
+            100.0,
+            ((completed_rounds * 100.0) + current_round_score) / float(ROUNDS_PER_LEVEL)
+        )
 
         last_sent = session_ctx.get("_ws_last_progress")
         skip_ws = (
-                phase == "ICE_BREAKING"
-                and last_sent is not None
-                and abs(overall_progress - float(last_sent)) < 2.5
+            phase == "ICE_BREAKING"
+            and last_sent is not None
+            and abs(overall_progress - float(last_sent)) < 2.5
         )
 
-        try:
-            if not skip_ws:
+        if not skip_ws:
+            try:
                 async with ws_lock:
                     await websocket.send_text(json.dumps({
                         "event": "topic_mastery_reached",
                         "progress": overall_progress,
                         "level": session_ctx.get("current_level", 1),
-                        "next_topic_suggestion": ""
+                        "turn_in_scenario": session_ctx.get("turn_count_in_scenario", 0),
+                        "next_topic_suggestion": "",
                     }))
                 session_ctx["_ws_last_progress"] = overall_progress
-        except Exception as e:
-            logger.error(f"Ws send progress error: {e}")
+            except Exception as e:
+                logger.error(f"Ws send progress error: {e}")
 
     except Exception as e:
         logger.error(f"evaluate_and_check_progress error: {e}", exc_info=True)
 
 
+def _check_constraint_hits(
+    db: Session,
+    user_id: str,
+    user_text: str,
+    all_constraints: list,
+    session_hits: set,
+    session_ctx: dict,
+) -> None:
+    """
+    L1 约束命中检测（微场景模式专用）。
+
+    遍历 ScenarioConstraintItem 列表，使用 normalize_text + simple_stem 匹配。
+    命中的 constraint_id 写入 session_ctx["_constraint_hits"]。
+    """
+    user_normalized = normalize_text(user_text)
+    constraint_hits_set = session_ctx.get("_constraint_hits", set())
+
+    for constraint in all_constraints:
+        cid = _get_constraint_id(constraint)
+        if cid is None:
+            continue
+        if cid in constraint_hits_set:
+            continue
+
+        text = _get_constraint_text(constraint)
+        if not text:
+            continue
+
+        text_normalized = normalize_text(text)
+        quality = _l1_match_quality(text_normalized, user_normalized)
+        if quality > 0:
+            constraint_hits_set.add(cid)
+            session_hits.add(cid)  # 兼容旧 session_hits
+            session_ctx["_constraint_hits"] = constraint_hits_set
+
+            # 计分
+            points_per = 60.0 / max(1, len(all_constraints))
+            session_ctx["task_score"] = min(
+                60.0, session_ctx.get("task_score", 0.0) + (points_per * quality)
+            )
+
+            # 写回 UserProgress（通过 legacy_node_id 关联）
+            _update_constraint_mastery(db, user_id, constraint, quality)
+            logger.info(
+                f"[L1] Constraint hit: '{text}' quality={quality:.2f} "
+                f"(cid={cid})"
+            )
+
+
+def _update_constraint_mastery(
+    db: Session,
+    user_id: str,
+    constraint,
+    quality: float,
+) -> None:
+    """将约束命中写回 UserProgress 表（通过 legacy_node_id）"""
+    try:
+        legacy_id = None
+        if isinstance(constraint, ScenarioConstraintItem):
+            legacy_id = getattr(constraint, "legacy_node_id", None)
+        elif isinstance(constraint, dict):
+            legacy_id = constraint.get("legacy_node_id", constraint.get("id"))
+
+        if legacy_id is None:
+            return
+
+        progress = db.query(UserProgress).filter(
+            UserProgress.user_id == user_id,
+            UserProgress.node_id == legacy_id,
+        ).first()
+
+        if not progress:
+            progress = UserProgress(
+                user_id=user_id,
+                node_id=legacy_id,
+                mastery_score=0.0,
+                practice_count=0,
+            )
+            db.add(progress)
+
+        progress.practice_count += 1
+        progress.mastery_score = update_mastery(
+            progress.mastery_score, was_correct=True, quality=quality
+        )
+        progress.last_practiced_at = datetime.datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        logger.warning(f"[_update_constraint_mastery] Failed to update progress: {e}")
+        db.rollback()
+
+
 def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
     """
     L1 节点命中检测，返回质量分 0~1（0 = 未命中）。
+    支持精确匹配和词干匹配。
     """
     pattern_exact = rf"(?<!\w){re.escape(node_normalized)}(?!\w)"
     if re.search(pattern_exact, user_normalized):
@@ -468,81 +1051,142 @@ def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
     return 0.0
 
 
+def _select_next_scenario(
+    session_ctx: dict,
+    current_scenario_info,
+) -> Optional[dict]:
+    """
+    从当前微场景的 available_transitions 中选择下一场景。
+
+    选择策略：
+    1. 优先选 overlap_ratio 最高的
+    2. 若 available_transitions 为空，返回 None（教研干预触发）
+    """
+    if not current_scenario_info or not current_scenario_info.available_transitions:
+        return None
+
+    transitions = list(current_scenario_info.available_transitions)
+    transitions.sort(key=lambda t: t.get("overlap_ratio", 0), reverse=True)
+    return transitions[0] if transitions else None
+
+
 def advance_state_machine(
         session_ctx: dict,
         db: Session,
         current_topic: Topic,
         session_hits: set,
         task_packet: Optional[TaskPacket] = None,
-):
+        director_signal: Optional[dict] = None,
+) -> bool:
     """
-    推进对话阶段状态机。
-    [演进]：根据副 LLM 异步传来的 llm_wants_to_advance 标志位推进状态机。
+    推进状态机。
+
+    新模式（微场景）：
+    - 检查 scenario_completed 信号（双轨 / 超限 / 全部命中）
+    - 若触发：重置 turn_count_in_scenario = 0，设置 scenario_completed = True
+    - 返回 True 表示需要重建 Prompt（重新 build_prompts）
+
+    旧模式（四阶段）：
+    - 维持原四阶段流转逻辑不变
+    - 返回 True 表示发生了状态转换
+
+    Returns:
+        True if a state transition occurred.
     """
-    phase = session_ctx.get("phase", "ICE_BREAKING")
-    llm_signal = session_ctx.get("llm_wants_to_advance", False)
-    transitioned = False
+    micro_mode = task_packet.has_constraints() if task_packet else False
 
-    turns = session_ctx.get("phase_turns", 0)
-    force_advance = (turns >= MAX_TURNS_PER_PHASE)
+    if micro_mode:
+        # === 微场景模式 ===
+        completed = check_scenario_completion(session_ctx, task_packet, director_signal)
 
-    if phase == "ICE_BREAKING" and (llm_signal or force_advance):
-        session_ctx["phase"] = "CORE_TASK"
-        session_ctx["phase_turns"] = 0
-        session_ctx["llm_wants_to_advance"] = False
-        logger.info(
-            "🔄 [推进] ICE_BREAKING -> CORE_TASK（沿用预加载词表）: "
-            f"{[n.get('node_text') for n in session_ctx.get('new_targets', [])]}"
-        )
-        transitioned = True
+        if completed:
+            session_ctx["turn_count_in_scenario"] = 0
+            session_ctx["scenario_completed"] = True
 
-    elif phase == "CORE_TASK" and (llm_signal or force_advance):
-        session_ctx["phase"] = "EVENT_EXTENSION"
-        session_ctx["phase_turns"] = 0
-        session_ctx["llm_wants_to_advance"] = False
-        session_ctx["current_event"] = random.choice(EVENT_POOL)
-        transitioned = True
-        logger.info(f"🔄 [推进] 考核结束，触发随机剧情: {session_ctx['current_event']}")
+            # 清理 Director 信号
+            session_ctx.pop("director_scenario_completed", None)
+            session_ctx.pop("director_constraints_hit", None)
+            session_ctx.pop("director_intent_achieved", None)
 
-    elif phase == "EVENT_EXTENSION" and (llm_signal or force_advance):
-        session_ctx["phase"] = "WRAP_UP"
-        session_ctx["phase_turns"] = 0
-        session_ctx["llm_wants_to_advance"] = False
+            next_scenario = _select_next_scenario(session_ctx, task_packet.current_scenario)
+            if next_scenario:
+                session_ctx["next_scenario"] = next_scenario
+                logger.info(
+                    f"[SCENARIO] 微场景通关！准备流转至: "
+                    f"{next_scenario.get('scenario_name', 'N/A')}"
+                )
+            else:
+                session_ctx["next_scenario"] = None
+                logger.info(
+                    "[SCENARIO] 微场景通关！无后续场景（可能需要教研人员手动配置），本话题结束"
+                )
 
-        session_ctx["task_score"] = 60.0
-        logger.info("🎁 [奖励发放] 成功推进至收尾阶段，系统发放本轮保底满分 (任务分 60/60)！")
-        transitioned = True
-
-    elif phase == "WRAP_UP" and (llm_signal or force_advance):
-        session_ctx["phase"] = "ICE_BREAKING"
-        session_ctx["phase_turns"] = 0
-        session_ctx["llm_wants_to_advance"] = False
-
-        session_ctx["loop_count"] = session_ctx.get("loop_count", 1) + 1
-        session_ctx["completed_rounds_in_level"] = session_ctx.get("completed_rounds_in_level", 0) + 1
-
-        session_ctx["chat_score"] = 0.0
-        session_ctx["task_score"] = 0.0
-        session_ctx["chat_interaction_count"] = 0
-
-        if session_ctx["completed_rounds_in_level"] >= ROUNDS_PER_LEVEL:
-            session_ctx["current_level"] = session_ctx.get("current_level", 1) + 1
-            session_ctx["completed_rounds_in_level"] = 0
-
-            session_ctx["history_targets"] = []
-            session_ctx["new_targets"] = []
-            session_hits.clear()
-
-            logger.info(f"🎉🎉🎉 [状态机结算] 恭喜突破！成功晋级至 Lv.{session_ctx['current_level']}，词表重置 🎉🎉🎉")
+            return True
         else:
-            old_new = session_ctx.get("new_targets", [])
-            session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
-            session_ctx["new_targets"] = []
+            return False
+
+    else:
+        # === 旧四阶段模式（完全保留）===
+        phase = session_ctx.get("phase", "ICE_BREAKING")
+        llm_signal = session_ctx.get("llm_wants_to_advance", False)
+        turns = session_ctx.get("phase_turns", 0)
+        force_advance = (turns >= MAX_TURNS_PER_PHASE)
+        transitioned = False
+
+        if phase == "ICE_BREAKING" and (llm_signal or force_advance):
+            session_ctx["phase"] = "CORE_TASK"
+            session_ctx["phase_turns"] = 0
+            session_ctx["llm_wants_to_advance"] = False
             logger.info(
-                f"🔄 [状态机结算] 进入本段位第 {session_ctx['completed_rounds_in_level'] + 1} 轮；"
-                f"已合并 {len(old_new)} 个节点到 history，等待预加载新词。"
+                "Transition: ICE_BREAKING -> CORE_TASK: "
+                f"{[n.get('node_text') for n in session_ctx.get('new_targets', [])]}"
             )
+            transitioned = True
 
-        transitioned = True
+        elif phase == "CORE_TASK" and (llm_signal or force_advance):
+            session_ctx["phase"] = "EVENT_EXTENSION"
+            session_ctx["phase_turns"] = 0
+            session_ctx["llm_wants_to_advance"] = False
+            session_ctx["current_event"] = random.choice(EVENT_POOL)
+            transitioned = True
+            logger.info(f"Transition: CORE_TASK -> EVENT_EXTENSION: {session_ctx['current_event']}")
 
-    return transitioned
+        elif phase == "EVENT_EXTENSION" and (llm_signal or force_advance):
+            session_ctx["phase"] = "WRAP_UP"
+            session_ctx["phase_turns"] = 0
+            session_ctx["llm_wants_to_advance"] = False
+            session_ctx["task_score"] = 60.0
+            logger.info("Transition: EVENT_EXTENSION -> WRAP_UP (task_score bonus 60/60)")
+            transitioned = True
+
+        elif phase == "WRAP_UP" and (llm_signal or force_advance):
+            session_ctx["phase"] = "ICE_BREAKING"
+            session_ctx["phase_turns"] = 0
+            session_ctx["llm_wants_to_advance"] = False
+            session_ctx["loop_count"] = session_ctx.get("loop_count", 1) + 1
+            session_ctx["completed_rounds_in_level"] = session_ctx.get("completed_rounds_in_level", 0) + 1
+            session_ctx["chat_score"] = 0.0
+            session_ctx["task_score"] = 0.0
+            session_ctx["chat_interaction_count"] = 0
+
+            if session_ctx["completed_rounds_in_level"] >= ROUNDS_PER_LEVEL:
+                session_ctx["current_level"] = session_ctx.get("current_level", 1) + 1
+                session_ctx["completed_rounds_in_level"] = 0
+                session_ctx["history_targets"] = []
+                session_ctx["new_targets"] = []
+                session_hits.clear()
+                logger.info(
+                    f"LEVEL UP: Lv.{session_ctx['current_level']}, vocabulary reset"
+                )
+            else:
+                old_new = session_ctx.get("new_targets", [])
+                session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
+                session_ctx["new_targets"] = []
+                logger.info(
+                    f"Round {session_ctx['completed_rounds_in_level'] + 1} started, "
+                    f"merged {len(old_new)} nodes to history"
+                )
+
+            transitioned = True
+
+        return transitioned

@@ -45,6 +45,12 @@ class ChatState {
   final bool isGeneratingTopic;
   final bool isWaitingForTeachingData;
 
+  // ── 【阶段三新增】微场景流转 UI 状态 ────────────────────────────────
+  // 当前微场景名称（如 "Confirm Cup Size"），空字符串表示未启用微场景模式
+  final String currentScenarioName;
+  // 当前微场景的教学意图描述
+  final String currentIntent;
+
   ChatState({
     required this.status,
     required this.chatHistory,
@@ -57,6 +63,8 @@ class ChatState {
     this.currentRoleName = "AI Coach",
     this.isGeneratingTopic = false,
     this.isWaitingForTeachingData = false,
+    this.currentScenarioName = '',
+    this.currentIntent = '',
   });
 
   ChatState copyWith({
@@ -71,6 +79,8 @@ class ChatState {
     String? currentRoleName,
     bool? isGeneratingTopic,
     bool? isWaitingForTeachingData,
+    String? currentScenarioName,
+    String? currentIntent,
   }) {
     return ChatState(
       status: status ?? this.status,
@@ -89,6 +99,8 @@ class ChatState {
       isGeneratingTopic: isGeneratingTopic ?? this.isGeneratingTopic,
       isWaitingForTeachingData:
           isWaitingForTeachingData ?? this.isWaitingForTeachingData,
+      currentScenarioName: currentScenarioName ?? this.currentScenarioName,
+      currentIntent: currentIntent ?? this.currentIntent,
     );
   }
 }
@@ -384,6 +396,21 @@ class ChatNotifier extends Notifier<ChatState> {
           currentRoleName:
               data['role_name'] as String? ?? state.currentRoleName,
           masteryProgress: 0.0,
+          // topic_changed 时同时重置微场景状态（降级为话题级展示）
+          currentScenarioName: '',
+          currentIntent: '',
+        );
+      } else if (data['event'] == 'scenario_transition') {
+        // ── 【阶段三新增】微场景图谱流转事件 ──────────────────────────
+        // 当用户在当前微场景中命中了所有约束时，后端下发此事件，
+        // 通知前端切换到下一个微场景，同时附带教学意图描述。
+        // 注意：本事件仅更新状态，不做 UI 副作用（UI 副作用由 ChatScreen
+        // 中的 ref.listen 统一处理，严格遵守 Riverpod 纯状态 + 视图副作用分离原则）。
+        state = state.copyWith(
+          currentScenarioName:
+              data['new_scenario_name'] as String? ?? state.currentScenarioName,
+          currentIntent:
+              data['new_intent'] as String? ?? state.currentIntent,
         );
       } else if (data['event'] == 'session_report') {
         _handleSessionReport(data);

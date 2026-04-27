@@ -2,7 +2,7 @@ import uuid
 import datetime
 from typing import Optional
 
-from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON, Text
+from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON, Text, CheckConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = "sqlite:///english_coach.db"
@@ -75,6 +75,133 @@ class UserProgress(Base):
     mastery_score = Column(Float, default=0.0)    # 0~100
     practice_count = Column(Integer, default=0)
     last_practiced_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 阶段一新增：微场景图谱 (Micro-Scenario Graph)
+# 支撑「双轨校验·微场景图谱流转架构」
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class MicroScenario(Base):
+    """
+    微场景 — 场景图的节点。
+
+    一个 Topic 可包含多个 MicroScenario，形成子图。
+    MicroScenario 之间通过 ScenarioTransition 表建立流转边。
+
+    设计原则：
+    - intent_desc：给 Director LLM 看的教学意图（Intent 校验标尺）
+    - scene_desc：给 Actor LLM 看的自然情境描述
+    - depth_level：CEFR 难度等级，流转时严格同层隔离
+    - step_order：逻辑顺序（用于约束流转方向，禁止时光倒流）
+    """
+    __tablename__ = 'micro_scenarios'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 归属大话题
+    topic_id = Column(Integer, ForeignKey('topics.id'), nullable=False)
+
+    # 场景标识
+    scenario_code = Column(String, unique=True, nullable=False)  # e.g., "MCD_01_CONFIRM_SIZE"
+    scenario_name = Column(String, nullable=False)               # e.g., "Confirm Cup Size"
+
+    # 描述层
+    intent_desc = Column(Text, nullable=False)   # 教学意图："用户需要确认饮料杯尺寸（小/中/大）"
+    scene_desc = Column(Text, nullable=False)    # 自然情境："咖啡师正在询问您的饮料杯型"
+
+    # 难度等级（CEFR 对齐：1=Beginner, 2=Intermediate, 3=Advanced）
+    # 流转时不得跨级跳转，严格隔离
+    depth_level = Column(Integer, default=1)
+
+    # 逻辑顺序（整数，越大越靠后，用于约束流转方向）
+    # 流转方向：只允许 from.step_order <= to.step_order，防止时光倒流
+    step_order = Column(Integer, default=0)
+
+    # 元数据
+    is_entry_point = Column(Boolean, default=False)  # 是否为话题入口微场景
+    max_turns = Column(Integer, default=8)           # 建议最大轮数（超时强制流转）
+    weight = Column(Float, default=1.0)               # 推荐权重（影响图谱构建）
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
+
+class ScenarioConstraint(Base):
+    """
+    微场景的教学约束 — 双轨校验的「Constraints」标尺。
+
+    一个 MicroScenario 可绑定多个 ScenarioConstraint。
+    Director LLM 的双轨校验之一：检查这些 constraint_text 是否被用户使用。
+
+    设计原则：
+    - constraint_text：目标表达原文（双轨校验的核心检测目标）
+    - constraint_type：检测粒度 (word/phrase/sentence)
+    - depth_level：必须与父 MicroScenario.depth_level 一致或更低
+    - legacy_node_id：关联旧 TargetNode（迁移期兼容）
+    """
+    __tablename__ = 'scenario_constraints'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    micro_scenario_id = Column(Integer, ForeignKey('micro_scenarios.id'), nullable=False)
+
+    # 约束文本（目标表达）
+    constraint_text = Column(String, nullable=False)  # e.g., "medium"
+    constraint_type = Column(String, default="word")  # word / phrase / sentence
+
+    # 难度等级（必须与父 MicroScenario.depth_level 一致或更低）
+    depth_level = Column(Integer, default=1)
+
+    # 权重（影响约束被命中的重要性）
+    weight = Column(Float, default=1.0)
+
+    # 提示（当约束未被命中时，Director 可参考此提示）
+    hint_cn = Column(String, nullable=True)  # e.g., "咖啡中杯用 medium"
+
+    # 关联旧 TargetNode（迁移期兼容）
+    legacy_node_id = Column(Integer, ForeignKey('target_nodes.id'), nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class ScenarioTransition(Base):
+    """
+    微场景图谱的流转边 — 场景切换的桥梁。
+
+    设计原则：
+    - overlap_ratio：两场景间 Constraint 集合的 Jaccard IoU
+    - 阈值 0.6 <= ratio <= 0.8 时建立流转边（支撑 70/30 平滑原则）
+    - 流转方向由 step_order 约束：只允许 from.step_order <= to.step_order
+    - 双向边独立记录，支持非对称流转（业务需要时）
+    """
+    __tablename__ = 'scenario_transitions'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # 流转边的两个端点
+    from_scenario_id = Column(Integer, ForeignKey('micro_scenarios.id'), nullable=False)
+    to_scenario_id = Column(Integer, ForeignKey('micro_scenarios.id'), nullable=False)
+
+    # 流转条件
+    # overlap_ratio: [0.0, 1.0]，两场景间约束词汇的 Jaccard IoU
+    overlap_ratio = Column(Float, nullable=False)
+
+    # 流转触发方式
+    trigger_type = Column(String, default="auto")  # auto / manual / intent_driven
+
+    # 触发该流转所需的约束命中率阈值（如 0.8 = 80% 约束已命中）
+    required_hit_rate = Column(Float, default=0.8)
+
+    # 元数据
+    shared_constraints = Column(JSON, nullable=True)  # 两场景共享的 constraint_id 列表
+    created_by = Column(String, default="algorithm")  # "algorithm" / "manual"
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    # 约束：禁止自环
+    __table_args__ = (
+        CheckConstraint('from_scenario_id != to_scenario_id', name='no_self_loop'),
+    )
 
 
 class ChatSession(Base):
