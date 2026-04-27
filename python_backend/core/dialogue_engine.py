@@ -121,12 +121,25 @@ Just speak your English reply. DO NOT output any tags, JSON, or tool calls. Repl
 
 # 【副 LLM 导演评估模板】：专职负责翻译、提示与状态推进，高内聚高稳定
 EVALUATOR_SYSTEM_TEMPLATE = JINJA_ENV.from_string("""
-You are the backend AI Director for an English coaching application. 
+You are the backend AI Director for an English coaching application.
 You will be provided with the last exchange between the User and the AI Coach.
 
 Your job is to strictly use the `submit_analysis_and_feedback` tool to output a JSON object containing:
-1. `ai_translation_cn`: A natural Chinese translation of the AI Coach's English reply.
-2. `suggested_hints_en`: 2 or 3 short English responses the User could say next.
+1. `ai_translation_cn`: A natural (not literal) Chinese translation of the AI Coach's English reply.
+2. `suggested_hints_en`: 2 short English replies the User could say next.
+   - Each hint must be 3-8 words. No full sentences over 8 words.
+   - Match the learner's level ({{ learner_level }}):
+     * Beginner: simple 2-4 word phrases
+     * Intermediate: natural 4-7 word responses
+     * Advanced: idiomatic or complex 6-10 word replies
+   {% if vocab_tags %}
+   - Relevance rule: at least 1 of 3 hints must naturally use a word from the scene vocabulary ({{ vocab_tags | join(', ') }}) if provided.
+   {% endif %}
+   {% if sentence_patterns %}
+   - Relevance rule: at least 1 of 3 hints should follow a sentence pattern like ({{ sentence_patterns | join(' | ') }}) if provided.
+   {% endif %}
+   - Variety rule: do not give 3 hints that all start the same way (e.g. "I would like...", "I want...", "Can I have...").
+   - Format: string array, e.g. ["Sure.", "That sounds good.", "Let me think."]
 3. `coach_correction_cn`: If the User made a severe grammar/vocabulary mistake in their text, correct it in Chinese. Otherwise, leave empty.
 4. `should_advance_phase`: A boolean. Set to TRUE ONLY IF the AI Coach's reply strongly indicates that the current phase goal is fulfilled and the conversation is naturally transitioning.
 
@@ -138,6 +151,13 @@ Current Phase Rules for Evaluation:
 
 Current Phase: {{ phase }}
 Scene: {{ scene_name }}
+Learner Level: {{ learner_level }}
+{% if sentence_patterns %}
+[HELPFUL SENTENCE STARTERS — pick from these patterns when generating hints]
+{% for pattern in sentence_patterns %}
+- {{ pattern }}
+{% endfor %}
+{% endif %}
 """)
 
 # ================= 辅助工具 =================
@@ -299,11 +319,24 @@ def build_prompts(
     return static_system_prompt, dynamic_turn_prompt
 
 
-def build_evaluator_prompt(session_ctx: dict, task_packet: Optional[TaskPacket] = None) -> str:
+def build_evaluator_prompt(
+    session_ctx: dict,
+    task_packet: Optional[TaskPacket] = None,
+) -> str:
     """构建发给旁路副 LLM（导演）的系统 Prompt"""
     phase = session_ctx.get("phase", "ICE_BREAKING")
-    scene_name = task_packet.scene_prompt if task_packet else "Conversation"
-    return EVALUATOR_SYSTEM_TEMPLATE.render(phase=phase, scene_name=scene_name)
+    scene_name = task_packet.scene_prompt if task_packet else "General Conversation"
+    learner_level = task_packet.learner_level if task_packet else "Intermediate"
+    vocab_tags = task_packet.vocab_tags if task_packet else []
+    sentence_patterns = task_packet.sentence_patterns if task_packet else []
+
+    return EVALUATOR_SYSTEM_TEMPLATE.render(
+        phase=phase,
+        scene_name=scene_name,
+        learner_level=learner_level,
+        vocab_tags=vocab_tags,
+        sentence_patterns=sentence_patterns,
+    )
 
 
 # ================= 核心计分与状态机 =================

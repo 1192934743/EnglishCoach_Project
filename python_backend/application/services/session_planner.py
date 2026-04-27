@@ -298,6 +298,8 @@ def _build_packet_for_topic(
         review_nodes=[_nd(n) for n in review_nodes],
         difficulty_config=diff_config,
         scene_specific_rules=scene_rules,
+        vocab_tags=topic.vocab_tags or [],
+        sentence_patterns=topic.sentence_patterns or [],
         session_goal=_build_session_goal(topic, target_nodes, review_nodes, depth_tier),
     )
 
@@ -562,6 +564,8 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
             max_reply_sentences=compute_max_reply_sentences(eff, 1),
             target_nodes=[{"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level} for n in nodes],
             scene_specific_rules=first_topic.scene_specific_rules or [],
+            vocab_tags=first_topic.vocab_tags or [],
+            sentence_patterns=first_topic.sentence_patterns or [],
             session_goal=f"Practice basic {first_topic.title} conversation.",
         )
 

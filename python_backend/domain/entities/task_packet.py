@@ -168,6 +168,10 @@ class TaskPacket:
     # ── 场景专属护栏（来自 Topic.scene_specific_rules） ───────────────────────
     scene_specific_rules: list = field(default_factory=list)
 
+    # ── 教辅素材（来自 Topic.vocab_tags / sentence_patterns） ──────────────────
+    vocab_tags: list = field(default_factory=list)
+    sentence_patterns: list = field(default_factory=list)
+
     # ── 给 AI 看的自然语言目标（注入 Prompt，帮助 AI 理解本次练习意图）────────
     session_goal: str = ""
 
