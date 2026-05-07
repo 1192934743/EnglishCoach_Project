@@ -3,6 +3,7 @@ import uuid
 import time
 import asyncio
 import logging
+import base64
 from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -38,6 +39,9 @@ import infrastructure.topic_generator as topic_generator
 
 logger = logging.getLogger("EnglishCoach")
 router = APIRouter()
+
+# session_transcript 最大长度，防止内存无限增长
+MAX_TRANSCRIPT_LENGTH = 50
 
 async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dict):
     """
@@ -158,12 +162,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         asr_stream_task = None
         asr_stream_queue = None
 
+    async def _send_recovery_tts(websocket, ws_lock, user_settings=None):
+        """发送 ASR 恢复提示语，保底机制"""
+        recovery_text = "Sorry, I didn't catch that. Could you please repeat that?"
+        tts_engine_name = "azure"
+        tts_voice = "en-US-GuyNeural"
+        if user_settings:
+            tts_engine_name = user_settings.get("tts_engine", "azure")
+            tts_voice = user_settings.get("tts_voice", "en-US-GuyNeural")
+        try:
+            provider = get_tts_factory().get_provider(tts_engine_name)
+            if provider:
+                await provider.synthesize_single(
+                    recovery_text, websocket, ws_lock, CONFIG, voice_id=tts_voice
+                )
+        except Exception as e:
+            logger.warning(f"恢复 TTS 失败: {e}")
+
     consumer_task = None
     tts_queue = None
 
     is_flipped = False
-    session_hits = set()
     session_ctx = SessionContext()
+    session_ctx["visited_scenarios"] = set()  # 用于循环检测
     current_task_packet = None
     session_transcript: list[dict] = []
     session_id: str = str(uuid.uuid4())
@@ -173,7 +194,12 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
     if current_user:
         current_task_packet = await run_in_threadpool(
-            session_planner.build_task_packet, current_user.id
+            session_planner.build_task_packet_for_topic, current_user.id, DEFAULT_TOPIC_ID
+        )
+        logger.info(
+            f"[Init] topic_id={current_task_packet.topic_id} "
+            f"title={current_task_packet.topic_title} "
+            f"has_constraints={current_task_packet.has_constraints()}"
         )
         mastery_snapshot = await run_in_threadpool(
             _take_mastery_snapshot, current_user.id, current_task_packet
@@ -193,8 +219,17 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         else DEFAULT_TOPIC_ID
     )
 
+    # 验证 TaskPacket 数据
+    if current_task_packet:
+        logger.info(
+            f"[Prompt] Using topic_id={current_task_packet.topic_id} "
+            f"title={current_task_packet.topic_title} "
+            f"role={current_task_packet.role_name} "
+            f"has_constraints={current_task_packet.has_constraints()}"
+        )
+
     static_sys, dynamic_turn = build_prompts(
-        current_user, is_flipped, session_ctx, current_task_packet, session_hits
+        current_user, is_flipped, session_ctx, current_task_packet
     )
     chat_history = [{"role": "system", "content": static_sys}]
 
@@ -202,13 +237,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         with get_db() as db:
             await evaluate_and_check_progress(
                 db, current_user.id, topic_id_for_progress, "",
-                session_hits, session_ctx, websocket, ws_lock,
+                session_ctx, websocket, ws_lock,
                 task_packet=current_task_packet,
             )
             static_sys, dynamic_turn = build_prompts(
-                current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                current_user, is_flipped, session_ctx, current_task_packet
             )
             chat_history[0]["content"] = static_sys
+
+    # 首次连接时主动推送话题信息
+    if current_task_packet and current_task_packet.topic_id:
+        await safe_send_ws(websocket, ws_lock, {
+            "event": "topic_changed",
+            "topic_id": current_task_packet.topic_id,
+            "topic_title": current_task_packet.topic_title,
+            "topic_title_zh": getattr(current_task_packet, "topic_title_zh", None) or "",
+            "role_name": current_task_packet.role_name,
+            "depth_tier": getattr(current_task_packet, "depth_tier", None),
+            "session_id": session_id,
+        })
 
     try:
         while True:
@@ -281,7 +328,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     session_ctx["turn_count_in_scenario"] = 0
                     session_ctx.pop("_constraint_hits", None)
                     static_sys, dynamic_turn = build_prompts(
-                        current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                        current_user, is_flipped, session_ctx, current_task_packet
                     )
                     chat_history[0]["content"] = static_sys
                     await safe_send_ws(websocket, ws_lock, {"event": "role_swapped", "is_flipped": is_flipped})
@@ -301,7 +348,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             current_user.settings["tts_engine"] = str(tts_engine).strip()
                         if tts_voice is not None:
                             current_user.settings["tts_voice"] = str(tts_voice).strip()
-                        static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
+                        static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet)
                         chat_history[0]["content"] = static_sys
                     continue
 
@@ -310,7 +357,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         level = data.get("level", 1)
                         await run_in_threadpool(update_user_politeness, current_user.id, level)
                         current_user = await run_in_threadpool(init_or_get_user, current_user.id)
-                        static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
+                        static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet)
                         chat_history[0]["content"] = static_sys
                     continue
 
@@ -326,14 +373,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             if current_task_packet:
                                 topic_id_for_progress = current_task_packet.topic_id
                                 session_id = str(uuid.uuid4())
-                                session_hits.clear()
                                 session_transcript.clear()
                                 session_ctx = SessionContext()
                                 mastery_snapshot = await run_in_threadpool(
                                     _take_mastery_snapshot, current_user.id, current_task_packet
                                 )
                                 static_sys, dynamic_turn = build_prompts(
-                                    current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                                    current_user, is_flipped, session_ctx, current_task_packet
                                 )
                                 chat_history = [{"role": "system", "content": static_sys}]
                                 await safe_send_ws(websocket, ws_lock, {
@@ -365,12 +411,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             )
                             topic_id_for_progress = current_task_packet.topic_id
                             session_id = str(uuid.uuid4())
-                            session_hits.clear()
                             session_transcript.clear()
                             mastery_snapshot = await run_in_threadpool(_take_mastery_snapshot, current_user.id, current_task_packet)
                             session_ctx = SessionContext()
 
-                            static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet, session_hits)
+                            static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet)
                             chat_history = [{"role": "system", "content": static_sys}]
 
                             await safe_send_ws(websocket, ws_lock, {
@@ -431,6 +476,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
                 if action in ["user_finish_speaking", "test_text_input"]:
                     is_test_mode = (action == "test_text_input")
+                    is_ai_first_strike = data.get("is_ai_first_strike", False)  # ← 【阶段四新增】AI 先手标记
                     asr_partial_last_mono = 0.0
                     turn_id = _coerce_turn_trace_id(data.get("trace_id"))
                     wall_recv_ms = int(time.time() * 1000)
@@ -447,6 +493,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     # 1. 语音转文本
                     if is_test_mode:
                         user_text, user_emotion = data.get("text", ""), "neutral"
+                        # 【阶段四新增】AI 先手模式：注入占位符触发 LLM 主动开场
+                        if is_ai_first_strike and user_text == "":
+                            user_text = "[AI_FIRST_STRIKE]"
                         _latency_log(lat, "02_skip_asr_test_text")
                     else:
                         used_streaming_asr = False
@@ -457,13 +506,27 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             try: user_text, user_emotion = await asr_stream_task
                             except asyncio.CancelledError: user_text, user_emotion = "", "neutral"
                             except Exception as e:
-                                logger.warning("流式 ASR 收束失败，回退整包: %s", e)
+                                logger.warning(f"ASR(stream) 异常（静默处理，用户可能没说话）: {e}")
+                                user_text, user_emotion = "", "neutral"
                                 asr_stream_task = asr_stream_queue = None
-                                user_text, user_emotion = await run_volcengine_wss_asr(audio_buffer, CONFIG)
+                                audio_buffer.clear()
+                                # 静默处理，不发送 asr_error 事件，让后续流程正常处理空文本
                             asr_stream_task = asr_stream_queue = None
                             audio_buffer.clear()
                         else:
-                            user_text, user_emotion = await run_volcengine_wss_asr(audio_buffer, CONFIG)
+                            try:
+                                user_text, user_emotion = await run_volcengine_wss_asr(audio_buffer, CONFIG)
+                            except Exception as e:
+                                logger.error(f"ASR(wss) 服务端错误: {e}", exc_info=True)
+                                await safe_send_ws(websocket, ws_lock, {
+                                    "event": "asr_error",
+                                    "code": "WSS_FAILED",
+                                    "message": str(e)
+                                })
+                                await _send_recovery_tts(websocket, ws_lock, current_user.settings if current_user else None)
+                                audio_buffer.clear()
+                                _latency_log(lat, "02_asr_done", user_chars=0, streaming_asr=False)
+                                continue
                             audio_buffer.clear()
                             if asr_stream_task is not None or asr_stream_queue is not None:
                                 await _abort_streaming_asr()
@@ -475,27 +538,39 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
                         continue
 
-                    session_transcript.append({"role": "user", "text": user_text})
-
-                    # 阶段二：微场景轮数递增
-                    micro_mode = current_task_packet.has_constraints() if current_task_packet else False
-                    if micro_mode:
-                        session_ctx["turn_count_in_scenario"] = session_ctx.get("turn_count_in_scenario", 0) + 1
-                        logger.info(
-                            f"[Turn {session_ctx['turn_count_in_scenario']}] "
-                            f"(scenario: {current_task_packet.current_scenario.scenario_code if current_task_packet and current_task_packet.current_scenario else 'N/A'}) "
-                            f"User: {user_text}"
-                        )
+                    # 【阶段四新增】AI 先手：跳过 Director 评估，直接让 LLM 开口
+                    if is_ai_first_strike:
+                        _latency_log(lat, "02c_ai_first_strike_skip_director")
+                        # 不添加到 session_transcript，避免污染对话历史
                     else:
-                        session_ctx["phase_turns"] += 1
-                        logger.info(f"[Turn {session_ctx['phase_turns']}] ({session_ctx['phase']}) User: {user_text}")
+                        session_transcript.append({"role": "user", "text": user_text})
+
+                        # 阶段二：微场景轮数递增
+                        micro_mode = current_task_packet.has_constraints() if current_task_packet else False
+                        if micro_mode:
+                            session_ctx["turn_count_in_scenario"] = session_ctx.get("turn_count_in_scenario", 0) + 1
+                            logger.info(
+                                f"[Turn {session_ctx['turn_count_in_scenario']}] "
+                                f"(scenario: {current_task_packet.current_scenario.scenario_code if current_task_packet and current_task_packet.current_scenario else 'N/A'}) "
+                                f"User: {user_text}"
+                            )
+                        else:
+                            session_ctx["phase_turns"] += 1
+                            logger.info(f"[Turn {session_ctx['phase_turns']}] ({session_ctx['phase']}) User: {user_text}")
+
+                        # 控制 session_transcript 长度
+                        if len(session_transcript) > MAX_TRANSCRIPT_LENGTH:
+                            session_transcript[:] = session_transcript[-MAX_TRANSCRIPT_LENGTH:]
+                            logger.info(f"[TRANSCRIPT] Trimmed to last {MAX_TRANSCRIPT_LENGTH} entries")
+                    # 【阶段四新增】AI 先手跳过评估，micro_mode 变量在下面仍然可用
 
                     # 2. 状态机评估 (利用上一轮副LLM写下的 llm_wants_to_advance / director 信号)
-                    if current_user:
+                    # 【阶段四修正】AI 先手时跳过 Director 评估
+                    if current_user and not is_ai_first_strike:
                         with get_db() as db:
                             await evaluate_and_check_progress(
                                 db, current_user.id, topic_id_for_progress, user_text,
-                                session_hits, session_ctx, websocket, ws_lock,
+                                session_ctx, websocket, ws_lock,
                                 task_packet=current_task_packet,
                             )
                             fresh_topic = db.query(Topic).filter(Topic.id == topic_id_for_progress).first()
@@ -511,7 +586,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
                             # 状态流转执行
                             did_transition = advance_state_machine(
-                                session_ctx, db, fresh_topic, session_hits,
+                                session_ctx, db, fresh_topic,
                                 current_task_packet, director_signal=director_signal,
                             )
 
@@ -525,13 +600,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     # ── 修复1：前端状态同步 ──────────────────────────────────
                                     # 发送完整的流转元数据，让前端 UI 立即切换显示
                                     if next_sc and next_sc.get("scenario_id"):
-                                        # 有后续场景：正常流转
                                         next_scenario_id = next_sc["scenario_id"]
-                                        new_task_packet = await run_in_threadpool(
-                                            session_planner.build_task_packet_for_next_scenario,
-                                            current_user.id,
-                                            next_scenario_id,
-                                        )
+
+                                        # 循环检测：防止进入已访问过的场景
+                                        visited = session_ctx.get("visited_scenarios")
+                                        if isinstance(visited, set) and next_scenario_id in visited:
+                                            logger.warning(
+                                                f"[SCENARIO] 检测到循环访问: scenario_id={next_scenario_id} "
+                                                f"已在本话题中访问过，阻止循环流转。"
+                                            )
+                                            session_ctx["next_scenario"] = None
+                                            session_ctx["_cycle_detected_alert"] = True
+                                            # 不执行流转，进入 dead-end 处理
+                                        else:
+                                            # 正常流转
+                                            new_task_packet = await run_in_threadpool(
+                                                session_planner.build_task_packet_for_next_scenario,
+                                                current_user.id,
+                                                next_scenario_id,
+                                            )
                                         topic_id_for_progress = new_task_packet.topic_id
 
                                         # 计算过关奖励分
@@ -555,8 +642,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                         # 重置状态，准备新场景
                                         current_task_packet = new_task_packet
                                         session_id = str(uuid.uuid4())
-                                        session_hits.clear()
-                                        session_transcript.clear()
+                                        session_ctx.pop("_constraint_hits", None)
+                                        # 【修复】不要清空 session_transcript！AI 需要记忆之前的对话历史
+
+                                        # 循环检测：记录已访问场景
+                                        visited = session_ctx.get("visited_scenarios")
+                                        if isinstance(visited, set):
+                                            visited.add(next_scenario_id)
+
                                         mastery_snapshot = await run_in_threadpool(
                                             _take_mastery_snapshot, current_user.id, current_task_packet
                                         )
@@ -603,7 +696,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
 
                                         # 保存本次话题学习记录
                                         asyncio.create_task(_renew_task_packet(
-                                            current_user.id, current_task_packet, session_hits.copy(),
+                                            current_user.id, current_task_packet,
+                                            session_ctx.get("_constraint_hits", set()).copy(),
                                             session_transcript.copy(), llm_client, session_id, websocket, ws_lock,
                                         ))
 
@@ -617,7 +711,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                             else DEFAULT_TOPIC_ID
                                         )
                                         session_id = str(uuid.uuid4())
-                                        session_hits.clear()
+                                        session_ctx.pop("_constraint_hits", None)
                                         session_transcript.clear()
                                         mastery_snapshot = await run_in_threadpool(
                                             _take_mastery_snapshot, current_user.id, current_task_packet
@@ -634,31 +728,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     session_ctx.pop("next_scenario", None)
                                     session_ctx.pop("_dead_end_exit", None)
 
-                                # 旧模式：ICE_BREAKING 结算 + 新局重建
-                                elif not micro_mode and session_ctx["phase"] == "ICE_BREAKING":
-                                    preliminary = build_preliminary_report(
-                                        task_packet=current_task_packet, session_id=session_id,
-                                        session_hits=session_hits, session_ctx=session_ctx,
-                                        mastery_snapshot=mastery_snapshot, db=db, user_id=current_user.id,
-                                    )
-                                    await safe_send_ws(websocket, ws_lock, preliminary)
-                                    asyncio.create_task(_renew_task_packet(
-                                        current_user.id, current_task_packet, session_hits.copy(),
-                                        session_transcript.copy(), llm_client, session_id, websocket, ws_lock,
-                                    ))
-                                    current_task_packet = await run_in_threadpool(
-                                        session_planner.build_task_packet, current_user.id
-                                    )
-                                    topic_id_for_progress = current_task_packet.topic_id if current_task_packet.topic_id else DEFAULT_TOPIC_ID
-                                    session_id = str(uuid.uuid4())
-                                    session_hits.clear()
-                                    session_transcript.clear()
-                                    mastery_snapshot = await run_in_threadpool(
-                                        _take_mastery_snapshot, current_user.id, current_task_packet
-                                    )
-
                             static_sys, dynamic_turn = build_prompts(
-                                current_user, is_flipped, session_ctx, current_task_packet, session_hits
+                                current_user, is_flipped, session_ctx, current_task_packet
                             )
                             chat_history[0]["content"] = static_sys
 
@@ -686,7 +757,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     messages_to_send.append({"role": "system", "content": dynamic_turn})
 
                     # 3. 准备并发 TTS 任务
-                    if not is_test_mode:
+                    # 【阶段四修正】AI 先手时也需要 TTS：做 TTS 的条件 = 非测试模式 或 AI先手
+                    if not is_test_mode or is_ai_first_strike:
                         tts_queue = asyncio.Queue()
                         async def tts_consumer(queue: asyncio.Queue):
                             try:
@@ -771,7 +843,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                         if not _lat_flags["tts_enqueue"]:
                                             _lat_flags["tts_enqueue"] = True
                                             _latency_log(lat, "06_tts_first_text_enqueued", preview=chunk_text[:72])
-                                        if not is_test_mode and tts_queue:
+                                        # 【阶段四修正】AI 先手时也需要 TTS
+                                        if (not is_test_mode or is_ai_first_strike) and tts_queue:
                                             logger.info(f"[TRACK_LLM] 截断送入TTS队列 len={len(chunk_text)} text={chunk_text[:40]}")
                                             await tts_queue.put(chunk_text)
                                     sentence_buffer = ""
@@ -806,7 +879,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         continue
 
                     # 尾盘清理：刷入最后的文本并发送结束信号给 TTS 队列
-                    if not is_test_mode and tts_queue:
+                    # 【阶段四修正】AI 先手时也需要 TTS：做 TTS 的条件 = 非测试模式 或 AI先手
+                    if (not is_test_mode or is_ai_first_strike) and tts_queue:
                         final_chunk = sentence_buffer.strip()
                         if final_chunk:
                             if not _lat_flags["tts_enqueue"]:
@@ -819,6 +893,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     chat_history.append({"role": "assistant", "content": clean_full_reply})
                     chat_history = trim_chat_history(chat_history)
                     session_transcript.append({"role": "assistant", "text": clean_full_reply})
+
+                    # 控制 session_transcript 长度
+                    if len(session_transcript) > MAX_TRANSCRIPT_LENGTH:
+                        session_transcript[:] = session_transcript[-MAX_TRANSCRIPT_LENGTH:]
+                        logger.info(f"[TRANSCRIPT] Trimmed to last {MAX_TRANSCRIPT_LENGTH} entries")
 
                     logger.info(f"🤖 演员 AI: {clean_full_reply}")
                     _latency_log(lat, "98_assistant_reply_ready", ai_chars=len(clean_full_reply))

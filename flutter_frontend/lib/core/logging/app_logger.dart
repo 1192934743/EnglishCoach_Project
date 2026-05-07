@@ -30,9 +30,12 @@ class AppLogger {
 
     if (_logFile != null) {
       try {
-        final fileSize = await _logFile!.length();
-        if (fileSize > _maxFileSizeBytes) {
-          await _rotateLog();
+        // 检查文件是否存在，避免文件不存在时 length() 抛出异常
+        if (await _logFile!.exists()) {
+          final fileSize = await _logFile!.length();
+          if (fileSize > _maxFileSizeBytes) {
+            await _rotateLog();
+          }
         }
         await _logFile!.writeAsString(logEntry, mode: FileMode.append);
       } catch (e) {

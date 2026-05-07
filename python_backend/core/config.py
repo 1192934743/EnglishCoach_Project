@@ -60,7 +60,7 @@ TEACHING_CONFIG = {"enable_correction": False, "enable_translation": True, "enab
 
 # 业务全局常量
 LLM_MAX_TOKENS = 500
-DEFAULT_TOPIC_ID = 999
+DEFAULT_TOPIC_ID = 21
 MAX_AUDIO_BYTES = 5 * 1024 * 1024
 MAX_BUFFER_CHARS = 65
 FIRST_TTS_EARLY_FLUSH_CHARS = 22

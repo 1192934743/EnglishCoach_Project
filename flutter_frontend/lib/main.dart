@@ -1,10 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'core/logging/app_logger.dart';
 import 'core/network/backend_config.dart';
-import 'core/providers/settings_provider.dart';
+import 'core/providers/settings_provider.dart';  // settingsProvider, tr, mainTabIndexProvider, etc.
 import 'features/chat/presentation/chat_screen.dart';
 import 'features/chat/providers/chat_provider.dart';
 import 'features/settings/screens/settings_screen.dart';
@@ -93,12 +95,11 @@ class MainScreen extends ConsumerStatefulWidget {
 }
 
 class _MainScreenState extends ConsumerState<MainScreen> {
-  int _currentIndex = 0;
+  Timer? _aiFirstStrikeTimer;
 
   @override
   void initState() {
     super.initState();
-    // Listen for topic_changed events and show toast
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _listenTopicChanged();
     });
@@ -106,11 +107,9 @@ class _MainScreenState extends ConsumerState<MainScreen> {
 
   void _listenTopicChanged() {
     ref.listenManual<ChatState>(chatProvider, (prev, next) {
-      // Show toast when topic title changes
-      if (prev != null &&
-          next.currentTopicTitle != 'Simulation Practice' &&
-          (prev.currentTopicTitle != next.currentTopicTitle ||
-              prev.currentTopicTitleZh != next.currentTopicTitleZh)) {
+      // 检测话题切换成功
+      if (prev != null && next.currentTopicTitle != prev.currentTopicTitle) {
+        // 显示 toast
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Row(
@@ -132,17 +131,31 @@ class _MainScreenState extends ConsumerState<MainScreen> {
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           ),
         );
-        // Also switch to chat tab so user sees the new session
-        setState(() => _currentIndex = 0);
+
+        // 切换到对话 Tab
+        ref.read(mainTabIndexProvider.notifier).setTab(0);
+
+        // 取消之前的定时器，防止多次触发
+        _aiFirstStrikeTimer?.cancel();
+        // 使用 Timer 替代 Future.delayed，可在 dispose 中取消
+        _aiFirstStrikeTimer = Timer(const Duration(milliseconds: 500), () {
+          if (mounted) {
+            ref.read(chatProvider.notifier).triggerAiFirstStrike();
+          }
+        });
+
+        ref.read(chatProvider.notifier).onTopicChanged();
       }
     });
   }
 
   @override
   Widget build(BuildContext context) {
+    final tabIndex = ref.watch(mainTabIndexProvider);
+
     return Scaffold(
       body: IndexedStack(
-        index: _currentIndex,
+        index: tabIndex,
         children: const [
           ChatScreen(),
           TopicBrowserScreen(),
@@ -151,8 +164,8 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         ],
       ),
       bottomNavigationBar: BottomNavigationBar(
-        currentIndex: _currentIndex,
-        onTap: (i) => setState(() => _currentIndex = i),
+        currentIndex: tabIndex,
+        onTap: (i) => ref.read(mainTabIndexProvider.notifier).setTab(i),
         selectedItemColor: Colors.blueAccent,
         unselectedItemColor: Colors.grey,
         type: BottomNavigationBarType.fixed,
@@ -180,5 +193,11 @@ class _MainScreenState extends ConsumerState<MainScreen> {
         ],
       ),
     );
+  }
+
+  @override
+  void dispose() {
+    _aiFirstStrikeTimer?.cancel();
+    super.dispose();
   }
 }

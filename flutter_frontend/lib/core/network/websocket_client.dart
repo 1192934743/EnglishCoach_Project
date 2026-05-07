@@ -37,6 +37,7 @@ class WebSocketClient {
   int _reconnectAttempts = 0;
   bool _intentionalDisconnect = false;
   WsConnectionState _state = WsConnectionState.disconnected;
+  String? _userId;
 
   // ── 配置常量 ──────────────────────────────────────────────────────────────
   static String get _url => kBackendWsUrl;
@@ -49,6 +50,13 @@ class WebSocketClient {
   Stream<WsConnectionState> get connectionStateStream =>
       _stateController.stream;
 
+  /// 设置 user_id，后续 connect() 时会作为查询参数传递
+  void setUserId(String? userId) {
+    _userId = userId;
+  }
+
+  String? get userId => _userId;
+
   // ── 连接 ─────────────────────────────────────────────────────────────────
   Future<void> connect() async {
     if (_state == WsConnectionState.connected ||
@@ -57,10 +65,15 @@ class WebSocketClient {
     }
     _intentionalDisconnect = false;
     _setState(WsConnectionState.connecting);
-    AppLogger.log('WS', 'Connecting to $_url');
+
+    String fullUrl = _url;
+    if (_userId != null) {
+      fullUrl = '$_url?user_id=$_userId';
+    }
+    AppLogger.log('WS', 'Connecting to $fullUrl');
 
     try {
-      _channel = WebSocketChannel.connect(Uri.parse(_url));
+      _channel = WebSocketChannel.connect(Uri.parse(fullUrl));
       await _channel!.ready.timeout(
         const Duration(seconds: 8),
         onTimeout: () {

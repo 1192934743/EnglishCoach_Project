@@ -455,7 +455,6 @@ def build_prompts(
         is_flipped: bool,
         session_ctx: dict,
         task_packet: Optional[TaskPacket] = None,
-        session_hits: Optional[set] = None,
 ) -> Tuple[str, str]:
     """
     构建发给主 LLM（演员）的 Prompt。
@@ -475,8 +474,6 @@ def build_prompts(
         )
 
     rules = load_global_rules()
-    if session_hits is None:
-        session_hits = set()
 
     # 判断运行模式
     micro_mode = task_packet.has_constraints()
@@ -553,16 +550,26 @@ def build_prompts(
     )
 
     # 渲染静态模板
+    # 统一使用 session_ctx["_constraint_hits"] 作为唯一数据源
+    constraint_hits = session_ctx.get("_constraint_hits", set())
+    # 【修复】防止 from_dict 反序列化后 _constraint_hits 变成 MISSING_TYPE
+    if not isinstance(constraint_hits, set):
+        constraint_hits = set()
+        session_ctx["_constraint_hits"] = constraint_hits
+
+    # 默认值，micro_mode 时会被覆盖
+    current_constraint_str = ""
+
     if micro_mode:
         # 约束命中状态
         all_constraints = task_packet.constraints + task_packet.review_constraints
         unhit = [
             c for c in all_constraints
-            if _get_constraint_id(c) not in session_hits
+            if _get_constraint_id(c) not in constraint_hits
         ]
         hit = [
             c for c in all_constraints
-            if _get_constraint_id(c) in session_hits
+            if _get_constraint_id(c) in constraint_hits
         ]
         unhit_str = ", ".join(
             f"'{_get_constraint_text(c)}'" for c in unhit
@@ -590,20 +597,9 @@ def build_prompts(
             unhit_constraints=unhit_str,
             hit_constraints=hit_str,
         )
-    else:
-        # 旧模式 fallback
-        new_targets_list = session_ctx.get("new_targets", [])
-        history_targets_list = session_ctx.get("history_targets", [])
-        all_active = new_targets_list + history_targets_list
-        unhit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] not in session_hits]
-        hit_nodes = [n for n in all_active if n.get("id") is not None and n["id"] in session_hits]
-        unhit_targets = ", ".join(
-            [f"'{t}'" for t in (n.get("node_text") for n in unhit_nodes) if t]
-        ) or "(none — great job)"
-        hit_targets = ", ".join(
-            [f"'{t}'" for t in (n.get("node_text") for n in hit_nodes) if t]
-        ) or "(none yet)"
 
+    else:
+        # Legacy mode: use original template without constraint tracking
         static_prompt = STATIC_SYSTEM_TEMPLATE.render(
             canonical_level=canonical_level,
             depth_tier_val=depth_level,
@@ -611,30 +607,21 @@ def build_prompts(
             role_desc=role_desc,
             personality_desc=personality_desc,
             cog_line=cog_line,
+            cefr_force_block=cefr_force_block,
+            cefr_level=cefr_level,
             universal_rules=universal_rules,
             scene_specific_rules=scene_specific_rules,
             session_goal_line=session_goal_line,
         )
 
     # 渲染动态模板
-    if micro_mode:
-        turn_count = session_ctx.get("turn_count_in_scenario", 1)
-        dynamic_prompt = DYNAMIC_TURN_V2_TEMPLATE.render(
-            turn_count=turn_count,
-            max_turns=max_turns,
-            scene_desc=scene_desc_str,
-            current_constraint=current_constraint_str,
-        )
-    else:
-        phase = session_ctx.get("phase", "ICE_BREAKING")
-        current_event = session_ctx.get("current_event", "There is a small problem with your request.")
-        dynamic_prompt = DYNAMIC_TURN_TEMPLATE.render(
-            phase=phase,
-            scene_name=scene_name,
-            unhit_targets=unhit_targets,
-            hit_targets=hit_targets,
-            current_event=current_event,
-        )
+    turn_count = session_ctx.get("turn_count_in_scenario", 1)
+    dynamic_prompt = DYNAMIC_TURN_V2_TEMPLATE.render(
+        turn_count=turn_count,
+        max_turns=max_turns,
+        scene_desc=scene_desc_str,
+        current_constraint=current_constraint_str,
+    )
 
     return static_prompt, dynamic_prompt
 
@@ -645,51 +632,40 @@ def build_evaluator_prompt(
 ) -> str:
     """
     构建发给旁路副 LLM（导演）的系统 Prompt。
-
-    双模式自动选择：
-    - micro_mode=True: EVALUATOR_V2_TEMPLATE（含双轨校验）
-    - micro_mode=False: EVALUATOR_SYSTEM_TEMPLATE（旧四阶段）
+    使用微场景双轨校验模板 EVALUATOR_V2_TEMPLATE。
     """
     learner_level = task_packet.learner_level if task_packet else "Intermediate"
-    micro_mode = task_packet.has_constraints() if task_packet else False
+    all_constraints = (task_packet.constraints + task_packet.review_constraints) if task_packet else []
+    constraint_texts = [_get_constraint_text(c) for c in all_constraints]
 
-    if micro_mode:
-        all_constraints = (task_packet.constraints + task_packet.review_constraints) if task_packet else []
-        constraint_texts = [_get_constraint_text(c) for c in all_constraints]
+    # 获取已命中约束文本（用于注入 Evaluator，防止视野失忆）
+    constraint_hits_set = session_ctx.get("_constraint_hits", set())
+    # 【修复】防止 from_dict 反序列化后 _constraint_hits 变成 MISSING_TYPE
+    if not isinstance(constraint_hits_set, set):
+        constraint_hits_set = set()
+    hit_constraints_list = [
+        _get_constraint_text(c)
+        for c in all_constraints
+        if _get_constraint_id(c) in constraint_hits_set
+    ]
+    hit_constraints_str = ", ".join(f"'{t}'" for t in hit_constraints_list) if hit_constraints_list else ""
 
-        # 获取已命中约束文本（用于注入 Evaluator，防止视野失忆）
-        session_hits_set = session_ctx.get("_constraint_hits", set())
-        hit_constraints_list = [
-            _get_constraint_text(c)
-            for c in all_constraints
-            if _get_constraint_id(c) in session_hits_set
-        ]
-        hit_constraints_str = ", ".join(f"'{t}'" for t in hit_constraints_list) if hit_constraints_list else ""
+    scenario_name_str = (
+        task_packet.current_scenario.scenario_name
+        if task_packet.current_scenario and task_packet.current_scenario.scenario_name
+        else (task_packet.scene_prompt if task_packet else "General Conversation")
+    )
+    current_intent_str = (
+        task_packet.current_intent or task_packet.session_goal or "Complete the conversation naturally."
+    )
 
-        scenario_name_str = (
-            task_packet.current_scenario.scenario_name
-            if task_packet.current_scenario and task_packet.current_scenario.scenario_name
-            else (task_packet.scene_prompt if task_packet else "General Conversation")
-        )
-        current_intent_str = (
-            task_packet.current_intent or task_packet.session_goal or "Complete the conversation naturally."
-        )
-
-        return EVALUATOR_V2_TEMPLATE.render(
-            learner_level=learner_level,
-            scenario_name=scenario_name_str,
-            current_intent=current_intent_str,
-            constraint_texts=constraint_texts,
-            hit_constraints=hit_constraints_str,
-        )
-    else:
-        return EVALUATOR_SYSTEM_TEMPLATE.render(
-            phase=session_ctx.get("phase", "ICE_BREAKING"),
-            scene_name=task_packet.scene_prompt if task_packet else "General Conversation",
-            learner_level=learner_level,
-            vocab_tags=task_packet.vocab_tags if task_packet else [],
-            sentence_patterns=task_packet.sentence_patterns if task_packet else [],
-        )
+    return EVALUATOR_V2_TEMPLATE.render(
+        learner_level=learner_level,
+        scenario_name=scenario_name_str,
+        current_intent=current_intent_str,
+        constraint_texts=constraint_texts,
+        hit_constraints=hit_constraints_str,
+    )
 
 
 # ================= Director 信号解析（阶段二新增）====================
@@ -698,7 +674,7 @@ def parse_director_signal(director_json: dict) -> dict:
     """
     解析 Director LLM 的 JSON 输出，返回标准化信号字典。
 
-    新格式（含双轨信号）：
+    格式：
     {
         "ai_translation_cn": "...",
         "suggested_hints_en": ["...", "..."],
@@ -709,14 +685,6 @@ def parse_director_signal(director_json: dict) -> dict:
         "constraints_hit_details": [...],
         ...
     }
-
-    旧格式（无双轨信号）：
-    {
-        "ai_translation_cn": "...",
-        "suggested_hints_en": ["...", "..."],
-        "coach_correction_cn": "...",
-        "should_advance_phase": bool,
-    }
     """
     result = {
         "ai_translation_cn": director_json.get("ai_translation_cn", ""),
@@ -724,20 +692,16 @@ def parse_director_signal(director_json: dict) -> dict:
         "coach_correction_cn": director_json.get("coach_correction_cn", ""),
     }
 
-    # 检测是否为新格式（Phase 2）
-    if "intent_achieved" in director_json:
-        intent_achieved = bool(director_json.get("intent_achieved", False))
-        constraints_hit = bool(director_json.get("constraints_hit", False))
-        scenario_completed = intent_achieved and constraints_hit
-        result.update({
-            "intent_achieved": intent_achieved,
-            "constraints_hit": constraints_hit,
-            "scenario_completed": scenario_completed,
-            "constraints_hit_details": director_json.get("constraints_hit_details", []),
-        })
-    else:
-        # 旧格式兼容
-        result["should_advance_phase"] = director_json.get("should_advance_phase", False)
+    # 检测双轨信号
+    intent_achieved = bool(director_json.get("intent_achieved", False))
+    constraints_hit = bool(director_json.get("constraints_hit", False))
+    scenario_completed = intent_achieved and constraints_hit
+    result.update({
+        "intent_achieved": intent_achieved,
+        "constraints_hit": constraints_hit,
+        "scenario_completed": scenario_completed,
+        "constraints_hit_details": director_json.get("constraints_hit_details", []),
+    })
 
     return result
 
@@ -750,10 +714,11 @@ def check_scenario_completion(
     """
     判断是否触发微场景通关。
 
-    通关条件（三选一）：
-    1. Director 双轨信号均为 True（主路径）
+    通关条件（二选一）：
+    1. Director 双轨信号均为 True（需要 intent AND constraints 都满足）
     2. 轮数超限（max_turns exceeded，强制通关保底）
-    3. 所有 constraints 均已命中（提前通关）
+
+    注意：约束命中只用于教学反馈，不直接触发通关。
 
     Returns:
         True if scenario should complete and trigger transition.
@@ -778,23 +743,6 @@ def check_scenario_completion(
         logger.info(f"[SCENARIO] 轮数超限（{turn_count}>={max_turns}），强制通关")
         return True
 
-    # 条件3：所有约束已命中
-    all_constraints = (
-        (task_packet.constraints + task_packet.review_constraints)
-        if task_packet
-        else []
-    )
-    if all_constraints:
-        constraint_hits_set = session_ctx.get("_constraint_hits", set())
-        all_hit = all(
-            _get_constraint_id(c) in constraint_hits_set
-            for c in all_constraints
-            if _get_constraint_id(c) is not None
-        )
-        if all_hit:
-            logger.info("[SCENARIO] 所有约束已命中，提前通关")
-            return True
-
     return False
 
 
@@ -805,7 +753,6 @@ async def evaluate_and_check_progress(
     user_id: str,
     topic_id: int,
     user_text: str,
-    session_hits: set,
     session_ctx: dict,
     websocket: WebSocket,
     ws_lock: asyncio.Lock,
@@ -814,10 +761,10 @@ async def evaluate_and_check_progress(
     """
     L1 评估层：每轮对话触发。
 
-    新模式（L1 约束命中检测）：
+    微场景模式（L1 约束命中检测）：
     - 遍历 constraints（含 review_constraints）
     - 使用 normalize_text + simple_stem 匹配
-    - 更新 session_hits 和 task_score
+    - 更新 _constraint_hits 和 task_score
     - 推送 WebSocket 进度
     """
     try:
@@ -845,65 +792,8 @@ async def evaluate_and_check_progress(
             all_constraints = task_packet.constraints + task_packet.review_constraints
             _check_constraint_hits(
                 db, user_id, user_text, all_constraints,
-                session_hits, session_ctx,
+                session_ctx,
             )
-
-        # 旧模式：L1 节点命中检测（向后兼容）
-        elif not micro_mode and user_text.strip():
-            new_targets = session_ctx.get("new_targets", [])
-            history_targets = session_ctx.get("history_targets", [])
-            all_active_targets = new_targets + history_targets
-
-            if all_active_targets:
-                denom = max(1, len(new_targets) if new_targets else len(all_active_targets))
-                points_per_new_word = 60.0 / denom
-
-                user_normalized = normalize_text(user_text)
-                hit_info: list[tuple[int, float]] = []
-
-                for node in all_active_targets:
-                    node_id = node.get("id")
-                    node_text = node.get("node_text", "")
-                    if node_id is None or not node_text or node_id in session_hits:
-                        continue
-
-                    node_normalized = normalize_text(node_text)
-                    quality = _l1_match_quality(node_normalized, user_normalized)
-                    if quality > 0:
-                        session_hits.add(node_id)
-                        hit_info.append((node_id, quality))
-
-                        is_new = any(n.get("id") == node_id for n in new_targets)
-                        added_task = points_per_new_word if is_new else (points_per_new_word * 0.5)
-                        added_task *= quality
-                        session_ctx["task_score"] = min(
-                            60.0, session_ctx.get("task_score", 0.0) + added_task
-                        )
-                        logger.info(f"[L1] Hit '{node_text}' quality={quality:.2f} +{added_task:.1f}pts")
-
-                if hit_info:
-                    hit_ids = [h[0] for h in hit_info]
-                    existing = db.query(UserProgress).filter(
-                        UserProgress.user_id == user_id,
-                        UserProgress.node_id.in_(hit_ids),
-                    ).all()
-                    progress_map = {p.node_id: p for p in existing}
-
-                    for node_id, quality in hit_info:
-                        progress = progress_map.get(node_id)
-                        if not progress:
-                            progress = UserProgress(
-                                user_id=user_id, node_id=node_id,
-                                mastery_score=0.0, practice_count=0,
-                            )
-                            db.add(progress)
-                        progress.practice_count += 1
-                        progress.mastery_score = update_mastery(
-                            progress.mastery_score, was_correct=True, quality=quality
-                        )
-                        progress.last_practiced_at = datetime.datetime.utcnow()
-
-                    db.commit()
 
         # WebSocket 进度推送
         completed_rounds = session_ctx.get("completed_rounds_in_level", 0)
@@ -943,7 +833,6 @@ def _check_constraint_hits(
     user_id: str,
     user_text: str,
     all_constraints: list,
-    session_hits: set,
     session_ctx: dict,
 ) -> None:
     """
@@ -954,6 +843,10 @@ def _check_constraint_hits(
     """
     user_normalized = normalize_text(user_text)
     constraint_hits_set = session_ctx.get("_constraint_hits", set())
+    # 【修复】防止 from_dict 反序列化后 _constraint_hits 变成 MISSING_TYPE
+    if not isinstance(constraint_hits_set, set):
+        constraint_hits_set = set()
+        session_ctx["_constraint_hits"] = constraint_hits_set
 
     for constraint in all_constraints:
         cid = _get_constraint_id(constraint)
@@ -970,7 +863,6 @@ def _check_constraint_hits(
         quality = _l1_match_quality(text_normalized, user_normalized)
         if quality > 0:
             constraint_hits_set.add(cid)
-            session_hits.add(cid)  # 兼容旧 session_hits
             session_ctx["_constraint_hits"] = constraint_hits_set
 
             # 计分
@@ -1074,20 +966,14 @@ def advance_state_machine(
         session_ctx: dict,
         db: Session,
         current_topic: Topic,
-        session_hits: set,
         task_packet: Optional[TaskPacket] = None,
         director_signal: Optional[dict] = None,
 ) -> bool:
     """
-    推进状态机。
+    推进微场景状态机。
 
-    新模式（微场景）：
     - 检查 scenario_completed 信号（双轨 / 超限 / 全部命中）
     - 若触发：重置 turn_count_in_scenario = 0，设置 scenario_completed = True
-    - 返回 True 表示需要重建 Prompt（重新 build_prompts）
-
-    旧模式（四阶段）：
-    - 维持原四阶段流转逻辑不变
     - 返回 True 表示发生了状态转换
 
     Returns:
@@ -1103,10 +989,7 @@ def advance_state_machine(
             session_ctx["turn_count_in_scenario"] = 0
             session_ctx["scenario_completed"] = True
 
-            # 清理 Director 信号
-            session_ctx.pop("director_scenario_completed", None)
-            session_ctx.pop("director_constraints_hit", None)
-            session_ctx.pop("director_intent_achieved", None)
+            # 【注意】Director 信号清理统一在 coach_ws.py 处理，此处不再清理
 
             next_scenario = _select_next_scenario(session_ctx, task_packet.current_scenario)
             if next_scenario:
@@ -1116,77 +999,20 @@ def advance_state_machine(
                     f"{next_scenario.get('scenario_name', 'N/A')}"
                 )
             else:
-                session_ctx["next_scenario"] = None
-                logger.info(
-                    "[SCENARIO] 微场景通关！无后续场景（可能需要教研人员手动配置），本话题结束"
-                )
+                # 无后续场景：检查是否标记为正常出口
+                current_scenario = task_packet.current_scenario
+                if current_scenario and getattr(current_scenario, 'is_exit_point', False):
+                    session_ctx["next_scenario"] = None  # 正常结束
+                    logger.info("[SCENARIO] 微场景通关！正常出口场景结束")
+                else:
+                    # 孤立节点：触发教研告警
+                    logger.warning(
+                        "[SCENARIO] 孤立节点：无后续场景且未标记为出口。"
+                        "建议教研人员在图谱中为该场景配置 available_transitions 或标记 is_exit_point=True。"
+                    )
+                    session_ctx["next_scenario"] = None
+                    session_ctx["_isolated_node_alert"] = True
 
             return True
         else:
             return False
-
-    else:
-        # === 旧四阶段模式（完全保留）===
-        phase = session_ctx.get("phase", "ICE_BREAKING")
-        llm_signal = session_ctx.get("llm_wants_to_advance", False)
-        turns = session_ctx.get("phase_turns", 0)
-        force_advance = (turns >= MAX_TURNS_PER_PHASE)
-        transitioned = False
-
-        if phase == "ICE_BREAKING" and (llm_signal or force_advance):
-            session_ctx["phase"] = "CORE_TASK"
-            session_ctx["phase_turns"] = 0
-            session_ctx["llm_wants_to_advance"] = False
-            logger.info(
-                "Transition: ICE_BREAKING -> CORE_TASK: "
-                f"{[n.get('node_text') for n in session_ctx.get('new_targets', [])]}"
-            )
-            transitioned = True
-
-        elif phase == "CORE_TASK" and (llm_signal or force_advance):
-            session_ctx["phase"] = "EVENT_EXTENSION"
-            session_ctx["phase_turns"] = 0
-            session_ctx["llm_wants_to_advance"] = False
-            session_ctx["current_event"] = random.choice(EVENT_POOL)
-            transitioned = True
-            logger.info(f"Transition: CORE_TASK -> EVENT_EXTENSION: {session_ctx['current_event']}")
-
-        elif phase == "EVENT_EXTENSION" and (llm_signal or force_advance):
-            session_ctx["phase"] = "WRAP_UP"
-            session_ctx["phase_turns"] = 0
-            session_ctx["llm_wants_to_advance"] = False
-            session_ctx["task_score"] = 60.0
-            logger.info("Transition: EVENT_EXTENSION -> WRAP_UP (task_score bonus 60/60)")
-            transitioned = True
-
-        elif phase == "WRAP_UP" and (llm_signal or force_advance):
-            session_ctx["phase"] = "ICE_BREAKING"
-            session_ctx["phase_turns"] = 0
-            session_ctx["llm_wants_to_advance"] = False
-            session_ctx["loop_count"] = session_ctx.get("loop_count", 1) + 1
-            session_ctx["completed_rounds_in_level"] = session_ctx.get("completed_rounds_in_level", 0) + 1
-            session_ctx["chat_score"] = 0.0
-            session_ctx["task_score"] = 0.0
-            session_ctx["chat_interaction_count"] = 0
-
-            if session_ctx["completed_rounds_in_level"] >= ROUNDS_PER_LEVEL:
-                session_ctx["current_level"] = session_ctx.get("current_level", 1) + 1
-                session_ctx["completed_rounds_in_level"] = 0
-                session_ctx["history_targets"] = []
-                session_ctx["new_targets"] = []
-                session_hits.clear()
-                logger.info(
-                    f"LEVEL UP: Lv.{session_ctx['current_level']}, vocabulary reset"
-                )
-            else:
-                old_new = session_ctx.get("new_targets", [])
-                session_ctx["history_targets"] = session_ctx.get("history_targets", []) + old_new
-                session_ctx["new_targets"] = []
-                logger.info(
-                    f"Round {session_ctx['completed_rounds_in_level'] + 1} started, "
-                    f"merged {len(old_new)} nodes to history"
-                )
-
-            transitioned = True
-
-        return transitioned

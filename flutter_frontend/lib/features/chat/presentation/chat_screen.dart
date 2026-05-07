@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 import '../providers/chat_provider.dart';
 import '../widgets/scenario_goal_card.dart';
 import '../../../core/providers/settings_provider.dart';
+import '../../topics/models/topic_item.dart';  // ← 【阶段四新增】TopicItem 模型
 import 'session_report_sheet.dart';
 
 // ── Topic-change bottom sheet ─────────────────────────────────────────────
@@ -139,8 +140,22 @@ Future<void> _showTopicRequestSheet(BuildContext context, WidgetRef ref) async {
     context: context,
     isScrollControlled: true,
     backgroundColor: Colors.transparent,
-    builder: (_) =>
-        _TopicRequestSheet(onSubmit: (desc) => notifier.requestTopic(desc)),
+    builder: (_) => _TopicRequestSheet(
+      onSubmit: (desc) {
+        // 【阶段四修改】创建临时 TopicItem，id=0 表示自定义话题
+        final topic = TopicItem(
+          id: 0,
+          title: desc,
+          category: 'Custom',
+          learnerLevel: 'Intermediate',
+          roleName: 'Coach',
+          totalNodes: 0,
+          depthLevels: const [1],
+          avgMastery: 0.0,
+        );
+        notifier.requestTopic(topic);
+      },
+    ),
   );
 }
 

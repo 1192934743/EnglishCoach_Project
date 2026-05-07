@@ -300,3 +300,16 @@ Color masteryUiBandColor(MasteryUiBand band) {
       return const Color(0xFF43A047);
   }
 }
+
+// 【阶段四新增】控制底部导航栏的 Tab 索引
+// 0 = Chat, 1 = Topics, 2 = Stats, 3 = Settings
+class MainTabNotifier extends Notifier<int> {
+  @override
+  int build() => 0;
+
+  void setTab(int index) => state = index;
+}
+
+final mainTabIndexProvider = NotifierProvider<MainTabNotifier, int>(
+  () => MainTabNotifier(),
+);

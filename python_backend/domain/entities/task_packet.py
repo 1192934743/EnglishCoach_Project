@@ -14,8 +14,11 @@ TaskPacket — LMS 与对话引擎之间的唯一契约
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field, asdict
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 _CANONICAL_LEVELS = ("Beginner", "Elementary", "Intermediate", "Advanced")
 
@@ -192,6 +195,12 @@ class MicroScenarioInfo:
 
     @classmethod
     def from_dict(cls, d: dict) -> "MicroScenarioInfo":
+        available_transitions = d.get("available_transitions", []) or []
+        if not available_transitions:
+            logger.warning(
+                f"[MicroScenario] No transitions for scenario: {d.get('scenario_code')} "
+                f"(is_exit_point={d.get('is_exit_point', False)})"
+            )
         return cls(
             scenario_id=d.get("scenario_id", 0),
             scenario_code=d.get("scenario_code", ""),
@@ -201,7 +210,7 @@ class MicroScenarioInfo:
             depth_level=d.get("depth_level", 1),
             step_order=d.get("step_order", 0),
             max_turns=d.get("max_turns", 8),
-            available_transitions=d.get("available_transitions", []),
+            available_transitions=available_transitions,
         )
 
 

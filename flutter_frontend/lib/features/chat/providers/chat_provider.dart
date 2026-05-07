@@ -16,6 +16,7 @@ import '../../../core/network/user_manager.dart';
 import '../../../core/vad/silero_vad_service.dart';
 import '../../../core/config/dev_panel_config.dart';
 import '../models/session_report_model.dart';
+import '../../topics/models/topic_item.dart'; // ← 【阶段四新增】TopicItem 模型
 
 export '../models/session_report_model.dart';
 
@@ -41,6 +42,7 @@ class ChatState {
   final SessionReport? sessionReport;
   final String currentTopicTitle;
   final String currentTopicTitleZh;
+  final int? currentTopicId; // ← 【阶段四新增】用于精准重复检测
   final String currentRoleName;
   final bool isGeneratingTopic;
   final bool isWaitingForTeachingData;
@@ -60,6 +62,7 @@ class ChatState {
     this.sessionReport,
     this.currentTopicTitle = "Simulation Practice",
     this.currentTopicTitleZh = '',
+    this.currentTopicId, // ← 【阶段四新增】
     this.currentRoleName = "AI Coach",
     this.isGeneratingTopic = false,
     this.isWaitingForTeachingData = false,
@@ -76,6 +79,7 @@ class ChatState {
     Object? sessionReport = _sentinel,
     String? currentTopicTitle,
     String? currentTopicTitleZh,
+    int? currentTopicId, // ← 【阶段四新增】
     String? currentRoleName,
     bool? isGeneratingTopic,
     bool? isWaitingForTeachingData,
@@ -95,6 +99,7 @@ class ChatState {
           : sessionReport as SessionReport?,
       currentTopicTitle: currentTopicTitle ?? this.currentTopicTitle,
       currentTopicTitleZh: currentTopicTitleZh ?? this.currentTopicTitleZh,
+      currentTopicId: currentTopicId ?? this.currentTopicId, // ← 【阶段四新增】
       currentRoleName: currentRoleName ?? this.currentRoleName,
       isGeneratingTopic: isGeneratingTopic ?? this.isGeneratingTopic,
       isWaitingForTeachingData:
@@ -127,6 +132,7 @@ class ChatNotifier extends Notifier<ChatState> {
   bool _isInterrupting = false;
   bool _wasReconnecting = false;
   bool _isStartingListen = false;
+  bool _isRequestingTopic = false; // ← 【阶段四新增】防抖标志
   Timer? _maxListenTimer;
   bool _reportShowing = false;
 
@@ -205,9 +211,11 @@ class ChatNotifier extends Notifier<ChatState> {
 
     await Future.wait([
       // 任务1：VAD 纯本地加载，极少失败，但加上兜底
-      _vadService.initialize(silenceThresholdMs: settings.vadTimeout).catchError((e) {
-        debugPrint('[Warmup] ⚠️ VAD 初始化异常: $e');
-      }),
+      _vadService
+          .initialize(silenceThresholdMs: settings.vadTimeout)
+          .catchError((e) {
+            debugPrint('[Warmup] ⚠️ VAD 初始化异常: $e');
+          }),
 
       // 任务2：音频系统配置
       _initAudioSessionAndPlayer().catchError((e) {
@@ -215,8 +223,13 @@ class ChatNotifier extends Notifier<ChatState> {
       }),
 
       // 任务3：WebSocket 建连（最容易因为网络波动）
-      ref.read(websocketProvider).connect().catchError((e) {
-        debugPrint('[Warmup] ⚠️ WebSocket 初始连线失败 (将由断线重连机制接管): $e');
+      Future<void>(() async {
+        final userId = await UserManager.getOrCreateUuid();
+        final wsClient = ref.read(websocketProvider);
+        wsClient.setUserId(userId);
+        wsClient.connect().catchError((e) {
+          debugPrint('[Warmup] ⚠️ WebSocket 初始连线失败 (将由断线重连机制接管): $e');
+        });
       }),
     ]);
 
@@ -281,8 +294,9 @@ class ChatNotifier extends Notifier<ChatState> {
   Future<void> swapRole() async {
     final wsClient = ref.read(websocketProvider);
     try {
-      await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
+      wsClient.setUserId(userId);
+      await wsClient.connect();
       wsClient.sendCommand("swap_role", {"user_id": userId});
     } catch (_) {}
   }
@@ -290,8 +304,9 @@ class ChatNotifier extends Notifier<ChatState> {
   Future<void> updatePoliteness(int level) async {
     final wsClient = ref.read(websocketProvider);
     try {
-      await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
+      wsClient.setUserId(userId);
+      await wsClient.connect();
       wsClient.sendCommand("update_politeness", {
         "level": level,
         "user_id": userId,
@@ -393,6 +408,7 @@ class ChatNotifier extends Notifier<ChatState> {
           currentTopicTitle:
               data['topic_title'] as String? ?? state.currentTopicTitle,
           currentTopicTitleZh: zh.isNotEmpty ? zh : '',
+          currentTopicId: data['topic_id'] as int?, // ← 【阶段四新增】
           currentRoleName:
               data['role_name'] as String? ?? state.currentRoleName,
           masteryProgress: 0.0,
@@ -409,9 +425,12 @@ class ChatNotifier extends Notifier<ChatState> {
         state = state.copyWith(
           currentScenarioName:
               data['new_scenario_name'] as String? ?? state.currentScenarioName,
-          currentIntent:
-              data['new_intent'] as String? ?? state.currentIntent,
+          currentIntent: data['new_intent'] as String? ?? state.currentIntent,
+          isWaitingForTeachingData: false,
         );
+        // 【修复】清除 AI 先手流式累积文字，避免残留
+        activeAiTextNotifier.value = '';
+        activeUserTextNotifier.value = '';
       } else if (data['event'] == 'session_report') {
         _handleSessionReport(data);
       } else if (data['event'] == 'error') {
@@ -467,6 +486,15 @@ class ChatNotifier extends Notifier<ChatState> {
     _isAutoLooping = true;
     _latencyLogClient('06_tts_finished_event');
 
+    // 【阶段四修复】重置 _isStartingListen，允许后续 startListening
+    _isStartingListen = false;
+
+    // 【阶段四修复】AI 先手场景下重置 isWaitingForTeachingData
+    // 因为跳过了 Director 评估，不会有 teaching_data 事件来重置它
+    if (state.isWaitingForTeachingData) {
+      state = state.copyWith(isWaitingForTeachingData: false);
+    }
+
     final tid = _latencyTurnId;
     final sw = _latencySw;
     if (tid != null && tid.isNotEmpty && sw != null) {
@@ -479,19 +507,33 @@ class ChatNotifier extends Notifier<ChatState> {
       });
     }
 
+    // 【阶段四修复】等待音频播放完成，而不是立即关闭
+    // 估算音频时长并等待（字节率 = 24000Hz * 1ch * 2bytes = 48000 bytes/sec）
+    // 增加 1000ms 缓冲余量，防止估算偏短导致切换过早
+    const int bufferMs = 0;
     if (_playbackStartTime != null && _totalBytesReceived > 0) {
-      int durationMs = (_totalBytesReceived / 48.0).ceil();
+      int durationMs = (_totalBytesReceived / 48.0).ceil() + bufferMs;
       int elapsedMs = DateTime.now()
           .difference(_playbackStartTime!)
           .inMilliseconds;
       int timeLeftMs = durationMs - elapsedMs;
       if (timeLeftMs > 0) {
+        debugPrint(
+          '[AI_FIRST_STRIKE] 等待音频播放完成，还需 ${timeLeftMs}ms (原始估算: ${(durationMs - bufferMs)}ms + 缓冲 $bufferMs)',
+        );
         await Future.delayed(Duration(milliseconds: timeLeftMs));
       }
     }
+
+    // 确保播放器完全停止后再清理
     try {
-      if (_player.isPlaying) await _player.stopPlayer();
+      if (_player.isPlaying) {
+        await _player.stopPlayer();
+        // 给播放器一点时间完全停止
+        await Future.delayed(const Duration(milliseconds: 100));
+      }
     } catch (_) {}
+
     _isAutoLooping = false;
     _playbackStartTime = null;
     _totalBytesReceived = 0;
@@ -522,6 +564,8 @@ class ChatNotifier extends Notifier<ChatState> {
 
       final wsClient = ref.read(websocketProvider);
       // 不阻塞主线程连接，后台自动保障
+      final userId = await UserManager.getOrCreateUuid();
+      wsClient.setUserId(userId);
       wsClient.connect();
 
       // 强力激活 Android/iOS 底层硬件降噪
@@ -566,17 +610,6 @@ class ChatNotifier extends Notifier<ChatState> {
         if (state.status == ChatStatus.listening) {
           wsClient.sendAudio(data);
           _vadService.feedPCM(data);
-        }
-      });
-
-      _maxListenTimer?.cancel();
-      _maxListenTimer = Timer(const Duration(seconds: 30), () {
-        if (state.status == ChatStatus.listening) {
-          if (_hasSpoken) {
-            stopListeningAndSubmit();
-          } else {
-            forceIdle();
-          }
         }
       });
     } catch (e, st) {
@@ -722,15 +755,79 @@ class ChatNotifier extends Notifier<ChatState> {
     state = state.copyWith(sessionReport: null);
   }
 
-  Future<void> requestTopic(String description) async {
-    if (description.trim().isEmpty) return;
+  Future<void> requestTopic(TopicItem topic) async {
+    if (_isRequestingTopic) return; // 防抖
+
+    // 精准重复检测：使用 topic.id
+    if (state.currentTopicId == topic.id) {
+      return;
+    }
+
+    _isRequestingTopic = true;
+    state = state.copyWith(isGeneratingTopic: true);
+
     final wsClient = ref.read(websocketProvider);
     try {
+      final userId = await UserManager.getOrCreateUuid();
+      wsClient.setUserId(userId);
       await wsClient.connect();
       wsClient.sendCommand("request_topic", {
-        "description": description.trim(),
+        "user_id": userId,
+        "description": topic.title,
+        "topic_id": topic.id, // ← 【阶段四新增】发送给后端
       });
-    } catch (_) {}
+    } catch (_) {
+      _isRequestingTopic = false;
+      state = state.copyWith(isGeneratingTopic: false);
+    }
+  }
+
+  void onTopicChanged() {
+    _isRequestingTopic = false;
+  }
+
+  // ── 【阶段四新增】AI 先手开场 ───────────────────────────────────
+  // 注意：不设置为 listening，避免触发麦克风波纹 UI
+  Future<void> triggerAiFirstStrike() async {
+    if (state.status != ChatStatus.idle) return;
+    if (_isStartingListen) return;
+
+    _isStartingListen = true;
+    _latencySw = Stopwatch()..start();
+    _latencyLoggedFirstPcm = false;
+    _totalBytesReceived = 0;
+    _playbackStartTime = DateTime.now();
+    _latencyTurnId = const Uuid().v4().replaceAll('-', '');
+
+    // 设置为 speaking，让 UI 显示等待动画而不是麦克风录音
+    // 并启动播放器接收 TTS 流
+    state = state.copyWith(
+      status: ChatStatus.speaking,
+      isWaitingForTeachingData: true,
+    );
+
+    try {
+      await _player.startPlayerFromStream(
+        codec: Codec.pcm16,
+        numChannels: 1,
+        sampleRate: 24000,
+        interleaved: true,
+        bufferSize: 96000,
+      );
+      _latencyLogClient('03_player_stream_ready');
+      // 给播放器一点时间确保完全准备好
+      await Future.delayed(const Duration(milliseconds: 50));
+    } catch (_) {
+      _isStartingListen = false;
+      forceIdle();
+      return;
+    }
+
+    final wsClient = ref.read(websocketProvider);
+    wsClient.sendCommand("test_text_input", {
+      "text": "",
+      "is_ai_first_strike": true,
+    });
   }
 
   Future<void> updateLmsSettings({
@@ -742,8 +839,9 @@ class ChatNotifier extends Notifier<ChatState> {
   }) async {
     final wsClient = ref.read(websocketProvider);
     try {
-      await wsClient.connect();
       final userId = await UserManager.getOrCreateUuid();
+      wsClient.setUserId(userId);
+      await wsClient.connect();
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": depthPreference,

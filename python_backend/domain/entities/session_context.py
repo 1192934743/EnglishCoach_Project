@@ -63,19 +63,28 @@ class SessionContext:
 
     def pop(self, key: str, default: Any = ...) -> Any:
         """
-        模拟 dict.pop() 行为：读取并删除属性。
-        支持 declared 字段和 extra 字段。
-
-        注意：dataclass 默认字段在声明时存在，所以 extra 字段需要用 hasattr 判断。
+        模拟 dict.pop() 行为。
+        对于 dataclass 声明的字段：只重置为默认值，不真正删除（dataclass 字段无法删除）。
+        对于动态添加的实例属性：正常删除。
         """
-        has_attr = hasattr(self, key)
-        if default is ...:
-            value = getattr(self, key)
+        declared_fields = {f.name for f in fields(self)}
+
+        if key in declared_fields:
+            field_obj = next(f for f in fields(self) if f.name == key)
+            if default is ...:
+                value = getattr(self, key)
+            else:
+                value = getattr(self, key, default)
+            object.__setattr__(self, key, field_obj.default)
+            return value
         else:
-            value = getattr(self, key, default)
-        if has_attr:
-            delattr(self, key)
-        return value
+            if default is ...:
+                value = getattr(self, key)
+            else:
+                value = getattr(self, key, default)
+            if hasattr(self, key):
+                delattr(self, key)
+            return value
 
     # ── 序列化 ────────────────────────────────────────────────────────────
     def to_dict(self) -> dict:

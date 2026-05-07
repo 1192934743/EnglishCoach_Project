@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../../core/network/backend_config.dart';
 import '../../../core/network/server_debug_config.dart';
+import '../../../core/network/user_manager.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
 import '../../../core/config/dev_panel_config.dart';
@@ -34,10 +35,12 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           // ── 开发者模式面板 ─────────────────────────────────────────────────────
           const SizedBox(height: 8),
           _DevModePanel(
-            onServerChanged: () {
+            onServerChanged: () async {
               // 切换服务器后强制重连 WebSocket
               final wsClient = ref.read(websocketProvider);
               wsClient.disconnect();
+              final userId = await UserManager.getOrCreateUuid();
+              wsClient.setUserId(userId);
               wsClient.connect();
             },
           ),

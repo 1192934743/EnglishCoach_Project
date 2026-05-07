@@ -8,52 +8,10 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/network/api_client.dart';
 import '../../core/network/user_manager.dart';
-import '../../core/providers/settings_provider.dart';
+import '../../core/providers/settings_provider.dart';  // settingsProvider, tr, mainTabIndexProvider, etc.
 import '../../core/widgets/mastery_band_widgets.dart';
 import '../chat/providers/chat_provider.dart';
-
-// ── Data model ────────────────────────────────────────────────────────────
-class TopicItem {
-  final int id;
-  final String title;
-  final String? titleZh;
-  final String category;
-  final String learnerLevel;
-  final String roleName;
-  final int totalNodes;
-  final List<int> depthLevels;
-  final double avgMastery;
-  final String? lastPracticed;
-
-  const TopicItem({
-    required this.id,
-    required this.title,
-    this.titleZh,
-    required this.category,
-    required this.learnerLevel,
-    required this.roleName,
-    required this.totalNodes,
-    required this.depthLevels,
-    required this.avgMastery,
-    this.lastPracticed,
-  });
-
-  factory TopicItem.fromJson(Map<String, dynamic> j) => TopicItem(
-        id: (j['id'] as num).toInt(),
-        title: j['title'] as String,
-        titleZh: j['title_zh'] as String?,
-        category: j['category'] as String? ?? 'General',
-        learnerLevel: j['learner_level'] as String? ?? 'Intermediate',
-        roleName: j['role_name'] as String? ?? 'Coach',
-        totalNodes: j['total_nodes'] as int? ?? 0,
-        depthLevels: (j['depth_levels'] as List?)?.cast<int>() ?? [1],
-        avgMastery: (j['avg_mastery'] as num?)?.toDouble() ?? 0.0,
-        lastPracticed: j['last_practiced'] as String?,
-      );
-
-  bool get hasPracticed => avgMastery > 0;
-  int get maxDepth => depthLevels.isEmpty ? 1 : depthLevels.last;
-}
+import 'models/topic_item.dart';  // ← 【阶段四新增】共享 TopicItem 模型
 
 // ── Provider ──────────────────────────────────────────────────────────────
 final topicsProvider = FutureProvider<List<TopicItem>>((ref) async {
@@ -374,8 +332,15 @@ class _TopicBrowserScreenState extends ConsumerState<TopicBrowserScreen> {
   }
 
   void _startTopic(TopicItem topic) {
-    ref.read(chatProvider.notifier).requestTopic(topic.title);
-    // topic_changed event → MainScreen._listenTopicChanged() will auto-switch to chat tab
+    // 精准重复检测：使用 topic.id
+    final currentTopicId = ref.read(chatProvider).currentTopicId;
+    if (currentTopicId == topic.id) {
+      // 已是当前话题，切换到对话页面
+      ref.read(mainTabIndexProvider.notifier).setTab(0);
+      return;
+    }
+
+    ref.read(chatProvider.notifier).requestTopic(topic);
   }
 }
 
