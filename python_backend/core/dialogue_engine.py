@@ -85,6 +85,20 @@ DEPTH_FORCE_RULES = {
     ),
 }
 
+# ================= 统一入口辅助函数 =================
+
+def is_micro_mode(task_packet: Optional[TaskPacket]) -> bool:
+    """
+    【修复】统一判断是否启用微场景模式。
+
+    避免在多处重复写 has_constraints() 判断，确保 micro_mode 判断一致。
+    这样 Director 信号存活链路中不会因为 micro_mode 判断不一致而跳过信号分支。
+    """
+    if task_packet is None:
+        return False
+    return task_packet.has_constraints()
+
+
 # ================= Jinja2 模板引擎配置 =================
 JINJA_ENV = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
 
@@ -476,7 +490,7 @@ def build_prompts(
     rules = load_global_rules()
 
     # 判断运行模式
-    micro_mode = task_packet.has_constraints()
+    micro_mode = is_micro_mode(task_packet)
 
     # 基础变量
     scene_name = task_packet.scene_prompt
@@ -633,6 +647,8 @@ def build_evaluator_prompt(
     """
     构建发给旁路副 LLM（导演）的系统 Prompt。
     使用微场景双轨校验模板 EVALUATOR_V2_TEMPLATE。
+
+    【修复 Prompt 污染】：排除本轮刚命中的约束，防止 Director 误判。
     """
     learner_level = task_packet.learner_level if task_packet else "Intermediate"
     all_constraints = (task_packet.constraints + task_packet.review_constraints) if task_packet else []
@@ -643,10 +659,20 @@ def build_evaluator_prompt(
     # 【修复】防止 from_dict 反序列化后 _constraint_hits 变成 MISSING_TYPE
     if not isinstance(constraint_hits_set, set):
         constraint_hits_set = set()
+
+    # 【修复 Prompt 污染】：排除本轮刚命中的约束
+    # 本轮刚命中的 ID 不能告诉 Director，否则 Director 会认为"用户本轮没说也没关系"
+    current_turn_hits = session_ctx.get("_current_turn_hits", set())
+    if not isinstance(current_turn_hits, set):
+        current_turn_hits = set()
+
+    # 历史命中 = 总命中 - 本轮命中
+    history_hit_ids = constraint_hits_set - current_turn_hits
+
     hit_constraints_list = [
         _get_constraint_text(c)
         for c in all_constraints
-        if _get_constraint_id(c) in constraint_hits_set
+        if _get_constraint_id(c) in history_hit_ids
     ]
     hit_constraints_str = ", ".join(f"'{t}'" for t in hit_constraints_list) if hit_constraints_list else ""
 
@@ -723,7 +749,7 @@ def check_scenario_completion(
     Returns:
         True if scenario should complete and trigger transition.
     """
-    micro_mode = task_packet.has_constraints() if task_packet else False
+    micro_mode = is_micro_mode(task_packet) if task_packet else False
     if not micro_mode:
         return False
 
@@ -770,7 +796,7 @@ async def evaluate_and_check_progress(
     try:
         _preload_new_targets_if_empty(db, session_ctx, task_packet, topic_id)
 
-        micro_mode = task_packet.has_constraints() if task_packet else False
+        micro_mode = is_micro_mode(task_packet) if task_packet else False
         phase = session_ctx.get("phase", "ICE_BREAKING")
 
         # 闲聊分（所有模式共享）
@@ -834,12 +860,15 @@ def _check_constraint_hits(
     user_text: str,
     all_constraints: list,
     session_ctx: dict,
-) -> None:
+) -> set:
     """
     L1 约束命中检测（微场景模式专用）。
 
     遍历 ScenarioConstraintItem 列表，使用 normalize_text + simple_stem 匹配。
     命中的 constraint_id 写入 session_ctx["_constraint_hits"]。
+
+    Returns:
+        新命中的 constraint_id 集合（用于 Prompt 污染修复）
     """
     user_normalized = normalize_text(user_text)
     constraint_hits_set = session_ctx.get("_constraint_hits", set())
@@ -847,6 +876,9 @@ def _check_constraint_hits(
     if not isinstance(constraint_hits_set, set):
         constraint_hits_set = set()
         session_ctx["_constraint_hits"] = constraint_hits_set
+
+    # 记录本轮新命中的 ID，用于排除 Evaluator Prompt 中的"视野失忆"问题
+    newly_hit_ids: set = set()
 
     for constraint in all_constraints:
         cid = _get_constraint_id(constraint)
@@ -863,6 +895,7 @@ def _check_constraint_hits(
         quality = _l1_match_quality(text_normalized, user_normalized)
         if quality > 0:
             constraint_hits_set.add(cid)
+            newly_hit_ids.add(cid)
             session_ctx["_constraint_hits"] = constraint_hits_set
 
             # 计分
@@ -878,6 +911,12 @@ def _check_constraint_hits(
                 f"(cid={cid})"
             )
 
+    # 存储本轮新命中，供 Evaluator Prompt 排除使用
+    if newly_hit_ids:
+        session_ctx["_current_turn_hits"] = newly_hit_ids
+
+    return newly_hit_ids
+
 
 def _update_constraint_mastery(
     db: Session,
@@ -885,15 +924,63 @@ def _update_constraint_mastery(
     constraint,
     quality: float,
 ) -> None:
-    """将约束命中写回 UserProgress 表（通过 legacy_node_id）"""
+    """
+    将约束命中写回 UserProgress 表。
+
+    【修复】支持动态创建虚拟 TargetNode：
+    - 如果 legacy_node_id 存在，直接使用
+    - 如果 legacy_node_id 为 None 但 constraint_id 存在，
+      动态创建虚拟 TargetNode 并关联，确保学习记录能落库
+    """
     try:
         legacy_id = None
+        constraint_id = None
+        constraint_text = ""
+        constraint_type = "word"
+        constraint_depth = 1
+
         if isinstance(constraint, ScenarioConstraintItem):
             legacy_id = getattr(constraint, "legacy_node_id", None)
+            constraint_id = getattr(constraint, "constraint_id", None)
+            constraint_text = getattr(constraint, "constraint_text", "")
+            constraint_type = getattr(constraint, "constraint_type", "word")
+            constraint_depth = getattr(constraint, "depth_level", 1)
         elif isinstance(constraint, dict):
-            legacy_id = constraint.get("legacy_node_id", constraint.get("id"))
+            legacy_id = constraint.get("legacy_node_id")
+            constraint_id = constraint.get("constraint_id")
+            constraint_text = constraint.get("constraint_text", "")
+            constraint_type = constraint.get("constraint_type", "word")
+            constraint_depth = constraint.get("depth_level", 1)
+
+        # 如果没有 legacy_id 但有 constraint_text，动态创建虚拟 TargetNode
+        if legacy_id is None and constraint_text:
+            # 先查找是否已有同名虚拟节点
+            node_record = db.query(TargetNode).filter(
+                TargetNode.node_text == constraint_text,
+                TargetNode.topic_id == 0,  # 虚拟节点 topic_id=0
+            ).first()
+
+            if not node_record:
+                # 创建虚拟节点
+                node_record = TargetNode(
+                    topic_id=0,  # 0 表示虚拟节点
+                    node_text=constraint_text,
+                    node_type=constraint_type,
+                    depth_level=constraint_depth,
+                    weight=1.0,
+                )
+                db.add(node_record)
+                db.commit()
+                db.refresh(node_record)
+                logger.info(
+                    f"[L1] Created virtual TargetNode for constraint: "
+                    f"id={node_record.id}, text='{constraint_text}'"
+                )
+
+            legacy_id = node_record.id
 
         if legacy_id is None:
+            logger.debug(f"[_update_constraint_mastery] No legacy_id for constraint: {constraint_text}")
             return
 
         progress = db.query(UserProgress).filter(
@@ -979,7 +1066,7 @@ def advance_state_machine(
     Returns:
         True if a state transition occurred.
     """
-    micro_mode = task_packet.has_constraints() if task_packet else False
+    micro_mode = is_micro_mode(task_packet) if task_packet else False
 
     if micro_mode:
         # === 微场景模式 ===

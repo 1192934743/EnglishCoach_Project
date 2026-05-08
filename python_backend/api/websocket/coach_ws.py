@@ -30,7 +30,10 @@ from core.audio_service import (
     run_volc_streaming_asr_worker,
 )
 from infrastructure.tts import get_tts_factory
-from core.dialogue_engine import build_prompts, build_evaluator_prompt, advance_state_machine, evaluate_and_check_progress
+from core.dialogue_engine import (
+    build_prompts, build_evaluator_prompt, advance_state_machine,
+    evaluate_and_check_progress, is_micro_mode
+)
 from domain.entities.session_context import SessionContext
 import application.services.session_planner as session_planner
 import application.services.assessment_engine as assessment_engine
@@ -42,6 +45,25 @@ router = APIRouter()
 
 # session_transcript 最大长度，防止内存无限增长
 MAX_TRANSCRIPT_LENGTH = 50
+
+
+def cleanup_scenario_signals(session_ctx: dict) -> None:
+    """
+    【P3 修复】集中化微场景流转信号清理。
+
+    在微场景发生真实流转后调用，清除所有流转相关状态。
+    注意：不在此处清除 _constraint_hits，因为下一轮可能还需要历史命中信息。
+    """
+    session_ctx["scenario_completed"] = False
+    session_ctx.pop("director_scenario_completed", None)
+    session_ctx.pop("director_constraints_hit", None)
+    session_ctx.pop("director_intent_achieved", None)
+    session_ctx.pop("next_scenario", None)
+    session_ctx.pop("_isolated_node_alert", None)
+    session_ctx.pop("_cycle_detected_alert", None)
+    session_ctx.pop("_dead_end_exit", None)
+    session_ctx.pop("_current_turn_hits", None)  # 本轮命中标记也清理
+
 
 async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dict):
     """
@@ -119,7 +141,11 @@ async def _run_background_evaluator(
         session_ctx["director_scenario_completed"] = True
         session_ctx["director_constraints_hit"] = feedback_data.get("constraints_hit", False)
         session_ctx["director_intent_achieved"] = feedback_data.get("intent_achieved", False)
-        logger.info("[Director] 🎯 双轨校验通过，scenario_completed=True，触发微场景通关信号")
+        logger.info(
+            f"[Director] N轮信号已写入: scenario_completed=True "
+            f"(constraints={feedback_data.get('constraints_hit')}, "
+            f"intent={feedback_data.get('intent_achieved')})"
+        )
 
     # 最终装盘推给前端 (替换掉骨架屏)
     feedback_data["user_text"] = user_text
@@ -546,7 +572,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         session_transcript.append({"role": "user", "text": user_text})
 
                         # 阶段二：微场景轮数递增
-                        micro_mode = current_task_packet.has_constraints() if current_task_packet else False
+                        micro_mode = is_micro_mode(current_task_packet)
                         if micro_mode:
                             session_ctx["turn_count_in_scenario"] = session_ctx.get("turn_count_in_scenario", 0) + 1
                             logger.info(
@@ -576,13 +602,25 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                             fresh_topic = db.query(Topic).filter(Topic.id == topic_id_for_progress).first()
 
                             # 构建 Director 双轨信号（阶段二）
+                            # 【修复】统一使用 is_micro_mode() 判断，并添加日志追踪
+                            micro_mode = is_micro_mode(current_task_packet)
                             director_signal = None
-                            if micro_mode and session_ctx.get("director_scenario_completed"):
-                                director_signal = {
-                                    "scenario_completed": True,
-                                    "constraints_hit": session_ctx.get("director_constraints_hit", False),
-                                    "intent_achieved": session_ctx.get("director_intent_achieved", False),
-                                }
+                            if micro_mode:
+                                _dir_completed = session_ctx.get("director_scenario_completed", False)
+                                if _dir_completed:
+                                    director_signal = {
+                                        "scenario_completed": True,
+                                        "constraints_hit": session_ctx.get("director_constraints_hit", False),
+                                        "intent_achieved": session_ctx.get("director_intent_achieved", False),
+                                    }
+                                    logger.info(
+                                        f"[Director] N-1信号已获取，准备触发流转: "
+                                        f"micro_mode={micro_mode}, "
+                                        f"constraints={director_signal['constraints_hit']}, "
+                                        f"intent={director_signal['intent_achieved']}"
+                                    )
+                                else:
+                                    logger.debug("[Director] N-1信号为空，等待Director后台评估")
 
                             # 状态流转执行
                             did_transition = advance_state_machine(
@@ -666,33 +704,53 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                         session_ctx["_scenario_transition_pending"] = True
 
                                     else:
-                                        # ── 修复3：图谱尽头，优雅退出 ────────────────────
-                                        # 没有后续场景：强行推入 WRAP_UP，让 AI 自然道别
-                                        logger.info(
-                                            "[SCENARIO] Dead end: no next_scenario. "
-                                            "Pushing to WRAP_UP for graceful exit."
+                                        # ── P3终态事件：图谱尽头，优雅退出 ────────────────────
+                                        # 没有后续场景时，检查是否为合法出口节点
+                                        current_scenario = (
+                                            current_task_packet.current_scenario
+                                            if current_task_packet else None
                                         )
-                                        session_ctx["phase"] = "WRAP_UP"
-                                        session_ctx["phase_turns"] = 0
-                                        session_ctx["_dead_end_exit"] = True
+                                        is_exit_point = (
+                                            getattr(current_scenario, 'is_exit_point', False)
+                                            if current_scenario else False
+                                        )
 
                                         # 给任务分保底奖励（用户已通关，应该满分）
                                         session_ctx["task_score"] = 60.0
                                         reward_delta = session_ctx.get("task_score", 0.0)
 
-                                        await safe_send_ws(websocket, ws_lock, {
-                                            "event": "scenario_transition",
-                                            "previous_scenario_code": (
-                                                current_task_packet.current_scenario.scenario_code
-                                                if current_task_packet and current_task_packet.current_scenario
-                                                else ""
-                                            ),
-                                            "new_scenario_code": "__WRAP_UP__",
-                                            "new_scenario_name": "Session Complete",
-                                            "new_intent": "Wrap up and say goodbye naturally.",
-                                            "progress_delta": reward_delta,
-                                            "next_topic_suggestion": "",
-                                        })
+                                        if is_exit_point:
+                                            # 正常出口：发送 topic_completed 事件
+                                            await safe_send_ws(websocket, ws_lock, {
+                                                "event": "topic_completed",
+                                                "topic_id": (
+                                                    current_task_packet.topic_id
+                                                    if current_task_packet else 0
+                                                ),
+                                                "topic_title": (
+                                                    current_task_packet.topic_title
+                                                    if current_task_packet else "Unknown"
+                                                ),
+                                                "message": "Congratulations! You've completed this scenario.",
+                                                "progress_delta": reward_delta,
+                                            })
+                                            logger.info(
+                                                f"[SCENARIO] Topic completed: "
+                                                f"'{current_task_packet.topic_title if current_task_packet else 'Unknown'}'"
+                                            )
+                                        else:
+                                            # 异常孤立节点：发送 scenario_exhausted 警告事件
+                                            await safe_send_ws(websocket, ws_lock, {
+                                                "event": "scenario_exhausted",
+                                                "warning": "This scenario has no transitions configured.",
+                                                "suggestion": "Please contact support or try another topic.",
+                                                "progress_delta": reward_delta,
+                                            })
+                                            logger.warning(
+                                                f"[SCENARIO] Isolated node detected: "
+                                                f"scenario='{current_scenario.scenario_code if current_scenario else 'Unknown'}' "
+                                                f"has no outgoing transitions."
+                                            )
 
                                         # 保存本次话题学习记录
                                         asyncio.create_task(_renew_task_packet(
@@ -719,14 +777,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                         # dead-end 场景不触发 AI 先手，等用户下次主动开口
                                         session_ctx.pop("_scenario_transition_pending", None)
 
-                                    # 清理信号
-                                    session_ctx["scenario_completed"] = False
-                                    session_ctx.pop("director_scenario_completed", None)
-                                    session_ctx.pop("director_constraints_hit", None)
-                                    session_ctx.pop("director_intent_achieved", None)
-                                    session_ctx.pop("_constraint_hits", None)
-                                    session_ctx.pop("next_scenario", None)
-                                    session_ctx.pop("_dead_end_exit", None)
+                                    # 【P3 修复】使用集中化清理函数
+                                    cleanup_scenario_signals(session_ctx)
 
                             static_sys, dynamic_turn = build_prompts(
                                 current_user, is_flipped, session_ctx, current_task_packet

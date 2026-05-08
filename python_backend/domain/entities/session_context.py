@@ -95,9 +95,29 @@ class SessionContext:
 
     @classmethod
     def from_dict(cls, data: dict) -> "SessionContext":
-        """从字典重建（兼容旧 session_ctx dict，忽略未知键）"""
+        """从字典重建（兼容旧 session_ctx dict，忽略未知键）
+
+        【修复】处理 set 类型字段的反序列化：
+        - dataclass 的 field(default_factory=set) 在 asdict() 时会转为 list
+        - 反序列化时需要将 list 强制转回 set
+        """
         known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in data.items() if k in known})
+        # 预先收集所有声明为 set 的字段名
+        set_field_names = {
+            f.name for f in fields(cls)
+            if f.default_factory is not None
+            and callable(f.default_factory)
+            and f.default_factory() == set()
+        }
+
+        kwargs = {}
+        for k, v in data.items():
+            if k in known:
+                # 如果字段声明为 set 但传入是 list/tuple，强制转换
+                if k in set_field_names and isinstance(v, (list, tuple)):
+                    v = set(v)
+                kwargs[k] = v
+        return cls(**kwargs)
 
     @classmethod
     def from_json(cls, raw: str) -> "SessionContext":

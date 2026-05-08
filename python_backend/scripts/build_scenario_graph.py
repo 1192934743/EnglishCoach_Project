@@ -203,64 +203,94 @@ def build_scenario_graph(
         f"{ {sid: len(clist) for sid, clist in scenario_constraints.items()} }"
     )
 
-    # ── Step 3: 两两计算 IoU，建立流转候选 ─────────────────────────────────
+    # ── Step 3: 建立流转边 ─────────────────────────────────────────────────
+    # 【修复】优先级策略：
+    # 1. 相邻 step_order 的场景强制连边（主线流程）
+    # 2. 同 step_order 的场景通过 IoU 判断是否横向拓展
+    # 3. 移除 IoU 对主线流程的硬性阻断
     transitions_to_create: list[dict] = []
 
-    for i, sc_a in enumerate(scenarios):
-        for sc_b in scenarios[i + 1:]:
-            constraint_list_a = scenario_constraints.get(sc_a.id, [])
-            constraint_list_b = scenario_constraints.get(sc_b.id, [])
+    # 构建 step_order → scenario 映射
+    step_scenarios: dict[int, list] = {}
+    for sc in scenarios:
+        step_scenarios.setdefault(sc.step_order, []).append(sc)
 
-            iou = compute_constraint_iou(constraint_list_a, constraint_list_b)
+    # ── 3.1 强制连边：相邻 step_order 之间 ────────────────────────────────
+    # 主线流程必须连通，确保"点单→确认→支付"等正常流程不断链
+    sorted_steps = sorted(step_scenarios.keys())
+    for i in range(len(sorted_steps) - 1):
+        current_step = sorted_steps[i]
+        next_step = sorted_steps[i + 1]
 
-            # ── 修正拼写错误：使用正确的变量名 MIN_IOU_THRESHOLD / MAX_IOU_THRESHOLD
-            effective_min = MIN_IOU_THRESHOLD
-            if sc_b.is_entry_point:
-                effective_min -= ENTRY_POINT_BOOST
+        for sc_from in step_scenarios[current_step]:
+            for sc_to in step_scenarios[next_step]:
+                # 加载约束用于计算 shared_constraints
+                constraints_from = scenario_constraints.get(sc_from.id, [])
+                constraints_to = scenario_constraints.get(sc_to.id, [])
 
-            if not (effective_min <= iou <= MAX_IOU_THRESHOLD):
-                continue
+                # 计算共享约束
+                from_set = set(c.lower().strip() for c in constraints_from)
+                to_set = set(c.lower().strip() for c in constraints_to)
+                shared_texts = from_set & to_set
+                shared_ids = []
+                if shared_texts:
+                    results = db.query(ScenarioConstraint.id).filter(
+                        ScenarioConstraint.micro_scenario_id.in_([sc_from.id, sc_to.id]),
+                        ScenarioConstraint.constraint_text.in_(shared_texts),
+                    ).all()
+                    shared_ids = [r[0] for r in results]
 
-            # ── 修正：step_order 约束（禁止时光倒流）───────────────────────────
-            # 允许流转的方向：from.step_order <= to.step_order
-            # 双向边独立判断：需要分别满足各自的方向约束
-            if sc_a.step_order > sc_b.step_order:
-                # sc_a -> sc_b 方向：禁止（a 在 b 之后，时光倒流）
-                pass
-            else:
-                # sc_a -> sc_b 方向允许
-                shared_ids = _get_shared_constraint_ids(
-                    db, sc_a.id, sc_b.id,
-                    constraint_list_a, constraint_list_b,
-                )
+                # 计算 IoU（用于日志和记录）
+                iou = compute_constraint_iou(constraints_from, constraints_to)
+
                 transitions_to_create.append({
-                    "from_scenario_id": sc_a.id,
-                    "to_scenario_id": sc_b.id,
+                    "from_scenario_id": sc_from.id,
+                    "to_scenario_id": sc_to.id,
                     "overlap_ratio": round(iou, 4),
                     "trigger_type": "auto",
-                    "required_hit_rate": 0.8,
+                    "required_hit_rate": 0.5,  # 主线流程降低门槛
                     "shared_constraints": shared_ids,
                     "created_by": "algorithm",
                 })
-
-            if sc_b.step_order > sc_a.step_order:
-                # sc_b -> sc_a 方向：禁止（b 在 a 之后，时光倒流）
-                pass
-            else:
-                # sc_b -> sc_a 方向允许
-                shared_ids = _get_shared_constraint_ids(
-                    db, sc_b.id, sc_a.id,
-                    constraint_list_b, constraint_list_a,
+                logger.info(
+                    f"[STEP 3.1] Force-connect: {sc_from.scenario_code} -> {sc_to.scenario_code} "
+                    f"(step {current_step} -> {next_step}, IoU={iou:.2f})"
                 )
-                transitions_to_create.append({
-                    "from_scenario_id": sc_b.id,
-                    "to_scenario_id": sc_a.id,
-                    "overlap_ratio": round(iou, 4),
-                    "trigger_type": "auto",
-                    "required_hit_rate": 0.8,
-                    "shared_constraints": shared_ids,
-                    "created_by": "algorithm",
-                })
+
+    # ── 3.2 横向拓展：同 step_order 之间用 IoU 判断 ─────────────────────
+    # IoU 用于判断同级别的不同分支是否应该互通
+    for step_order, step_list in step_scenarios.items():
+        if len(step_list) < 2:
+            continue
+
+        for i, sc_a in enumerate(step_list):
+            for sc_b in step_list[i + 1:]:
+                constraint_list_a = scenario_constraints.get(sc_a.id, [])
+                constraint_list_b = scenario_constraints.get(sc_b.id, [])
+
+                iou = compute_constraint_iou(constraint_list_a, constraint_list_b)
+
+                # 只有 IoU 在有效范围内才连横向边
+                if MIN_IOU_THRESHOLD <= iou <= MAX_IOU_THRESHOLD:
+                    # 双向边
+                    for sc_from, sc_to in [(sc_a, sc_b), (sc_b, sc_a)]:
+                        shared_ids = _get_shared_constraint_ids(
+                            db, sc_from.id, sc_to.id,
+                            constraint_list_a, constraint_list_b,
+                        )
+                        transitions_to_create.append({
+                            "from_scenario_id": sc_from.id,
+                            "to_scenario_id": sc_to.id,
+                            "overlap_ratio": round(iou, 4),
+                            "trigger_type": "auto",
+                            "required_hit_rate": 0.8,
+                            "shared_constraints": shared_ids,
+                            "created_by": "algorithm",
+                        })
+                    logger.info(
+                        f"[STEP 3.2] Horizontal-connect: {sc_a.scenario_code} <-> {sc_b.scenario_code} "
+                        f"(step {step_order}, IoU={iou:.2f})"
+                    )
 
     logger.info(f"[STEP 3] Generated {len(transitions_to_create)} transition candidates")
 
