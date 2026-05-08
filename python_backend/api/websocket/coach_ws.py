@@ -53,16 +53,19 @@ def cleanup_scenario_signals(session_ctx: dict) -> None:
 
     在微场景发生真实流转后调用，清除所有流转相关状态。
     注意：不在此处清除 _constraint_hits，因为下一轮可能还需要历史命中信息。
+    阶段三更新：新增清理 _last_director_signal 和 director_coach_ready。
     """
     session_ctx["scenario_completed"] = False
     session_ctx.pop("director_scenario_completed", None)
     session_ctx.pop("director_constraints_hit", None)
     session_ctx.pop("director_intent_achieved", None)
+    session_ctx.pop("director_coach_ready", None)  # 阶段三新增
     session_ctx.pop("next_scenario", None)
     session_ctx.pop("_isolated_node_alert", None)
     session_ctx.pop("_cycle_detected_alert", None)
     session_ctx.pop("_dead_end_exit", None)
     session_ctx.pop("_current_turn_hits", None)  # 本轮命中标记也清理
+    session_ctx.pop("_last_director_signal", None)  # 阶段三新增：清理上轮 Director 信号
 
 
 async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dict):
@@ -129,22 +132,33 @@ async def _run_background_evaluator(
     feedback_data.setdefault("constraints_hit", False)
     feedback_data.setdefault("constraints_hit_details", [])
     feedback_data.setdefault("scenario_completed", False)
+    feedback_data.setdefault("coach_ready_to_transition", False)  # 阶段三新增
 
     # 提取状态机信号，写入上下文，供用户下一轮发言(L1 判定)时触发流转
     should_adv = feedback_data.get("should_advance_phase", False)
     if should_adv:
         session_ctx["llm_wants_to_advance"] = True
-        logger.info("[Director] 🎬 副模型导演批准：本阶段目标达成，准备进入下一阶段！")
+        logger.info("[Director] 副模型导演批准：本阶段目标达成，准备进入下一阶段！")
 
-    # Phase 2：双轨校验信号注入 session_ctx
+    # Phase 2/3：三轨校验信号注入 session_ctx
+    # 阶段三新增：保存完整信号到 _last_director_signal，供 build_prompts 的 Detail Probing 使用
+    session_ctx["_last_director_signal"] = {
+        "scenario_completed": feedback_data.get("scenario_completed", False),
+        "constraints_hit": feedback_data.get("constraints_hit", False),
+        "intent_achieved": feedback_data.get("intent_achieved", False),
+        "coach_ready_to_transition": feedback_data.get("coach_ready_to_transition", False),
+    }
+
     if feedback_data.get("scenario_completed"):
         session_ctx["director_scenario_completed"] = True
         session_ctx["director_constraints_hit"] = feedback_data.get("constraints_hit", False)
         session_ctx["director_intent_achieved"] = feedback_data.get("intent_achieved", False)
+        session_ctx["director_coach_ready"] = feedback_data.get("coach_ready_to_transition", False)  # 阶段三新增
         logger.info(
-            f"[Director] N轮信号已写入: scenario_completed=True "
+            f"[Director] 三轨信号已写入: scenario_completed=True "
             f"(constraints={feedback_data.get('constraints_hit')}, "
-            f"intent={feedback_data.get('intent_achieved')})"
+            f"intent={feedback_data.get('intent_achieved')}, "
+            f"coach_ready={feedback_data.get('coach_ready_to_transition')})"
         )
 
     # 最终装盘推给前端 (替换掉骨架屏)
@@ -628,7 +642,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 current_task_packet, director_signal=director_signal,
                             )
 
+                            # 【P4新增】立即清理 Director 信号，防止新场景的 build_prompts 读到脏数据
+                            # 问题根因：cleanup_scenario_signals 在 build_prompts 之后调用，存在时间窗口
                             if did_transition:
+                                session_ctx.pop("_last_director_signal", None)
                                 # ================================================================
                                 # 微场景通关处理（阶段三）：前端同步 + AI 先手 + 无缝流转
                                 # ================================================================

@@ -139,6 +139,9 @@ Coach turn length cap: {{ max_reply_sentences }} short in-character sentences pe
 [OUTPUT BUDGET & QUESTION POLICY]
 - Within your {{ max_reply_sentences }} sentence allowance: ask at most ONE question that expects an answer from the learner this turn.
 - Do NOT put two answerable questions in the same sentence.
+- ANTI-PATTERN: Never ask the same question in two different ways.
+  BAD: "Small, medium, or big? What size please?" (Two question marks = two questions)
+  GOOD: "What size would you like: small, medium, or large?" (One question mark)
 - No bullet lists, no lecture-style multi-paragraph answers. Use plain conversational text only.
 """)
 
@@ -219,32 +222,58 @@ ALREADY PRACTICED (these were used successfully before — do not force repetiti
 {% endif %}
 {% endif %}
 
+[CONVERSATION PRIORITIES]
+1. EMPATHY & FLOW FIRST: Always respond naturally and appropriately to what the learner JUST said. Never ignore their context, jokes, or complaints.
+2. TEACHING SECOND: Treat target vocabulary as secondary. NEVER act like a pushy salesman trying to hit a vocabulary KPI. If pushing a target word makes the conversation feel stiff or unnatural, ABANDON the word for this turn.
+3. CLOSURE RECOGNITION (CRITICAL): If the user explicitly signals they are done (e.g., "that's all", "thanks", "no more", "I'm good"), YOU MUST STOP ASKING QUESTIONS. Immediately wrap up with a natural closing remark (e.g., "Great, coming right up!", "Perfect, enjoy!").
+   **EXCEPTION**: If this is the FIRST TURN of a new scenario, their "thanks" or "bye" is just a leftover from the PREVIOUS task. DO NOT wrap up or say goodbye. Instead, briefly acknowledge it and PIVOT IMMEDIATELY to the current scenario's task.
+
 [OUTPUT BUDGET & QUESTION POLICY]
 - Within your {{ max_reply_sentences }} sentence allowance: ask at most ONE question that expects an answer from the learner this turn.
 - Do NOT put two answerable questions in the same sentence.
+- ANTI-PATTERN: Never ask the same question in two different ways.
+  BAD: "Small, medium, or big? What size please?" (Two question marks = two questions)
+  GOOD: "What size would you like: small, medium, or large?" (One question mark)
 - No bullet lists, no lecture-style multi-paragraph answers. Use plain conversational text only.
 """)
 
 # 【主 LLM 演员动态模板 V2】：微场景模式渐进诱导
+# 阶段三新增：Detail Probing 分支（当用户已达成意图但场景未通关时追问细节）
 DYNAMIC_TURN_V2_TEMPLATE = JINJA_ENV.from_string("""
 {% if turn_count == 1 %}
-[SITUATION — TURN {{ turn_count }} / {{ max_turns }}]
+[SITUATION — TURN {{ turn_count }} / {{ max_turns }} — NEW SCENE START]
 {{ scene_desc }}
 
-Action: Start the conversation naturally and set the scene for the learner.
-Give them space to respond. Do NOT push practice vocabulary yet.
+Action: This is a NEW SCENE. Initiate naturally.
+If the learner's message looks like a leftover greeting from the PREVIOUS scene (e.g., "thanks", "bye", "you're welcome", "have a nice day"):
+1. BRIEFLY accept it (one short phrase, e.g., "You're welcome!" or "Sure!").
+2. PIVOT IMMEDIATELY to this scenario's task. Do NOT continue saying goodbye.
+   Example: "You're welcome! Now, how would you like to pay?"
+3. If their message is NOT a leftover greeting, just start the scenario normally.
+
+{% elif intent_achieved %}
+[SITUATION — TURN {{ turn_count }} / {{ max_turns }} — DETAIL PROBING MODE]
+{{ scene_desc }}
+
+Action:
+1. REACT FIRST: Respond naturally to their last message. Empathize or acknowledge their context.
+2. PROBE SECOND: Ask a relevant follow-up question to add depth (e.g., preferences, details).
+{% if current_constraint %}
+3. VOCABULARY (OPTIONAL): If it fits the flow perfectly, steer the question to make '{{ current_constraint }}' a natural answer. IF IT FEELS AWKWARD OR FORCED, IGNORE THE VOCABULARY THIS TURN.
+{% endif %}
+
 {% elif turn_count == 2 %}
 [SITUATION — TURN {{ turn_count }} / {{ max_turns }}]
 {{ scene_desc }}
 
+Action:
+1. REACT FIRST: Acknowledge and respond to what the learner JUST said. DO NOT ignore their context.
 {% if current_constraint %}
-Action: If the user has NOT yet naturally used the target expression '{{ current_constraint }}',
-use a gentle prompt that makes saying it feel like the most natural choice.
-For example, offer a simple yes/no or choice question that leads toward the target word.
-DO NOT directly mention or spell out the target expression.
+2. GUIDE SECOND: If it naturally fits the current flow, gently create an opportunity for them to use '{{ current_constraint }}' (DO NOT say the word yourself). IF IT FEELS FORCED, SKIP THE VOCABULARY GOAL THIS TURN.
 {% else %}
-Action: The user seems engaged. Continue naturally guiding the conversation.
+2. GUIDE SECOND: Continue naturally guiding the conversation.
 {% endif %}
+
 {% else %}
 [SITUATION — TURN {{ turn_count }} / {{ max_turns }} — RESCUE MODE]
 {{ scene_desc }}
@@ -307,7 +336,11 @@ Learner Level: {{ learner_level }}
 {% endif %}
 """)
 
-# 【副 LLM 导演评估模板 V2】：微场景双轨校验模式
+# 【副 LLM 导演评估模板 V2】：微场景三轨校验模式（阶段三）
+# 职责分离设计：
+# - intent_achieved: 宽松，只要用户表达核心诉求即为 TRUE（解锁追问模式）
+# - constraints_hit: 教学词汇命中检测（保持现有逻辑）
+# - coach_ready_to_transition: 严格，只有 Coach 给出结语才为 TRUE（通关把关人）
 # 隐患1修复：在模板中注入 hit_constraints，防止"视野失忆"
 EVALUATOR_V2_TEMPLATE = JINJA_ENV.from_string("""
 You are the backend AI Director for an English coaching application.
@@ -327,12 +360,19 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
 3. `coach_correction_cn`: If the user made a grammar/vocabulary error, correct it in Chinese.
    Otherwise leave empty.
 
-=== DUAL-TRACK VALIDATION ===
+=== TRIPLE-TRACK VALIDATION ===
 
 4. `intent_achieved`: BOOLEAN
-   Set to TRUE if the user's reply demonstrates that they have fulfilled the teaching intent:
-   "{{ current_intent }}"
-   Consider: Did they meaningfully engage with the scenario goal? Was the conversation productive?
+   Set to TRUE if the user has clearly expressed their core request or main goal for this scenario.
+   This flag is used to unlock the "Detail Probing" mode — it should be easy to trigger.
+   
+   Examples of TRUE:
+   - "I'd like a coffee." (Core request stated, even if details are missing)
+   - "I need help with my bill."
+   - "Can I get the check please?"
+   
+   Set to FALSE only if the user is completely off-topic or just saying "hello".
+   This is NOT about transaction completion — it's about whether the user engaged with the scenario.
 
 5. `constraints_hit`: BOOLEAN
    IMPORTANT — Prevailing Rule: Check BOTH this turn AND the conversation history.
@@ -360,9 +400,32 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
    - quality 0.8 = stem/close variant in good context
    - quality 0.0 = not hit yet
 
-7. `scenario_completed`: BOOLEAN
-   Set to TRUE ONLY when BOTH:
-     intent_achieved == TRUE AND constraints_hit == TRUE.
+7. `coach_ready_to_transition`: BOOLEAN
+   This is the REAL gatekeeper for scenario completion. Be STRICT here.
+   
+   Set to TRUE ONLY IF the AI Coach's latest reply includes a smooth closing:
+   - The Coach has wrapped up the current topic
+   - The Coach has given closing remarks (e.g., "Here is your coffee. Have a great day!")
+   - The conversation has reached a natural end point
+   
+   Set to FALSE if ANY of these are true:
+   - The Coach is still asking follow-up questions ("What size would you like?")
+   - The Coach is mid-conversation
+   - The Coach hasn't concluded the topic yet
+   
+   Examples of TRUE:
+   - "Great job! See you next time."
+   - "Perfect, that's all for now. Have a wonderful day!"
+   - "Here is your order. That will be $5. Have a great day!"
+   
+   Examples of FALSE:
+   - "Would you like anything else with that?"
+   - "So which size would you prefer?"
+   - "Did you want any milk with that?"
+
+8. `scenario_completed`: BOOLEAN
+   Set to TRUE ONLY when ALL THREE are TRUE:
+     intent_achieved == TRUE AND constraints_hit == TRUE AND coach_ready_to_transition == TRUE.
    This signals the engine to trigger micro-scenario transition.
 
 Learner Level: {{ learner_level }}
@@ -630,11 +693,17 @@ def build_prompts(
 
     # 渲染动态模板
     turn_count = session_ctx.get("turn_count_in_scenario", 1)
+
+    # 从 session_ctx 获取上一轮 Director 信号（阶段三新增：用于 Detail Probing）
+    last_director = session_ctx.get("_last_director_signal", {})
+    prev_intent_achieved = last_director.get("intent_achieved", False)
+
     dynamic_prompt = DYNAMIC_TURN_V2_TEMPLATE.render(
         turn_count=turn_count,
         max_turns=max_turns,
         scene_desc=scene_desc_str,
         current_constraint=current_constraint_str,
+        intent_achieved=prev_intent_achieved,  # 阶段三新增：传入上一轮意图达成状态
     )
 
     return static_prompt, dynamic_prompt
@@ -707,6 +776,7 @@ def parse_director_signal(director_json: dict) -> dict:
         "coach_correction_cn": "...",
         "intent_achieved": bool,
         "constraints_hit": bool,
+        "coach_ready_to_transition": bool,
         "scenario_completed": bool,
         "constraints_hit_details": [...],
         ...
@@ -718,13 +788,18 @@ def parse_director_signal(director_json: dict) -> dict:
         "coach_correction_cn": director_json.get("coach_correction_cn", ""),
     }
 
-    # 检测双轨信号
+    # 检测三轨信号
     intent_achieved = bool(director_json.get("intent_achieved", False))
     constraints_hit = bool(director_json.get("constraints_hit", False))
-    scenario_completed = intent_achieved and constraints_hit
+    coach_ready = bool(director_json.get("coach_ready_to_transition", False))
+
+    # 三轨全部满足才通关（阶段三新增 coach_ready）
+    scenario_completed = intent_achieved and constraints_hit and coach_ready
+
     result.update({
         "intent_achieved": intent_achieved,
         "constraints_hit": constraints_hit,
+        "coach_ready_to_transition": coach_ready,  # 阶段三新增
         "scenario_completed": scenario_completed,
         "constraints_hit_details": director_json.get("constraints_hit_details", []),
     })
