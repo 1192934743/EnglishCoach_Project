@@ -24,7 +24,7 @@ from sqlalchemy.orm import Session
 from fastapi import WebSocket
 import jinja2
 
-from database import User, Topic, TargetNode, UserProgress
+from database import User, Topic, LearningSession
 from domain.entities.task_packet import (
     TaskPacket,
     compute_max_reply_sentences,
@@ -34,6 +34,13 @@ from domain.entities.task_packet import (
 from application.services.mastery_scorer import (
     update_mastery, L1_EXACT_QUALITY, L1_STEM_QUALITY,
     normalize_text, simple_stem,
+)
+from application.services.session_planner import (
+    should_wormhole,
+    should_depth_upgrade,
+    should_trigger_twist,
+    select_twist,
+    compute_scenario_mastery,
 )
 
 logger = logging.getLogger("EnglishCoach")
@@ -161,7 +168,11 @@ Bonus Review: The user already used these words: {{ hit_targets }}.
 Action: Keep the conversation flowing naturally toward completing the task.
 {% elif phase == 'EVENT_EXTENSION' %}
 PHASE 3: EVENT EXTENSION (The Twist)
+{% if twist_message %}
+Goal: {{ twist_message }}
+{% else %}
 Goal: Introduce this complication: '{{ current_event }}'. Test user's problem-solving skills.
+{% endif %}
 {% elif phase == 'WRAP_UP' %}
 PHASE 4: WRAP UP (Conclusion)
 Goal: Conclude naturally. Give one sentence of positive feedback and say a final goodbye.
@@ -220,6 +231,11 @@ TARGET EXPRESSIONS (learner should naturally use at least one): {{ unhit_constra
 {% if hit_constraints %}
 ALREADY PRACTICED (these were used successfully before — do not force repetition): {{ hit_constraints }}
 {% endif %}
+{% endif %}
+
+{% if twist_message %}
+[TWIST ALERT — Special Complication]
+{{ twist_message }}
 {% endif %}
 
 [CONVERSATION PRIORITIES]
@@ -485,7 +501,7 @@ def _preload_new_targets_if_empty(
         task_packet: Optional[TaskPacket],
         topic_id: int,
 ) -> None:
-    """本局 new_targets 为空时，从 TaskPacket 或 DB 预取最多 3 个节点（排除已在 history 中的 id）"""
+    """本局 new_targets 为空时，从 TaskPacket 预取最多 3 个节点（排除已在 history 中的 id）"""
     if session_ctx.get("new_targets"):
         return
     used_ids = {n.get("id") for n in session_ctx.get("history_targets", []) if n.get("id") is not None}
@@ -502,27 +518,8 @@ def _preload_new_targets_if_empty(
                 f"{[n.get('node_text') or n.get('constraint_text', '') for n in session_ctx['new_targets']]}"
             )
         return
-    if not topic_id:
-        session_ctx["new_targets"] = []
-        return
-    all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic_id).all()
-    candidates = [n for n in all_nodes if n.id not in used_ids]
-    candidates.sort(key=lambda n: (n.depth_level or 1, n.id))
-    selected = candidates[:3]
-    session_ctx["new_targets"] = [
-        {
-            "id": n.id,
-            "node_text": n.node_text,
-            "node_type": n.node_type,
-            "depth_level": n.depth_level,
-        }
-        for n in selected
-    ]
-    if session_ctx["new_targets"]:
-        logger.info(
-            f"[L1] Preloaded new_targets from DB: "
-            f"{[n.get('node_text') for n in session_ctx['new_targets']]}"
-        )
+    # 没有 TaskPacket 时，无法加载节点
+    session_ctx["new_targets"] = []
 
 
 # ================= 核心提示词构建 (动静分离) =================
@@ -637,6 +634,11 @@ def build_prompts(
     # 默认值，micro_mode 时会被覆盖
     current_constraint_str = ""
 
+    # Phase 4: Dynamic Twist - 初始化 twist_message
+    twist_message: str | None = None
+    if task_packet:
+        twist_message = getattr(task_packet, "twist_message", None) or session_ctx.get("twist_message")
+
     if micro_mode:
         # 约束命中状态
         all_constraints = task_packet.constraints + task_packet.review_constraints
@@ -673,6 +675,7 @@ def build_prompts(
             current_intent=current_intent_str,
             unhit_constraints=unhit_str,
             hit_constraints=hit_str,
+            twist_message=twist_message,
         )
 
     else:
@@ -698,6 +701,7 @@ def build_prompts(
     last_director = session_ctx.get("_last_director_signal", {})
     prev_intent_achieved = last_director.get("intent_achieved", False)
 
+    # 渲染动态模板
     dynamic_prompt = DYNAMIC_TURN_V2_TEMPLATE.render(
         turn_count=turn_count,
         max_turns=max_turns,
@@ -979,8 +983,6 @@ def _check_constraint_hits(
                 60.0, session_ctx.get("task_score", 0.0) + (points_per * quality)
             )
 
-            # 写回 UserProgress（通过 legacy_node_id 关联）
-            _update_constraint_mastery(db, user_id, constraint, quality)
             logger.info(
                 f"[L1] Constraint hit: '{text}' quality={quality:.2f} "
                 f"(cid={cid})"
@@ -991,96 +993,6 @@ def _check_constraint_hits(
         session_ctx["_current_turn_hits"] = newly_hit_ids
 
     return newly_hit_ids
-
-
-def _update_constraint_mastery(
-    db: Session,
-    user_id: str,
-    constraint,
-    quality: float,
-) -> None:
-    """
-    将约束命中写回 UserProgress 表。
-
-    【修复】支持动态创建虚拟 TargetNode：
-    - 如果 legacy_node_id 存在，直接使用
-    - 如果 legacy_node_id 为 None 但 constraint_id 存在，
-      动态创建虚拟 TargetNode 并关联，确保学习记录能落库
-    """
-    try:
-        legacy_id = None
-        constraint_id = None
-        constraint_text = ""
-        constraint_type = "word"
-        constraint_depth = 1
-
-        if isinstance(constraint, ScenarioConstraintItem):
-            legacy_id = getattr(constraint, "legacy_node_id", None)
-            constraint_id = getattr(constraint, "constraint_id", None)
-            constraint_text = getattr(constraint, "constraint_text", "")
-            constraint_type = getattr(constraint, "constraint_type", "word")
-            constraint_depth = getattr(constraint, "depth_level", 1)
-        elif isinstance(constraint, dict):
-            legacy_id = constraint.get("legacy_node_id")
-            constraint_id = constraint.get("constraint_id")
-            constraint_text = constraint.get("constraint_text", "")
-            constraint_type = constraint.get("constraint_type", "word")
-            constraint_depth = constraint.get("depth_level", 1)
-
-        # 如果没有 legacy_id 但有 constraint_text，动态创建虚拟 TargetNode
-        if legacy_id is None and constraint_text:
-            # 先查找是否已有同名虚拟节点
-            node_record = db.query(TargetNode).filter(
-                TargetNode.node_text == constraint_text,
-                TargetNode.topic_id == 0,  # 虚拟节点 topic_id=0
-            ).first()
-
-            if not node_record:
-                # 创建虚拟节点
-                node_record = TargetNode(
-                    topic_id=0,  # 0 表示虚拟节点
-                    node_text=constraint_text,
-                    node_type=constraint_type,
-                    depth_level=constraint_depth,
-                    weight=1.0,
-                )
-                db.add(node_record)
-                db.commit()
-                db.refresh(node_record)
-                logger.info(
-                    f"[L1] Created virtual TargetNode for constraint: "
-                    f"id={node_record.id}, text='{constraint_text}'"
-                )
-
-            legacy_id = node_record.id
-
-        if legacy_id is None:
-            logger.debug(f"[_update_constraint_mastery] No legacy_id for constraint: {constraint_text}")
-            return
-
-        progress = db.query(UserProgress).filter(
-            UserProgress.user_id == user_id,
-            UserProgress.node_id == legacy_id,
-        ).first()
-
-        if not progress:
-            progress = UserProgress(
-                user_id=user_id,
-                node_id=legacy_id,
-                mastery_score=0.0,
-                practice_count=0,
-            )
-            db.add(progress)
-
-        progress.practice_count += 1
-        progress.mastery_score = update_mastery(
-            progress.mastery_score, was_correct=True, quality=quality
-        )
-        progress.last_practiced_at = datetime.datetime.utcnow()
-        db.commit()
-    except Exception as e:
-        logger.warning(f"[_update_constraint_mastery] Failed to update progress: {e}")
-        db.rollback()
 
 
 def _l1_match_quality(node_normalized: str, user_normalized: str) -> float:
@@ -1151,7 +1063,55 @@ def advance_state_machine(
             session_ctx["turn_count_in_scenario"] = 0
             session_ctx["scenario_completed"] = True
 
-            # 【注意】Director 信号清理统一在 coach_ws.py 处理，此处不再清理
+            # 【新增】虫洞检查：通关后判断是否触发跨话题跳转（防沉迷：最多 1 次/会话）
+            if task_packet and task_packet.current_scenario:
+                current_scenario_id = task_packet.current_scenario.scenario_id
+                if current_scenario_id:
+                    wormhole = should_wormhole(
+                        session_ctx.get("user_id", ""),
+                        current_scenario_id,
+                        task_packet.topic_id,
+                        session_ctx,  # 【新增】传递 session_ctx 用于防沉迷计数
+                        db,
+                    )
+                    if wormhole:
+                        session_ctx["wormhole_triggered"] = wormhole
+                        session_ctx["wormhole_count"] = session_ctx.get("wormhole_count", 0) + 1
+                        logger.info(
+                            f"[WORMHOLE] 设置虫洞跳转 (count={session_ctx['wormhole_count']}): "
+                            f"{wormhole.get('target_scenario_name')} "
+                            f"(from topic {task_packet.topic_id} -> {wormhole.get('target_topic_id')})"
+                        )
+
+            # 【新增】难度晋级检查 - 只在话题出口触发，晋级标记持久化到下次
+            if task_packet and task_packet.current_scenario:
+                current_scenario = task_packet.current_scenario
+                is_exit = getattr(current_scenario, "is_exit_point", False)
+                if should_depth_upgrade(
+                    session_ctx.get("user_id", ""),
+                    task_packet.topic_id,
+                    current_scenario.scenario_id,
+                    is_exit,  # 【新增】必须为话题出口才允许晋级
+                    db,
+                ):
+                    target_depth = current_scenario.depth_level + 1
+                    # 晋级标记持久化（下一次进入话题时生效）
+                    from application.services.session_planner import save_depth_upgrade_marker
+                    save_depth_upgrade_marker(
+                        session_ctx.get("user_id", ""),
+                        task_packet.topic_id,
+                        target_depth,
+                        db,
+                    )
+                    session_ctx["depth_upgrade_available"] = True
+                    session_ctx["_pending_depth_upgrade"] = {
+                        "topic_id": task_packet.topic_id,
+                        "target_depth": target_depth,
+                    }
+                    logger.info(
+                        f"[DEPTH] 检测到可晋级到更高难度层级 (depth={target_depth})，"
+                        "标记已持久化到数据库"
+                    )
 
             next_scenario = _select_next_scenario(session_ctx, task_packet.current_scenario)
             if next_scenario:

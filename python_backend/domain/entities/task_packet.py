@@ -302,6 +302,11 @@ class TaskPacket:
     sentence_patterns: list = field(default_factory=list)
     session_goal: str = ""
 
+    # ── 【新增】Phase 4: Dynamic Twist ───────────────────────────────────
+    # 触发 Twist 时，Twist 消息会注入到 Director LLM 的 event 指令中
+    twist_message: Optional[str] = None
+    twist_triggered_at_turn: int = 0  # Twist 触发时的轮次，0 表示未触发
+
     # ── 序列化 ──────────────────────────────────────────────────────────────
     def to_dict(self) -> dict:
         d = asdict(self)

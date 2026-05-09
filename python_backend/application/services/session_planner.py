@@ -31,11 +31,8 @@ from database import (
     SessionLocal,
     User,
     Topic,
-    TargetNode,
-    UserProgress,
     LearningSession,
     effective_topic_title_zh,
-    # 阶段三新增：微场景图谱
     MicroScenario,
     ScenarioConstraint,
     ScenarioTransition,
@@ -50,7 +47,6 @@ from domain.entities.task_packet import (
     effective_learner_label,
 )
 from infrastructure.vector_store.numpy_store import NumpyVectorStore, embed_topics_bow
-from application.services.mastery_scorer import effective_mastery
 
 logger = logging.getLogger("EnglishCoach")
 
@@ -66,6 +62,9 @@ MASTERY_AUTO_PICK_SOFT_CAP = 88.0
 
 # ── 遗忘曲线参数（简化 SM-2）──────────────────────────────────────────────
 REVIEW_URGENCY_HALF_LIFE_DAYS = 3.0    # 半衰期（天）：练习 N 天后复习紧迫度达 50%
+
+# ── 虫洞防沉迷阈值 ─────────────────────────────────────────────────────
+MAX_WORMHOLES_PER_SESSION = 1          # 每个会话最多触发 1 次虫洞（防止横向沉迷）
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -396,9 +395,7 @@ def _load_review_constraints(
     """
     加载低于 current_depth 的未掌握约束（最多 3 个）。
 
-    匹配逻辑：
-    - ScenarioConstraint.depth_level < current_depth
-    - legacy_node_id 在 UserProgress 中，且 mastery < 80
+    基于 LearningSession.nodes_mastered 判断是否已掌握。
     """
     lower_constraints = db.query(ScenarioConstraint).join(
         MicroScenario,
@@ -411,19 +408,18 @@ def _load_review_constraints(
     if not lower_constraints:
         return []
 
-    legacy_ids = [c.legacy_node_id for c in lower_constraints if c.legacy_node_id]
-    progress_map = {}
-    if legacy_ids:
-        progresses = db.query(UserProgress).filter(
-            UserProgress.user_id == user_id,
-            UserProgress.node_id.in_(legacy_ids),
-        ).all()
-        progress_map = {p.node_id: p.mastery_score for p in progresses}
+    mastered_ids = set()
+    sessions = db.query(LearningSession).filter(
+        LearningSession.user_id == user_id,
+        LearningSession.topic_id == topic_id,
+    ).all()
+    for s in sessions:
+        if s.nodes_mastered:
+            mastered_ids.update(s.nodes_mastered)
 
     review = []
     for c in lower_constraints:
-        legacy_id = c.legacy_node_id
-        if legacy_id and progress_map.get(legacy_id, 0) < 80.0:
+        if c.id not in mastered_ids:
             review.append(ScenarioConstraintItem(
                 constraint_id=c.id,
                 constraint_text=c.constraint_text,
@@ -462,10 +458,9 @@ def save_learning_session(
     should_close = db is None
     db = db or SessionLocal()
     try:
-        all_target_ids = [n["id"] for n in task_packet.all_practice_nodes if n.get("id")]
         mastered_ids = [
-            nid for nid in all_target_ids
-            if _get_node_mastery(user_id, nid, db) >= MASTERY_THRESHOLD_FOR_TIER_UP
+            nid for nid in nodes_hit
+            if _get_constraint_mastery(user_id, nid, db) >= MASTERY_THRESHOLD_FOR_TIER_UP
         ]
 
         session = LearningSession(
@@ -503,15 +498,13 @@ def _build_packet_for_topic(
     db: Session,
 ) -> TaskPacket:
     """
-    Shared core: build TaskPacket for a specific topic.
-    双模式路由：
-    - 若 topic 下有 MicroScenario 数据，走新版微场景逻辑（阶段三）
-    - 否则走旧版 TargetNode 逻辑（向后兼容）
+    构建指定话题的 TaskPacket。
+    优先使用微场景模式。
     """
     if _has_micro_scenarios(db, topic.id):
         return _build_packet_for_topic_micro(user_id, topic, depth_preference, db)
     else:
-        return _build_packet_for_topic_legacy(user_id, topic, depth_preference, db)
+        return _fallback_task_packet(db)
 
 
 def _build_packet_for_topic_micro(
@@ -548,80 +541,15 @@ def _build_packet_for_topic_micro(
     if entry is None:
         logger.warning(
             f"[SessionPlanner] No MicroScenario for topic={topic.id}, depth={depth_tier}. "
-            f"Falling back to legacy mode."
+            f"Falling back to default packet."
         )
-        return _build_packet_for_topic_legacy(user_id, topic, depth_preference, db)
+        return _fallback_task_packet(db)
 
     logger.info(
         f"[SessionPlanner] Micro mode: topic='{topic.title}' "
         f"scenario='{entry.scenario_code}' depth={depth_tier}"
     )
     return _build_micro_task_packet(user_id, topic, entry, db)
-
-
-def _build_packet_for_topic_legacy(
-    user_id: str,
-    topic: Topic,
-    depth_preference: float,
-    db: Session,
-) -> TaskPacket:
-    """
-    旧版 TargetNode 模式（向后兼容）。
-
-    当 topic 下没有 MicroScenario 数据时使用此路径。
-    完全保留原有的目标节点选取逻辑。
-    """
-    earned_tier = _compute_depth_tier(user_id, topic.id, db)
-    max_allowed = max(1, min(MAX_DEPTH_TIER, int(depth_preference)))
-    depth_tier = min(earned_tier, max_allowed)
-
-    all_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic.id).all()
-    target_nodes = [n for n in all_nodes if n.depth_level == depth_tier]
-    bonus_nodes = [n for n in all_nodes if n.depth_level == depth_tier + 1]
-
-    progresses = db.query(UserProgress).filter(UserProgress.user_id == user_id).all()
-    low_mastery = {p.node_id for p in progresses if p.mastery_score < 80.0}
-    review_nodes = [n for n in all_nodes if n.id in low_mastery and n.depth_level < depth_tier]
-
-    diff_config = DifficultyConfig(
-        first_turn_depth=depth_tier,
-        bonus_node_unlock_after=3,
-        correction_frequency=min(0.5, 0.1 + depth_tier * 0.1),
-    )
-
-    difficulty_tiers_cfg: dict = topic.difficulty_tiers or {}
-    tier_rules: list = difficulty_tiers_cfg.get(str(depth_tier), {}).get("rules", [])
-    scene_rules: list = (topic.scene_specific_rules or []) + tier_rules
-
-    def _nd(n: TargetNode) -> dict:
-        return {"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level}
-
-    row = db.query(User).filter(User.id == user_id).first()
-    settings_dict = dict(row.settings or {}) if row else None
-    topic_lv = topic.learner_level or "Intermediate"
-    eff_label = effective_learner_label(settings_dict, topic_lv, topic_lv)
-    max_reply = compute_max_reply_sentences(eff_label, depth_tier)
-
-    tzh = effective_topic_title_zh(topic)
-    return TaskPacket(
-        topic_id=topic.id,
-        topic_title=topic.title,
-        topic_title_zh=tzh,
-        scene_prompt=topic.system_prompt or topic.title,
-        role_name=topic.role_name or topic.category or "English Coach",
-        learner_level=eff_label,
-        voice=topic.voice or "Stanley",
-        depth_tier=depth_tier,
-        max_reply_sentences=max_reply,
-        target_nodes=[_nd(n) for n in target_nodes],
-        bonus_nodes=[_nd(n) for n in bonus_nodes],
-        review_nodes=[_nd(n) for n in review_nodes],
-        difficulty_config=diff_config,
-        scene_specific_rules=scene_rules,
-        vocab_tags=topic.vocab_tags or [],
-        sentence_patterns=topic.sentence_patterns or [],
-        session_goal=_build_session_goal(topic, target_nodes, review_nodes, depth_tier),
-    )
 
 
 def _build(user_id: str, db: Session) -> TaskPacket:
@@ -663,8 +591,7 @@ def _build(user_id: str, db: Session) -> TaskPacket:
     packet = _build_packet_for_topic(user_id, best_topic, depth_preference, db)
     logger.info(
         f"[SessionPlanner] TaskPacket: topic='{best_topic.title}' score={best_score:.2f} "
-        f"avg_mastery={avg_pick:.1f}% tier={packet.depth_tier} "
-        f"target={len(packet.target_nodes)} review={len(packet.review_nodes)}"
+        f"avg_mastery={avg_pick:.1f}% tier={packet.depth_tier}"
     )
     return packet
 
@@ -674,21 +601,33 @@ def _build(user_id: str, db: Session) -> TaskPacket:
 
 def _topic_avg_mastery_display(topic_id: int, user_id: str, db: Session) -> float:
     """
-    与 GET /api/topics 中 avg_mastery 一致：已记录进度的节点分数之和 / 该话题总节点数。
-    从未练过（无 UserProgress）视为 0。
+    计算话题平均掌握度：基于 LearningSession.nodes_mastered。
+    已掌握的 constraint 数 / 该话题总 constraint 数。
     """
-    nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic_id).all()
-    if not nodes:
+    constraints = db.query(ScenarioConstraint).join(
+        MicroScenario,
+        ScenarioConstraint.micro_scenario_id == MicroScenario.id,
+    ).filter(
+        MicroScenario.topic_id == topic_id
+    ).all()
+
+    if not constraints:
         return 0.0
-    node_ids = [n.id for n in nodes]
-    progresses = (
-        db.query(UserProgress)
-        .filter(UserProgress.user_id == user_id, UserProgress.node_id.in_(node_ids))
-        .all()
-    )
-    if not progresses:
-        return 0.0
-    return sum(float(p.mastery_score) for p in progresses) / float(len(nodes))
+
+    total_constraints = len(constraints)
+    constraint_ids = {c.id for c in constraints}
+
+    mastered_ids = set()
+    sessions = db.query(LearningSession).filter(
+        LearningSession.user_id == user_id,
+        LearningSession.topic_id == topic_id,
+    ).all()
+    for s in sessions:
+        if s.nodes_mastered:
+            mastered_ids.update(s.nodes_mastered)
+
+    mastered_count = len(constraint_ids & mastered_ids)
+    return (mastered_count / total_constraints) * 100.0
 
 
 def _mastery_gap_priority(avg_mastery: float) -> float:
@@ -785,78 +724,412 @@ def _compute_depth_tier(user_id: str, topic_id: int, db: Session) -> int:
     """
     根据用户对该话题的「有效掌握度」计算应解锁的深度层级。
 
-    Phase 2 升级：使用 effective_mastery（含时间衰减）代替原始 mastery_score，
-    防止久未练习的用户被误判为已掌握而跳过复习。
-
+    基于 LearningSession.nodes_mastered 判断是否已掌握某 constraint。
     逻辑：
-    - 从 tier=1 开始，计算该 tier 所有节点的有效掌握度均值
-    - 若均值 >= MASTERY_THRESHOLD_FOR_TIER_UP，晋级到 tier+1
+    - 从 tier=1 开始，计算该 tier 所有 constraints 中已掌握的比例
+    - 若比例 >= MASTERY_THRESHOLD_FOR_TIER_UP / 100，晋级到 tier+1
     - 直到达到 MAX_DEPTH_TIER 或未达到晋级阈值
     """
-    progresses = db.query(UserProgress).filter(UserProgress.user_id == user_id).all()
-    # 构建 node_id → (mastery, last_practiced_at) 映射
-    progress_map: dict[int, tuple[float, object]] = {
-        p.node_id: (p.mastery_score, p.last_practiced_at) for p in progresses
-    }
-
     for tier in range(1, MAX_DEPTH_TIER + 1):
-        nodes_at_tier = (
-            db.query(TargetNode)
-            .filter(TargetNode.topic_id == topic_id, TargetNode.depth_level == tier)
-            .all()
-        )
-        if not nodes_at_tier:
-            return tier  # 该话题没有这个 tier 的节点
+        constraints = db.query(ScenarioConstraint).join(
+            MicroScenario,
+            ScenarioConstraint.micro_scenario_id == MicroScenario.id,
+        ).filter(
+            MicroScenario.topic_id == topic_id,
+            MicroScenario.depth_level == tier,
+        ).all()
 
-        # 有效掌握度 = 经过时间衰减修正后的掌握度
-        eff_scores = []
-        for n in nodes_at_tier:
-            if n.id in progress_map:
-                raw_mastery, last_practiced = progress_map[n.id]
-                eff_scores.append(effective_mastery(raw_mastery, last_practiced))
-            else:
-                eff_scores.append(0.0)
+        if not constraints:
+            return tier
 
-        avg_effective = sum(eff_scores) / len(eff_scores)
-        logger.debug(f"[DepthTier] topic={topic_id} tier={tier} avg_effective={avg_effective:.1f}")
+        constraint_ids = {c.id for c in constraints}
+        mastered_ids = set()
+        sessions = db.query(LearningSession).filter(
+            LearningSession.user_id == user_id,
+            LearningSession.topic_id == topic_id,
+        ).all()
+        for s in sessions:
+            if s.nodes_mastered:
+                mastered_ids.update(s.nodes_mastered)
 
-        if avg_effective < MASTERY_THRESHOLD_FOR_TIER_UP:
-            return tier  # 当前 tier 未达标
+        mastered_count = len(constraint_ids & mastered_ids)
+        mastery_ratio = mastered_count / len(constraints)
+
+        logger.debug(f"[DepthTier] topic={topic_id} tier={tier} mastered={mastered_count}/{len(constraints)} ratio={mastery_ratio:.2f}")
+
+        if mastery_ratio < MASTERY_THRESHOLD_FOR_TIER_UP / 100.0:
+            return tier
 
     return MAX_DEPTH_TIER
 
 
-def _get_node_mastery(user_id: str, node_id: int, db: Session) -> float:
-    """返回节点的「有效掌握度」（含时间衰减）"""
-    progress = (
-        db.query(UserProgress)
-        .filter(UserProgress.user_id == user_id, UserProgress.node_id == node_id)
-        .first()
+def _get_constraint_mastery(user_id: str, constraint_id: int, db: Session) -> float:
+    """
+    判断某 constraint 是否已被用户掌握。
+    基于 LearningSession.nodes_mastered。
+    """
+    sessions = db.query(LearningSession).filter(
+        LearningSession.user_id == user_id,
+    ).all()
+    for s in sessions:
+        if s.nodes_mastered and constraint_id in s.nodes_mastered:
+            return 100.0
+    return 0.0
+
+
+# ── 会话目标描述已由 _build_micro_session_goal 替代 ─────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 3 新增：Mastery Score 驱动流转 + 虫洞即时奖励
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 虫洞触发阈值
+WORMHOLE_MASTERY_THRESHOLD = 85.0   # 掌握度达到此值才允许虫洞跳转
+WORMHOLE_STEP_COMPLETE_MIN_SCENARIOS = 3  # Step 完成至少需要练习的场景数
+
+# 动态 Twist 配置
+TWIST_PROBABILITY = 0.15   # 每个场景触发 Twist 的概率
+
+
+def compute_scenario_mastery(
+    user_id: str,
+    scenario_id: int,
+    db: Session,
+) -> float:
+    """
+    计算用户在某个微场景的掌握度。
+
+    基于 LearningSession.nodes_mastered：场景关联的 constraints 中已掌握的比例。
+    """
+    constraints = db.query(ScenarioConstraint).filter(
+        ScenarioConstraint.micro_scenario_id == scenario_id
+    ).all()
+
+    if not constraints:
+        return 50.0  # 无约束，默认中等掌握度
+
+    constraint_ids = {c.id for c in constraints}
+
+    mastered_ids = set()
+    sessions = db.query(LearningSession).filter(
+        LearningSession.user_id == user_id,
+    ).all()
+    for s in sessions:
+        if s.nodes_mastered:
+            mastered_ids.update(s.nodes_mastered)
+
+    mastered_in_scenario = len(constraint_ids & mastered_ids)
+    return (mastered_in_scenario / len(constraints)) * 100.0
+
+
+def should_wormhole(
+    user_id: str,
+    current_scenario_id: int,
+    current_topic_id: int,
+    session_ctx: dict,
+    db: Session,
+) -> dict | None:
+    """
+    判断是否应该触发虫洞即时奖励。
+
+    触发条件：
+    1. 当前场景掌握度 >= WORMHOLE_MASTERY_THRESHOLD
+    2. 当前话题该 Step 已练习 >= WORMHOLE_STEP_COMPLETE_MIN_SCENARIOS 个场景
+    3. 本会话已触发虫洞次数 < MAX_WORMHOLES_PER_SESSION（防横向沉迷）
+
+    Returns:
+        WormholePacket dict: {
+            'target_topic_id': int,
+            'target_scenario_id': int,
+            'target_scenario_name': str,
+            'trigger_type': 'step_complete' | 'topic_complete',
+        }
+        None: 不触发虫洞
+    """
+    # 【防沉迷检查】每个会话最多触发 MAX_WORMHOLES_PER_SESSION 次虫洞
+    wormhole_count = session_ctx.get("wormhole_count", 0)
+    if wormhole_count >= MAX_WORMHOLES_PER_SESSION:
+        logger.info(
+            f"[WORMHOLE] 跳过：本次会话已触发 {wormhole_count} 次虫洞，"
+            f"达到上限 MAX_WORMHOLES_PER_SESSION={MAX_WORMHOLES_PER_SESSION}"
+        )
+        return None
+
+    # 检查掌握度
+    mastery = compute_scenario_mastery(user_id, current_scenario_id, db)
+    if mastery < WORMHOLE_MASTERY_THRESHOLD:
+        return None
+
+    # 获取当前场景信息
+    current_scenario = db.query(MicroScenario).filter(
+        MicroScenario.id == current_scenario_id
+    ).first()
+
+    if not current_scenario:
+        return None
+
+    current_step = current_scenario.step_order
+    current_depth = current_scenario.depth_level
+
+    # 检查该 Step 已练习的场景数
+    practiced_in_step = db.query(LearningSession).filter(
+        LearningSession.user_id == user_id,
+        LearningSession.topic_id == current_topic_id,
+    ).count()
+
+    if practiced_in_step < WORMHOLE_STEP_COMPLETE_MIN_SCENARIOS:
+        return None
+
+    # 查找跨话题虫洞边
+    cross_topic_edge = db.query(ScenarioTransition).filter(
+        ScenarioTransition.from_scenario_id == current_scenario_id,
+        ScenarioTransition.edge_type == "CROSS_TOPIC_MIGRATION",
+    ).order_by(ScenarioTransition.overlap_ratio.desc()).first()
+
+    if not cross_topic_edge:
+        return None
+
+    # 获取目标场景
+    target_scenario = db.query(MicroScenario).filter(
+        MicroScenario.id == cross_topic_edge.to_scenario_id
+    ).first()
+
+    if not target_scenario:
+        return None
+
+    target_topic = db.query(Topic).filter(Topic.id == target_scenario.topic_id).first()
+    if not target_topic:
+        return None
+
+    logger.info(
+        f"[WORMHOLE] 触发虫洞: 用户={user_id}, "
+        f"从 {current_scenario.scenario_code}({current_topic_id}) "
+        f"跳转至 {target_scenario.scenario_code}({target_topic.id}), "
+        f"mastery={mastery:.1f}%"
     )
-    if not progress:
-        return 0.0
-    return effective_mastery(progress.mastery_score, progress.last_practiced_at)
+
+    return {
+        "target_topic_id": target_topic.id,
+        "target_topic_title": target_topic.title,
+        "target_scenario_id": target_scenario.id,
+        "target_scenario_name": target_scenario.scenario_name,
+        "trigger_type": "step_complete",
+        "similarity_score": cross_topic_edge.overlap_ratio,
+    }
 
 
-# ── 会话目标描述 ──────────────────────────────────────────────────────────
+def should_depth_upgrade(
+    user_id: str,
+    topic_id: int,
+    current_scenario_id: int,
+    is_topic_exit: bool,
+    db: Session,
+) -> bool:
+    """
+    判断是否应该进入更深一层的 depth（难度晋级）。
 
-def _build_session_goal(
-    topic: Topic,
-    target_nodes: list[TargetNode],
-    review_nodes: list[TargetNode],
-    depth_tier: int,
+    【修复】晋级检查只在话题最终出口触发，绝对不允许中途晋级。
+    条件：
+    1. 必须是话题出口场景（is_topic_exit=True）
+    2. 当前话题当前 step 的平均掌握度 >= MASTERY_THRESHOLD_FOR_TIER_UP
+    """
+    # 【绝对禁止中途晋级】非出口场景直接返回 False
+    if not is_topic_exit:
+        logger.info(
+            f"[DEPTH] 跳过晋级检查：非话题出口场景 (scenario_id={current_scenario_id})，"
+            "禁止中途晋级"
+        )
+        return False
+
+    current_scenario = db.query(MicroScenario).filter(
+        MicroScenario.id == current_scenario_id
+    ).first()
+
+    if not current_scenario:
+        return False
+
+    current_step = current_scenario.step_order
+    current_depth = current_scenario.depth_level
+
+    # 获取同 step 同 depth 的所有场景
+    same_level_scenarios = db.query(MicroScenario).filter(
+        MicroScenario.topic_id == topic_id,
+        MicroScenario.step_order == current_step,
+        MicroScenario.depth_level == current_depth,
+    ).all()
+
+    if not same_level_scenarios:
+        return False
+
+    # 计算平均掌握度
+    total_mastery = 0.0
+    count = 0
+
+    for sc in same_level_scenarios:
+        mastery = compute_scenario_mastery(user_id, sc.id, db)
+        total_mastery += mastery
+        count += 1
+
+    avg_mastery = total_mastery / count if count > 0 else 0.0
+
+    if avg_mastery >= MASTERY_THRESHOLD_FOR_TIER_UP:
+        logger.info(
+            f"[DEPTH] 晋级条件满足：topic={topic_id}, step={current_step}, "
+            f"avg_mastery={avg_mastery:.1f}% >= {MASTERY_THRESHOLD_FOR_TIER_UP}%"
+        )
+        return True
+
+    return False
+
+
+def get_next_depth_scenario(
+    user_id: str,
+    topic_id: int,
+    current_scenario_id: int,
+    db: Session,
+) -> MicroScenario | None:
+    """
+    获取下一 depth 层的场景（用于难度晋级）。
+    """
+    current_scenario = db.query(MicroScenario).filter(
+        MicroScenario.id == current_scenario_id
+    ).first()
+
+    if not current_scenario:
+        return None
+
+    current_step = current_scenario.step_order
+    current_depth = current_scenario.depth_level
+    next_depth = current_depth + 1
+
+    if next_depth > MAX_DEPTH_TIER:
+        return None
+
+    # 查找同 step 的下一 depth 层入口场景
+    next_scenario = db.query(MicroScenario).filter(
+        MicroScenario.topic_id == topic_id,
+        MicroScenario.step_order == current_step,
+        MicroScenario.depth_level == next_depth,
+        MicroScenario.is_entry_point == True,
+    ).first()
+
+    if next_scenario:
+        return next_scenario
+
+    # 没有 entry point，找任意一个
+    next_scenario = db.query(MicroScenario).filter(
+        MicroScenario.topic_id == topic_id,
+        MicroScenario.step_order == current_step,
+        MicroScenario.depth_level == next_depth,
+    ).first()
+
+    return next_scenario
+
+
+def save_depth_upgrade_marker(
+    user_id: str,
+    topic_id: int,
+    target_depth: int,
+    db: Session,
+) -> None:
+    """
+    将难度晋级标记持久化到用户设置中。
+
+    存储位置：User.settings JSON 字段
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        logger.warning(f"[DEPTH] Cannot save depth marker: user {user_id} not found")
+        return
+
+    settings = dict(user.settings or {})
+    marker_key = f"depth_upgrade_to_{target_depth}"
+    settings[marker_key] = True
+    user.settings = settings
+    db.commit()
+    logger.info(
+        f"[DEPTH] 晋级标记已保存: user={user_id}, topic={topic_id}, "
+        f"depth={target_depth}"
+    )
+
+
+def get_depth_upgrade_marker(user_id: str, target_depth: int, db: Session) -> bool:
+    """检查用户是否已标记晋级到某深度"""
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        return False
+    settings = dict(user.settings or {})
+    return settings.get(f"depth_upgrade_to_{target_depth}", False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Phase 4 新增：Dynamic Twist 支持
+# ═══════════════════════════════════════════════════════════════════════════
+
+TWIST_POOL = [
+    "The customer before you had the same order and their card was declined. Yours seems fine, but do you have a backup payment method just in case?",
+    "Oh sorry, we're actually out of that item. Can you pick something else?",
+    "One moment - there's a manager who wants to verify something with your order. Just stay here for a minute.",
+    "I just realized we have a special promotion today. Would you like to hear about it?",
+    "Sorry for the wait - the machine is being a bit slow today. Your total is ready when you are.",
+    "Before I finalize this, do you have our loyalty card or app? You could earn points today!",
+    "I need to double-check something about your order - is there any chance you meant decaf instead of regular?",
+    "We're actually closing in 5 minutes, but I can definitely help you finish up quickly.",
+]
+
+
+def should_trigger_twist(
+    scenario_mastery: float,
+    turn_count: int,
+    max_turns: int,
+) -> bool:
+    """
+    判断是否应该触发 Dynamic Twist。
+
+    策略：
+    - 掌握度越高，越容易触发 Twist（挑战高难度）
+    - 掌握度越低，越不容易触发（保护初学者）
+    - 越接近最大轮次，越容易触发（收尾）
+    """
+    import random
+
+    # 基础概率
+    base_prob = TWIST_PROBABILITY
+
+    # 根据掌握度调整（0.5 ~ 2.0 倍）
+    mastery_factor = 0.5 + (scenario_mastery / 100.0) * 1.5
+
+    # 根据轮次调整（后期更容易触发）
+    progress_factor = 1.0 + (turn_count / max_turns) * 0.5
+
+    final_prob = base_prob * mastery_factor * progress_factor
+    final_prob = min(0.4, final_prob)  # 最多 40%
+
+    return random.random() < final_prob
+
+
+def select_twist(
+    topic_id: int,
+    current_scenario_code: str,
 ) -> str:
-    """为 TaskPacket.session_goal 生成人类可读的目标描述（注入进 Prompt）"""
-    parts = []
-    if target_nodes:
-        expressions = [f"'{n.node_text}'" for n in target_nodes[:3]]
-        parts.append(f"Practice using: {', '.join(expressions)}")
-    if review_nodes:
-        review_exprs = [f"'{n.node_text}'" for n in review_nodes[:2]]
-        parts.append(f"Also reinforce: {', '.join(review_exprs)}")
-    if not parts:
-        parts.append(f"Practice {topic.title} at depth level {depth_tier}.")
-    return " | ".join(parts)
+    """
+    从 Twist Pool 中选择一个适合的 Twist。
+
+    策略：随机选择（后续可扩展为基于 topic/scene 的智能匹配）
+    """
+    import random
+    return random.choice(TWIST_POOL)
+
+
+def build_twist_context(twist_message: str, current_event: str | None) -> str:
+    """
+    构建带 Twist 的事件上下文。
+
+    用于替换 Jinja 模板中的 current_event。
+    """
+    if current_event:
+        return f"{current_event}\n\nTWIST: {twist_message}"
+    return twist_message
 
 
 # ── 降级兜底 ──────────────────────────────────────────────────────────────
@@ -865,10 +1138,19 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
     """当 DB 为空或发生异常时，返回一个最小可用的 TaskPacket"""
     first_topic = db.query(Topic).first()
     if first_topic:
-        nodes = db.query(TargetNode).filter(
-            TargetNode.topic_id == first_topic.id,
-            TargetNode.depth_level == 1
-        ).all()
+        entry = db.query(MicroScenario).filter(
+            MicroScenario.topic_id == first_topic.id,
+            MicroScenario.is_entry_point == True,
+        ).first()
+
+        if entry is None:
+            entry = db.query(MicroScenario).filter(
+                MicroScenario.topic_id == first_topic.id,
+            ).first()
+
+        if entry:
+            return _build_micro_task_packet("default_user", first_topic, entry, db)
+
         topic_lv = first_topic.learner_level or "Intermediate"
         eff = effective_learner_label(None, topic_lv, topic_lv)
         tz = effective_topic_title_zh(first_topic)
@@ -882,11 +1164,9 @@ def _fallback_task_packet(db: Session) -> TaskPacket:
             voice=first_topic.voice or "Stanley",
             depth_tier=1,
             max_reply_sentences=compute_max_reply_sentences(eff, 1),
-            target_nodes=[{"id": n.id, "node_text": n.node_text, "node_type": n.node_type, "depth_level": n.depth_level} for n in nodes],
-            scene_specific_rules=first_topic.scene_specific_rules or [],
+            session_goal=f"Practice basic {first_topic.title} conversation.",
             vocab_tags=first_topic.vocab_tags or [],
             sentence_patterns=first_topic.sentence_patterns or [],
-            session_goal=f"Practice basic {first_topic.title} conversation.",
         )
 
     # 数据库完全为空时的终极兜底

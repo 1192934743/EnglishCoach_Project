@@ -25,38 +25,40 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 import openai
 
-load_dotenv("config.env")
+# 使用绝对路径加载配置文件
+script_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(script_dir, "config.env"))
 
 from database import SessionLocal, Topic
 from infrastructure.topic_generator import get_or_generate_topic
 from application.services.session_planner import warm_up
 
 # ── 种子话题描述列表 ──────────────────────────────────────────────────────────
-# 每行一个自然语言描述，TopicGenerator 负责理解并生成完整配置
+# 每项为 dict：domain（调用方直接写入 DB，不经 LLM）+ desc（生成用描述）
 SEED_DESCRIPTIONS = [
     # 餐饮
-    "Ordering drinks and food at a coffee shop or café",
-    "Sitting down at a restaurant, ordering from the menu, and paying the bill",
+    {"domain": "餐饮", "desc": "Ordering drinks and food at a coffee shop or café"},
+    {"domain": "餐饮", "desc": "Sitting down at a restaurant, ordering from the menu, and paying the bill"},
 
     # 出行
-    "Checking in luggage and going through security at an airport",
-    "Taking a taxi or rideshare like Uber — giving directions and making small talk",
-    "Checking in at a hotel, asking for amenities, and checking out",
+    {"domain": "出行", "desc": "Checking in luggage and going through security at an airport"},
+    {"domain": "出行", "desc": "Taking a taxi or rideshare like Uber — giving directions and making small talk"},
+    {"domain": "出行", "desc": "Checking in at a hotel, asking for amenities, and checking out"},
 
     # 购物
-    "Shopping for clothes — asking for sizes, colors, and trying items on",
-    "Grocery shopping and asking store staff where to find items",
+    {"domain": "购物", "desc": "Shopping for clothes — asking for sizes, colors, and trying items on"},
+    {"domain": "购物", "desc": "Grocery shopping and asking store staff where to find items"},
 
     # 医疗日常
-    "Visiting a doctor, describing symptoms, and understanding a prescription",
+    {"domain": "医疗", "desc": "Visiting a doctor, describing symptoms, and understanding a prescription"},
 
     # 职业
-    "Calling customer service to report a problem or request a refund",
-    "A business meeting — presenting ideas, giving feedback, and discussing next steps",
+    {"domain": "职业", "desc": "Calling customer service to report a problem or request a refund"},
+    {"domain": "职业", "desc": "A business meeting — presenting ideas, giving feedback, and discussing next steps"},
 
     # 社交
-    "Making small talk at a party — introducing yourself and discussing hobbies",
-    "Renting an apartment — asking the landlord about rules, utilities, and repairs",
+    {"domain": "社交", "desc": "Making small talk at a party — introducing yourself and discussing hobbies"},
+    {"domain": "社交", "desc": "Renting an apartment — asking the landlord about rules, utilities, and repairs"},
 ]
 
 # ── 主流程 ────────────────────────────────────────────────────────────────────
@@ -76,12 +78,14 @@ async def seed():
     skipped = 0
     failed = 0
 
-    for i, desc in enumerate(SEED_DESCRIPTIONS, 1):
-        print(f"[{i:2d}/{len(SEED_DESCRIPTIONS)}] '{desc}'")
+    for i, item in enumerate(SEED_DESCRIPTIONS, 1):
+        desc = item["desc"]
+        domain = item["domain"]
+        print(f"[{i:2d}/{len(SEED_DESCRIPTIONS)}] '{desc}' [domain={domain}]")
 
         try:
             t0 = time.monotonic()
-            topic = await get_or_generate_topic(desc, client, db)
+            topic = await get_or_generate_topic(desc, client, db, domain=domain)
             elapsed = time.monotonic() - t0
 
             if topic.title.lower() in existing_titles and topic.id is not None:

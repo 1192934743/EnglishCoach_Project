@@ -1,0 +1,231 @@
+{
+  "nodes": [
+    {
+      "id": 1,
+      "topic_id": 21,
+      "topic_title": "Starbucks Ordering",
+      "topic_title_zh": "星巴克点单",
+      "scenario_code": "SBUX_01_ORDER_DRINK",
+      "scenario_name": "Order a Coffee",
+      "intent_desc": "The learner orders a coffee drink, using the target vocabulary 'coffee' and 'Americano' in context.",
+      "scene_desc": "You are a Starbucks barista. A customer approaches the counter. Greet them warmly and ask what they would like to order. Guide the customer to say 'coffee' and 'Americano' naturally.",
+      "depth_level": 1,
+      "step_order": 1,
+      "is_entry_point": true,
+      "max_turns": 8,
+      "weight": 1.0,
+      "constraints": [
+        {
+          "text": "coffee",
+          "type": "word",
+          "depth_level": 1,
+          "weight": 1.0,
+          "hint_cn": "咖啡"
+        },
+        {
+          "text": "Americano",
+          "type": "word",
+          "depth_level": 1,
+          "weight": 1.0,
+          "hint_cn": "美式咖啡"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "topic_id": 21,
+      "topic_title": "Starbucks Ordering",
+      "topic_title_zh": "星巴克点单",
+      "scenario_code": "SBUX_02_CONFIRM_TEMP",
+      "scenario_name": "Confirm Drink Temperature",
+      "intent_desc": "The learner confirms whether they want a hot or iced drink, using 'hot' and 'iced' naturally.",
+      "scene_desc": "You are a Starbucks barista. The customer just ordered an Americano. Ask them if they want it hot or iced. Guide them to say 'hot' or 'iced' in their reply.",
+      "depth_level": 1,
+      "step_order": 2,
+      "is_entry_point": false,
+      "max_turns": 6,
+      "weight": 1.0,
+      "constraints": [
+        {
+          "text": "hot",
+          "type": "word",
+          "depth_level": 1,
+          "weight": 1.0,
+          "hint_cn": "热的"
+        },
+        {
+          "text": "iced",
+          "type": "word",
+          "depth_level": 1,
+          "weight": 1.0,
+          "hint_cn": "冰的"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "topic_id": 21,
+      "topic_title": "Starbucks Ordering",
+      "topic_title_zh": "星巴克点单",
+      "scenario_code": "SBUX_03_PAYMENT",
+      "scenario_name": "Pay for the Order",
+      "intent_desc": "The learner confirms payment method, using 'credit card' and 'receipt' in context.",
+      "scene_desc": "You are a Starbucks barista. The customer's drink is ready. Ask them how they would like to pay. Guide them to say 'credit card' and ask for a 'receipt' naturally.",
+      "depth_level": 1,
+      "step_order": 3,
+      "is_entry_point": false,
+      "max_turns": 6,
+      "weight": 1.0,
+      "constraints": [
+        {
+          "text": "credit card",
+          "type": "phrase",
+          "depth_level": 1,
+          "weight": 1.5,
+          "hint_cn": "信用卡"
+        },
+        {
+          "text": "receipt",
+          "type": "word",
+          "depth_level": 1,
+          "weight": 1.0,
+          "hint_cn": "收据"
+        }
+      ]
+    }
+  ],
+  "links": [
+    {
+      "id": 1,
+      "source": 1,
+      "target": 2,
+      "overlap_ratio": 0.65,
+      "trigger_type": "auto",
+      "required_hit_rate": 0.5,
+      "edge_type": "auto",
+      "transition_weight": null
+    },
+    {
+      "id": 2,
+      "source": 2,
+      "target": 3,
+      "overlap_ratio": 0.65,
+      "trigger_type": "auto",
+      "required_hit_rate": 0.5,
+      "edge_type": "auto",
+      "transition_weight": null
+    }
+  ],
+  "metadata": {
+    "total_nodes": 3,
+    "total_links": 2,
+    "total_topics": 21,
+    "topics": [
+      {
+        "id": 1,
+        "title": "McDonald's Ordering",
+        "title_zh": "麦当劳点餐"
+      },
+      {
+        "id": 2,
+        "title": "Technical Job Interview",
+        "title_zh": "技术岗位面试"
+      },
+      {
+        "id": 3,
+        "title": "Daily Casual Conversation",
+        "title_zh": "日常闲聊"
+      },
+      {
+        "id": 4,
+        "title": "Restaurant Dining Experience",
+        "title_zh": "餐厅用餐体验"
+      },
+      {
+        "id": 5,
+        "title": "Airport Check-in and Security",
+        "title_zh": "机场值机与安检"
+      },
+      {
+        "id": 6,
+        "title": "Taxi & Rideshare Directions",
+        "title_zh": "出租车与网约车路线"
+      },
+      {
+        "id": 7,
+        "title": "Hotel Check-in and Check-out",
+        "title_zh": "酒店入住与退房"
+      },
+      {
+        "id": 8,
+        "title": "Clothing Store Shopping",
+        "title_zh": "服装店购物"
+      },
+      {
+        "id": 9,
+        "title": "Grocery Store Navigation",
+        "title_zh": "超市导购"
+      },
+      {
+        "id": 10,
+        "title": "Doctor Visit & Prescription",
+        "title_zh": "看医生与开药"
+      },
+      {
+        "id": 11,
+        "title": "Customer Service Call for Issues and Refunds",
+        "title_zh": "客服问题与退款"
+      },
+      {
+        "id": 12,
+        "title": "Business Meeting Essentials",
+        "title_zh": "商务会议要点"
+      },
+      {
+        "id": 13,
+        "title": "Restaurant Dining Experience",
+        "title_zh": "餐厅用餐体验"
+      },
+      {
+        "id": 14,
+        "title": "Party Small Talk: Introductions & Hobbies",
+        "title_zh": "派对闲聊：介绍与爱好"
+      },
+      {
+        "id": 15,
+        "title": "Hotel Check-in & Check-out",
+        "title_zh": "酒店入住与退房"
+      },
+      {
+        "id": 16,
+        "title": "Apartment Rental Inquiry",
+        "title_zh": "公寓租赁咨询"
+      },
+      {
+        "id": 17,
+        "title": "Clothing Store Assistance",
+        "title_zh": "服装店导购"
+      },
+      {
+        "id": 18,
+        "title": "Doctor Visit: Symptoms & Prescription",
+        "title_zh": "就诊：症状与处方"
+      },
+      {
+        "id": 19,
+        "title": "Tenant Inquiry: Rules, Utilities & Repairs",
+        "title_zh": "租客咨询：规则、费用与维修"
+      },
+      {
+        "id": 20,
+        "title": "Buying a Mobile Phone",
+        "title_zh": "购买手机"
+      },
+      {
+        "id": 21,
+        "title": "Starbucks Ordering",
+        "title_zh": "星巴克点单"
+      }
+    ]
+  }
+}

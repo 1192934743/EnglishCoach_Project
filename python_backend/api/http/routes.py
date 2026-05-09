@@ -6,13 +6,51 @@ from fastapi.concurrency import run_in_threadpool
 from api.dependencies import get_db
 from database import (
     Topic,
-    TargetNode,
-    UserProgress,
     LearningSession,
+    MicroScenario,
+    ScenarioConstraint,
     effective_topic_title_zh,
 )
 
 router = APIRouter()
+
+
+def _get_topic_stats(db, topic_id: int, user_id: str | None):
+    """获取话题的统计信息（基于微场景）"""
+    constraints = db.query(ScenarioConstraint).join(
+        MicroScenario,
+        ScenarioConstraint.micro_scenario_id == MicroScenario.id,
+    ).filter(MicroScenario.topic_id == topic_id).all()
+
+    total_constraints = len(constraints)
+    constraint_ids = {c.id for c in constraints}
+    depth_levels = sorted(set(c.depth_level for c in constraints))
+
+    avg_mastery = 0.0
+    last_practiced = None
+    if user_id and constraints:
+        mastered_ids = set()
+        sessions = db.query(LearningSession).filter(
+            LearningSession.user_id == user_id,
+            LearningSession.topic_id == topic_id,
+        ).all()
+        for s in sessions:
+            if s.nodes_mastered:
+                mastered_ids.update(s.nodes_mastered)
+
+        mastered_count = len(constraint_ids & mastered_ids)
+        avg_mastery = (mastered_count / total_constraints * 100) if total_constraints > 0 else 0.0
+
+        dates = [s.start_time for s in sessions if s.start_time]
+        last_practiced = max(dates).isoformat() if dates else None
+
+    return {
+        "total_constraints": total_constraints,
+        "depth_levels": depth_levels,
+        "avg_mastery": round(avg_mastery, 1),
+        "last_practiced": last_practiced,
+    }
+
 
 @router.get("/api/topics")
 async def get_topics(user_id: Optional[str] = Query(default=None)):
@@ -21,21 +59,7 @@ async def get_topics(user_id: Optional[str] = Query(default=None)):
             topics = db.query(Topic).all()
             result = []
             for t in topics:
-                nodes = db.query(TargetNode).filter(TargetNode.topic_id == t.id).all()
-                total_nodes = len(nodes)
-                avg_mastery = 0.0
-                last_practiced = None
-                if user_id and nodes:
-                    node_ids = [n.id for n in nodes]
-                    progresses = db.query(UserProgress).filter(
-                        UserProgress.user_id == user_id,
-                        UserProgress.node_id.in_(node_ids),
-                    ).all()
-                    if progresses:
-                        avg_mastery = sum(p.mastery_score for p in progresses) / len(nodes)
-                        dates = [p.last_practiced_at for p in progresses if p.last_practiced_at]
-                        last_practiced = max(dates).isoformat() if dates else None
-                depth_levels = sorted(set(n.depth_level for n in nodes))
+                stats = _get_topic_stats(db, t.id, user_id)
                 result.append({
                     "id": t.id,
                     "title": t.title,
@@ -43,10 +67,10 @@ async def get_topics(user_id: Optional[str] = Query(default=None)):
                     "category": t.category or "General",
                     "learner_level": t.learner_level or "Intermediate",
                     "role_name": t.role_name or "Coach",
-                    "total_nodes": total_nodes,
-                    "depth_levels": depth_levels,
-                    "avg_mastery": round(avg_mastery, 1),
-                    "last_practiced": last_practiced,
+                    "total_nodes": stats["total_constraints"],
+                    "depth_levels": stats["depth_levels"],
+                    "avg_mastery": stats["avg_mastery"],
+                    "last_practiced": stats["last_practiced"],
                 })
             return result
 
@@ -63,12 +87,12 @@ async def get_stats(user_id: str = Query(...)):
                 LearningSession.user_id == user_id
             ).order_by(LearningSession.start_time.desc()).all()
 
-            all_progress = db.query(UserProgress).filter(
-                UserProgress.user_id == user_id
-            ).all()
-
-            mastered_nodes = [p for p in all_progress if p.mastery_score >= 60.0]
-            total_practiced = len(all_progress)
+            mastered_count = 0
+            total_practiced = 0
+            for s in sessions:
+                if s.nodes_mastered:
+                    mastered_count += len(s.nodes_mastered)
+                    total_practiced += len(s.nodes_attempted or [])
 
             streak = 0
             if sessions:
@@ -96,31 +120,23 @@ async def get_stats(user_id: str = Query(...)):
             topics_summary = []
             all_topics = db.query(Topic).all()
             for t in all_topics:
-                nodes = db.query(TargetNode).filter(TargetNode.topic_id == t.id).all()
-                if not nodes:
+                stats = _get_topic_stats(db, t.id, user_id)
+                if stats["total_constraints"] == 0:
                     continue
-                node_ids = [n.id for n in nodes]
-                progs = db.query(UserProgress).filter(
-                    UserProgress.user_id == user_id,
-                    UserProgress.node_id.in_(node_ids),
-                ).all()
-                if not progs:
-                    continue
-                avg = sum(p.mastery_score for p in progs) / len(nodes)
                 topics_summary.append({
                     "topic_title": t.title,
                     "topic_title_zh": effective_topic_title_zh(t),
                     "category": t.category or "General",
-                    "avg_mastery": round(avg, 1),
-                    "nodes_practiced": len(progs),
-                    "total_nodes": len(nodes),
+                    "avg_mastery": stats["avg_mastery"],
+                    "nodes_practiced": stats["total_constraints"],
+                    "total_nodes": stats["total_constraints"],
                 })
             topics_summary.sort(key=lambda x: x["avg_mastery"], reverse=True)
 
             return {
                 "total_sessions": len(sessions),
                 "total_expressions_practiced": total_practiced,
-                "total_expressions_mastered": len(mastered_nodes),
+                "total_expressions_mastered": mastered_count,
                 "topics_touched": len(topic_ids_practiced),
                 "current_streak_days": streak,
                 "recent_sessions": recent,

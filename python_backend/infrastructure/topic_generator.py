@@ -24,7 +24,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from database import SessionLocal, Topic, TargetNode, topic_title_zh_fallback
+from database import SessionLocal, Topic, topic_title_zh_fallback
 from application.services.mastery_scorer import normalize_text
 
 logger = logging.getLogger("EnglishCoach")
@@ -82,19 +82,21 @@ async def get_or_generate_topic(
     description: str,
     openai_client,
     db: Optional[Session] = None,
+    domain: Optional[str] = None,
 ) -> Topic:
     """
     主入口：根据描述返回一个 Topic（已有或新生成）。
 
     - 调用方通过 TaskPacket 使用返回的 Topic
     - 所有生成的 Topic 均持久化到 DB
+    - domain 由调用方直接传入，不经 LLM 生成
 
     此函数绝不抛出异常，失败时返回 fallback Topic。
     """
     should_close = db is None
     db = db or SessionLocal()
     try:
-        return await _get_or_generate(description, openai_client, db)
+        return await _get_or_generate(description, openai_client, db, domain=domain)
     except Exception as e:
         logger.error(f"[TopicGenerator] Unexpected error: {e}", exc_info=True)
         return _get_fallback_topic(db)
@@ -111,6 +113,8 @@ async def _get_or_generate(
     description: str,
     openai_client,
     db: Session,
+    *,
+    domain: Optional[str] = None,
 ) -> Topic:
     all_topics = db.query(Topic).all()
 
@@ -132,17 +136,21 @@ async def _get_or_generate(
                     "[TopicGenerator] Backfilled title_zh for reused topic %r",
                     best_topic.title,
                 )
+        # 直接复用场景下也写入 domain（新生成时 domain 由调用方保证，存量可能缺失）
+        if domain and not getattr(best_topic, "domain", None):
+            best_topic.domain = domain
+            db.commit()
         logger.info(f"[TopicGenerator] Tier-1 reuse: '{best_topic.title}'")
         return best_topic
 
     # ── 层 2：参考引导生成 ────────────────────────────────────────────────
     if best_sim >= SIMILARITY_REFERENCE_THRESHOLD and best_topic is not None:
         logger.info(f"[TopicGenerator] Tier-2 reference-guided generation")
-        return await _generate_with_reference(description, best_topic, openai_client, db)
+        return await _generate_with_reference(description, best_topic, openai_client, db, domain=domain)
 
     # ── 层 3：纯净生成 ────────────────────────────────────────────────────
     logger.info(f"[TopicGenerator] Tier-3 pure generation (no good reference)")
-    return await _generate_from_scratch(description, openai_client, db)
+    return await _generate_from_scratch(description, openai_client, db, domain=domain)
 
 
 # ── 相似度计算 ─────────────────────────────────────────────────────────────
@@ -206,19 +214,6 @@ def _build_reference_template(topic: Topic) -> dict:
     从已有 Topic 提取纯内容结构（去掉运行时字段），
     作为 few-shot 模板传给 AI。
     """
-    nodes = []
-    db = SessionLocal()
-    try:
-        raw_nodes = db.query(TargetNode).filter(TargetNode.topic_id == topic.id).all()
-        for n in raw_nodes:
-            nodes.append({
-                "text": n.node_text,
-                "type": n.node_type,
-                "depth_level": n.depth_level,
-            })
-    finally:
-        db.close()
-
     return {
         "title": topic.title,
         "title_zh": getattr(topic, "title_zh", None) or "",
@@ -230,7 +225,7 @@ def _build_reference_template(topic: Topic) -> dict:
         "sentence_patterns": topic.sentence_patterns or [],
         "scene_specific_rules": topic.scene_specific_rules or [],
         "difficulty_tiers": topic.difficulty_tiers or {},
-        "nodes": nodes,
+        "nodes": [],
     }
 
 
@@ -239,13 +234,18 @@ async def _generate_with_reference(
     reference: Topic,
     openai_client,
     db: Session,
+    *,
+    domain: Optional[str] = None,
 ) -> Topic:
     ref_template = _build_reference_template(reference)
     ref_json = json.dumps(ref_template, indent=2, ensure_ascii=False)
 
+    domain_hint = f'\nTARGET DOMAIN: "{domain}"' if domain else ""
+
     prompt = f"""You are designing English language practice topics for a conversation coaching app.
 
 TARGET TOPIC: "{description}"
+{domain_hint}
 
 REFERENCE EXAMPLE (highest-quality similar topic from our library — use it as a structural template):
 {ref_json}
@@ -262,7 +262,7 @@ Always include title_zh (natural Chinese for the same topic as title).
 Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
 {_SCHEMA_STR}"""
 
-    return await _call_llm_and_save(prompt, db, openai_client)
+    return await _call_llm_and_save(prompt, db, openai_client, domain=domain)
 
 
 # ── 层 3：纯净生成 ─────────────────────────────────────────────────────────
@@ -271,10 +271,15 @@ async def _generate_from_scratch(
     description: str,
     openai_client,
     db: Session,
+    *,
+    domain: Optional[str] = None,
 ) -> Topic:
+    domain_hint = f'\nTARGET DOMAIN: "{domain}"' if domain else ""
+
     prompt = f"""You are designing English language practice topics for a conversation coaching app.
 
 TARGET TOPIC: "{description}"
+{domain_hint}
 
 Create a complete topic with rich coaching content.
 {_NODE_DISTRIBUTION_HINT}
@@ -284,7 +289,7 @@ Always include title_zh (natural Chinese for the same topic as title).
 Return ONLY a JSON object matching this exact schema (no markdown, no explanation):
 {_SCHEMA_STR}"""
 
-    return await _call_llm_and_save(prompt, db, openai_client)
+    return await _call_llm_and_save(prompt, db, openai_client, domain=domain)
 
 
 # ── LLM 调用 + 持久化 ──────────────────────────────────────────────────────
@@ -351,6 +356,8 @@ async def _call_llm_and_save(
     prompt: str,
     db: Session,
     openai_client,
+    *,
+    domain: Optional[str] = None,
 ) -> Topic:
     try:
         resp = await asyncio.wait_for(
@@ -371,7 +378,7 @@ async def _call_llm_and_save(
     raw = resp.choices[0].message.content
     data = _parse_and_validate(raw)
     await _fill_title_zh_if_missing(data, openai_client)
-    return _save_to_db(data, db)
+    return _save_to_db(data, db, domain=domain)
 
 
 def _parse_and_validate(raw: str) -> dict:
@@ -405,8 +412,8 @@ def _parse_and_validate(raw: str) -> dict:
     return data
 
 
-def _save_to_db(data: dict, db: Session) -> Topic:
-    """Persist generated Topic + TargetNodes, return detached Topic."""
+def _save_to_db(data: dict, db: Session, *, domain: Optional[str] = None) -> Topic:
+    """Persist generated Topic, return detached Topic."""
     tzh = (data.get("title_zh") or "").strip()
     topic = Topic(
         title=data["title"],
@@ -420,36 +427,18 @@ def _save_to_db(data: dict, db: Session) -> Topic:
         scene_specific_rules=data["scene_specific_rules"],
         difficulty_tiers=data["difficulty_tiers"],
         voice="Stanley",
+        domain=domain,
     )
     db.add(topic)
     db.commit()
     db.refresh(topic)
-
-    # Save TargetNodes
-    raw_nodes = data.get("nodes", [])
-    for n in raw_nodes:
-        text = n.get("text", "").strip()
-        if not text:
-            continue
-        depth = int(n.get("depth_level", 1))
-        ntype = n.get("type", "word")
-        # weight heuristic: sentences > phrases > words
-        weight = 3.0 if ntype == "sentence" else (2.0 if ntype == "phrase" else 1.0)
-        db.add(TargetNode(
-            topic_id=topic.id,
-            node_text=text,
-            node_type=ntype,
-            depth_level=depth,
-            weight=weight,
-        ))
-    db.commit()
 
     # Save values before expunge (accessing attributes on detached instance raises DetachedInstanceError)
     saved_title = topic.title
     saved_id = topic.id
     db.expunge(topic)
     logger.info(f"[TopicGenerator] Saved new topic: '{saved_title}' "
-                f"(id={saved_id}, nodes={len(raw_nodes)})")
+                f"(id={saved_id}, domain={domain})")
     return topic
 
 

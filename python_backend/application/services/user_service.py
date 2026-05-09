@@ -1,5 +1,6 @@
 from api.dependencies import get_db
-from database import User, UserProgress
+from database import User
+
 
 def init_or_get_user(user_id: str):
     if not user_id:
@@ -14,12 +15,14 @@ def init_or_get_user(user_id: str):
         db.expunge(user)
         return user
 
+
 def _fetch_user_settings_dict(user_id: str) -> dict:
     if not user_id:
         return {}
     with get_db() as db:
         u = db.query(User).filter(User.id == user_id).first()
         return dict(u.settings or {}) if u else {}
+
 
 def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite=None, learner_level=None, tts_engine=None, tts_voice=None):
     if not user_id:
@@ -42,6 +45,7 @@ def _update_lms_settings(user_id: str, depth_preference=None, new_topic_appetite
             db.commit()
             db.refresh(user)
 
+
 def update_user_politeness(user_id: str, level: int):
     if not user_id:
         return
@@ -51,16 +55,12 @@ def update_user_politeness(user_id: str, level: int):
             user.politeness_level = level
             db.commit()
 
+
 def _take_mastery_snapshot(user_id: str, task_packet) -> dict:
-    if not task_packet or not user_id:
-        return {}
-    all_nodes = task_packet.target_nodes + task_packet.review_nodes
-    node_ids = [n["id"] for n in all_nodes if n.get("id")]
-    if not node_ids:
-        return {}
-    with get_db() as db:
-        progresses = db.query(UserProgress).filter(
-            UserProgress.user_id == user_id,
-            UserProgress.node_id.in_(node_ids),
-        ).all()
-        return {p.node_id: p.mastery_score for p in progresses}
+    """
+    返回空的 mastery snapshot。
+
+    新架构下掌握度基于 LearningSession.nodes_mastered 追踪，
+    不再需要从 UserProgress 获取之前的掌握度。
+    """
+    return {}

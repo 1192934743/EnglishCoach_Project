@@ -1,3 +1,4 @@
+import os
 import uuid
 import datetime
 from typing import Optional
@@ -5,7 +6,9 @@ from typing import Optional
 from sqlalchemy import create_engine, Column, String, Integer, Float, Boolean, DateTime, ForeignKey, JSON, Text, CheckConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = "sqlite:///english_coach.db"
+# 使用绝对路径，确保无论从哪个目录运行都在 python_backend/ 下创建数据库
+_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "english_coach.db")
+DATABASE_URL = f"sqlite:///{_DB_PATH}"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -55,32 +58,8 @@ class Topic(Base):
     scene_specific_rules = Column(JSON, nullable=True)
     # 话题特征向量（由 VectorStore 离线生成后写回），JSON 存 float 列表
     embedding = Column(JSON, nullable=True)
-
-
-class TargetNode(Base):
-    __tablename__ = 'target_nodes'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    topic_id = Column(Integer, ForeignKey('topics.id'))
-    node_text = Column(String, nullable=False)
-    node_type = Column(String, default="word")   # word / phrase / sentence
-    depth_level = Column(Integer, default=1)     # 1=基础, 2=进阶, 3=高阶
-    weight = Column(Float, default=1.0)
-
-
-class UserProgress(Base):
-    __tablename__ = 'user_progress'
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    user_id = Column(String, ForeignKey('users.id'))
-    node_id = Column(Integer, ForeignKey('target_nodes.id'))
-    mastery_score = Column(Float, default=0.0)    # 0~100
-    practice_count = Column(Integer, default=0)
-    last_practiced_at = Column(DateTime, default=datetime.datetime.utcnow)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 阶段一新增：微场景图谱 (Micro-Scenario Graph)
-# 支撑「双轨校验·微场景图谱流转架构」
-# ══════════════════════════════════════════════════════════════════════════════
+    # 话题领域分类，支撑 Migration Lock（防横向沉迷）
+    domain = Column(String, nullable=True)  # e.g. "餐饮", "出行", "购物"
 
 
 class MicroScenario(Base):
@@ -123,6 +102,10 @@ class MicroScenario(Base):
     max_turns = Column(Integer, default=8)           # 建议最大轮数（超时强制流转）
     weight = Column(Float, default=1.0)               # 推荐权重（影响图谱构建）
 
+    # 语义向量（图谱构建时使用 Cosine Similarity）
+    # JSON 数组，存储 Gemini embedding-001 的 768 维向量
+    embedding = Column(JSON, nullable=True)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
 
@@ -138,7 +121,6 @@ class ScenarioConstraint(Base):
     - constraint_text：目标表达原文（双轨校验的核心检测目标）
     - constraint_type：检测粒度 (word/phrase/sentence)
     - depth_level：必须与父 MicroScenario.depth_level 一致或更低
-    - legacy_node_id：关联旧 TargetNode（迁移期兼容）
     """
     __tablename__ = 'scenario_constraints'
 
@@ -157,9 +139,6 @@ class ScenarioConstraint(Base):
 
     # 提示（当约束未被命中时，Director 可参考此提示）
     hint_cn = Column(String, nullable=True)  # e.g., "咖啡中杯用 medium"
-
-    # 关联旧 TargetNode（迁移期兼容）
-    legacy_node_id = Column(Integer, ForeignKey('target_nodes.id'), nullable=True)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -195,6 +174,12 @@ class ScenarioTransition(Base):
     # 元数据
     shared_constraints = Column(JSON, nullable=True)  # 两场景共享的 constraint_id 列表
     created_by = Column(String, default="algorithm")  # "algorithm" / "manual"
+
+    # 边类型（v2.0 新增，用于区分垂直主线和横向迁移）
+    edge_type = Column(String, nullable=True)  # VERTICAL_CORE / HORIZONTAL_MIGRATION / MANUAL
+
+    # 流转权重（v2.0 新增，用于处理双向迁移不对称性）
+    transition_weight = Column(Float, nullable=True)  # 0.0-1.0，默认为 None
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
@@ -241,169 +226,21 @@ class LearningSession(Base):
 
 def init_db(safe: bool = True):
     """
-    初始化数据库并注入种子数据。
+    初始化数据库表结构。
 
-    Args:
-        safe: True 时为幂等模式——若已有话题则跳过；False 时强制重建（会清空数据）。
+    话题数据由 scripts/seed_topics.py 生成，不要在这里硬编码。
     """
     db = SessionLocal()
     try:
-        existing_count = db.query(Topic).count()
-
-        if existing_count > 0 and safe:
-            print(f"[INFO] DB already has {existing_count} topics, skipping init_db (safe mode).")
+        # 确保表已创建
+        Base.metadata.create_all(bind=engine)
+        
+        if safe:
             return
 
-        if not safe:
-            print("[INFO] Rebuilding database with LMS schema...")
-            Base.metadata.drop_all(bind=engine)
-            Base.metadata.create_all(bind=engine)
-            db.close()
-            db = SessionLocal()
-
-        # ── 话题1：麦当劳点餐（初级）────────────────────────────────────────────
-        mcdonalds = Topic(
-            title="McDonald's Ordering",
-            title_zh="麦当劳点餐",
-            category="Food & Drink",
-            role_name="Fast-food Server",
-            learner_level="Beginner",
-            voice="Stanley",
-            system_prompt=(
-                "You are a friendly fast-food server at McDonald's drive-thru. "
-                "Follow the specific persona instructions provided in the dynamic prompt."
-            ),
-            vocab_tags=["burger", "fries", "combo", "meal", "drink", "order", "receipt", "change"],
-            sentence_patterns=[
-                "I would like to order",
-                "Can I get",
-                "for here or to go",
-                "Would you like to upsize",
-                "That will be",
-            ],
-            scene_specific_rules=[
-                "If the user says they are not hungry or do not want food, suggest a small side item or a drink instead of ending the conversation.",
-                "Always confirm the complete order before proceeding to payment.",
-                "If the user's order is unclear, politely ask them to repeat or clarify each item.",
-            ],
-            difficulty_tiers={
-                "1": {"rules": ["Focus only on basic food ordering vocabulary. Keep sentences short."]},
-                "2": {"rules": ["Introduce combo meals, upsizing, and payment options."]},
-                "3": {"rules": ["Add dietary restrictions, customizations, and complaint handling."]},
-            },
-        )
-        db.add(mcdonalds)
-        db.commit()
-        db.refresh(mcdonalds)
-
-        nodes_mcdonalds = [
-            # depth_level=1: 绝对基础，第一次练习必须覆盖
-            TargetNode(topic_id=mcdonalds.id, node_text="burger", node_type="word", depth_level=1, weight=1.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="fries", node_type="word", depth_level=1, weight=1.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="I would like to order", node_type="sentence", depth_level=1, weight=3.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="Can I get", node_type="phrase", depth_level=1, weight=2.0),
-            # depth_level=2: 进阶表达，掌握 tier-1 后解锁
-            TargetNode(topic_id=mcdonalds.id, node_text="for here or to go", node_type="phrase", depth_level=2, weight=2.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="combo meal", node_type="phrase", depth_level=2, weight=2.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="upsize", node_type="word", depth_level=2, weight=1.5),
-            # depth_level=3: 高阶，能处理意外情况
-            TargetNode(topic_id=mcdonalds.id, node_text="I have a food allergy", node_type="sentence", depth_level=3, weight=2.0),
-            TargetNode(topic_id=mcdonalds.id, node_text="Could you make that without", node_type="phrase", depth_level=3, weight=2.0),
-        ]
-        db.add_all(nodes_mcdonalds)
-
-        # ── 话题2：技术面试（专业级）────────────────────────────────────────────
-        interview = Topic(
-            title="Technical Job Interview",
-            title_zh="技术岗位面试",
-            category="Career & Professional",
-            role_name="Senior Tech Lead",
-            learner_level="Professional",
-            voice="Stanley",
-            system_prompt=(
-                "You are conducting a technical interview for a Python Algorithm Engineer position. "
-                "Follow the specific persona instructions provided in the dynamic prompt."
-            ),
-            vocab_tags=["algorithm", "complexity", "optimize", "implement", "trade-off", "scalable", "edge case"],
-            sentence_patterns=[
-                "Could you walk me through your approach",
-                "What is the time complexity",
-                "How would you handle edge cases",
-                "In my experience",
-                "I would approach this by",
-            ],
-            scene_specific_rules=[
-                "If the user gives a one-word answer, probe for more detail: 'Could you walk me through your reasoning?'",
-                "Acknowledge correct technical answers with brief positive feedback before moving on.",
-                "If the user seems stuck, offer a single small hint rather than giving the full answer.",
-            ],
-            difficulty_tiers={
-                "1": {"rules": ["Ask simple behavioral questions. Focus on past experience."]},
-                "2": {"rules": ["Introduce algorithm questions. Expect Big-O analysis."]},
-                "3": {"rules": ["Add system design questions. Expect trade-off discussions."]},
-            },
-        )
-        db.add(interview)
-        db.commit()
-        db.refresh(interview)
-
-        nodes_interview = [
-            TargetNode(topic_id=interview.id, node_text="In my experience", node_type="phrase", depth_level=1, weight=2.0),
-            TargetNode(topic_id=interview.id, node_text="I would approach this by", node_type="sentence", depth_level=1, weight=3.0),
-            TargetNode(topic_id=interview.id, node_text="time complexity", node_type="phrase", depth_level=2, weight=2.5),
-            TargetNode(topic_id=interview.id, node_text="edge case", node_type="phrase", depth_level=2, weight=2.0),
-            TargetNode(topic_id=interview.id, node_text="trade-off", node_type="word", depth_level=2, weight=2.0),
-            TargetNode(topic_id=interview.id, node_text="scalable", node_type="word", depth_level=3, weight=1.5),
-            TargetNode(topic_id=interview.id, node_text="bottleneck", node_type="word", depth_level=3, weight=1.5),
-        ]
-        db.add_all(nodes_interview)
-
-        # ── 话题3：日常闲聊（中级）──────────────────────────────────────────────
-        casual = Topic(
-            title="Daily Casual Conversation",
-            title_zh="日常闲聊",
-            category="Daily Life",
-            role_name="Language Partner",
-            learner_level="Intermediate",
-            voice="Stanley",
-            system_prompt=(
-                "You are a friendly British language partner practicing daily conversation. "
-                "Follow the specific persona instructions provided in the dynamic prompt."
-            ),
-            vocab_tags=["weekend", "hobby", "plan", "recommend", "prefer", "actually", "honestly"],
-            sentence_patterns=[
-                "What do you think about",
-                "To be honest",
-                "Have you ever tried",
-                "That reminds me of",
-                "I was wondering if",
-            ],
-            scene_specific_rules=[
-                "Occasionally echo back a rephrased version of what the user said to model natural British English.",
-                "If the user makes a grammatical error, gently model the correct version in your own reply without explicitly pointing it out.",
-            ],
-            difficulty_tiers={
-                "1": {"rules": ["Keep topics simple: weather, hobbies, food."]},
-                "2": {"rules": ["Discuss opinions, preferences, and past experiences."]},
-                "3": {"rules": ["Debate abstract topics, hypotheticals, and current events."]},
-            },
-        )
-        db.add(casual)
-        db.commit()
-        db.refresh(casual)
-
-        nodes_casual = [
-            TargetNode(topic_id=casual.id, node_text="What do you think about", node_type="sentence", depth_level=1, weight=2.5),
-            TargetNode(topic_id=casual.id, node_text="To be honest", node_type="phrase", depth_level=1, weight=2.0),
-            TargetNode(topic_id=casual.id, node_text="Have you ever tried", node_type="sentence", depth_level=2, weight=2.5),
-            TargetNode(topic_id=casual.id, node_text="That reminds me of", node_type="phrase", depth_level=2, weight=2.0),
-            TargetNode(topic_id=casual.id, node_text="I was wondering if", node_type="sentence", depth_level=3, weight=2.0),
-            TargetNode(topic_id=casual.id, node_text="hypothetically speaking", node_type="phrase", depth_level=3, weight=1.5),
-        ]
-        db.add_all(nodes_casual)
-
-        db.commit()
-        print("[INFO] Database ready: 3 topics seeded with full LMS fields.")
+        print("[INFO] Rebuilding database with LMS schema...")
+        Base.metadata.drop_all(bind=engine)
+        Base.metadata.create_all(bind=engine)
     finally:
         db.close()
 
@@ -450,7 +287,14 @@ def effective_topic_title_zh(topic: Topic) -> Optional[str]:
 
 
 def ensure_schema_upgrades() -> None:
-    """在 ORM 访问前调用：为已有 english_coach.db 追加 topics.title_zh 并尽量回填。"""
+    """
+    在 ORM 访问前调用：为已有 english_coach.db 追加缺失字段。
+
+    v2.0 新增字段：
+    - micro_scenarios.embedding: JSON，存储 768 维语义向量
+    - scenario_transitions.edge_type: VARCHAR，区分边类型
+    - scenario_transitions.transition_weight: FLOAT，处理双向迁移不对称性
+    """
     from sqlalchemy import text
 
     if engine.dialect.name != "sqlite":
@@ -462,10 +306,34 @@ def ensure_schema_upgrades() -> None:
         ).fetchone() is not None
         if not table_exists:
             return
+
+        # 检查 topics 表
         rows = conn.execute(text("PRAGMA table_info(topics)")).fetchall()
         colnames = {r[1] for r in rows}
-        if "title_zh" not in colnames:
-            conn.execute(text("ALTER TABLE topics ADD COLUMN title_zh VARCHAR"))
+
+        if "domain" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN domain VARCHAR(64)"))
+            print("[Schema] Added topics.domain column")
+
+        # 检查 micro_scenarios 表
+        rows = conn.execute(text("PRAGMA table_info(micro_scenarios)")).fetchall()
+        colnames = {r[1] for r in rows}
+
+        if "embedding" not in colnames:
+            conn.execute(text("ALTER TABLE micro_scenarios ADD COLUMN embedding JSON"))
+            print("[Schema] Added micro_scenarios.embedding column")
+
+        # 检查 scenario_transitions 表
+        rows = conn.execute(text("PRAGMA table_info(scenario_transitions)")).fetchall()
+        colnames = {r[1] for r in rows}
+
+        if "edge_type" not in colnames:
+            conn.execute(text("ALTER TABLE scenario_transitions ADD COLUMN edge_type VARCHAR(32)"))
+            print("[Schema] Added scenario_transitions.edge_type column")
+
+        if "transition_weight" not in colnames:
+            conn.execute(text("ALTER TABLE scenario_transitions ADD COLUMN transition_weight FLOAT"))
+            print("[Schema] Added scenario_transitions.transition_weight column")
 
     db = SessionLocal()
     try:
