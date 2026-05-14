@@ -1,0 +1,71 @@
+{
+  "version": "1.0",
+  "last_updated": "2026-05-13",
+  "description": "话题模板配置文件，支持通过修改此文件扩展话题，无需改代码",
+  "domains": {
+    "餐饮": [
+      {
+        "description": "Ordering drinks and food at a coffee shop or café",
+        "role_hint": "Barista"
+      },
+      {
+        "description": "Sitting down at a restaurant, ordering from the menu, and paying the bill",
+        "role_hint": "Waiter"
+      },
+      {
+        "description": "Ordering takeout via phone",
+        "role_hint": "Restaurant Staff"
+      }
+    ],
+    "出行": [
+      {
+        "description": "Checking in luggage and going through security at an airport",
+        "role_hint": "Airport Staff"
+      },
+      {
+        "description": "Taking a taxi or rideshare like Uber — giving directions and making small talk",
+        "role_hint": "Taxi Driver"
+      },
+      {
+        "description": "Checking in at a hotel, asking for amenities, and checking out",
+        "role_hint": "Hotel Receptionist"
+      }
+    ],
+    "购物": [
+      {
+        "description": "Shopping for clothes — asking for sizes, colors, and trying items on",
+        "role_hint": "Shop Assistant"
+      },
+      {
+        "description": "Grocery shopping and asking store staff where to find items",
+        "role_hint": "Store Staff"
+      }
+    ],
+    "医疗": [
+      {
+        "description": "Visiting a doctor, describing symptoms, and understanding a prescription",
+        "role_hint": "Doctor"
+      }
+    ],
+    "职业": [
+      {
+        "description": "Calling customer service to report a problem or request a refund",
+        "role_hint": "Customer Service Representative"
+      },
+      {
+        "description": "A business meeting — presenting ideas, giving feedback, and discussing next steps",
+        "role_hint": "Business Colleague"
+      }
+    ],
+    "社交": [
+      {
+        "description": "Making small talk at a party — introducing yourself and discussing hobbies",
+        "role_hint": "Party Guest"
+      },
+      {
+        "description": "Renting an apartment — asking the landlord about rules, utilities, and repairs",
+        "role_hint": "Landlord"
+      }
+    ]
+  }
+}

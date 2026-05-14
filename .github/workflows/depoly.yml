@@ -41,7 +41,12 @@ jobs:
             # 确保这里是你 docker-compose.yml 所在的目录
             sudo docker compose up -d --build backend
 
-            # 6. 清理残留的虚悬镜像（节省空间）
+            # 6. 同步内容数据（从 content_seed.json upsert 到数据库）
+            # 这不会影响用户数据（users, learning_sessions 等）
+            echo "[DEPLOY] Syncing content from content_seed.json..."
+            sudo docker compose exec -T backend python scripts/import_content.py --input content_seed.json || true
+
+            # 7. 清理残留的虚悬镜像（节省空间）
             sudo docker image prune -f
 
-            echo "🚀 Actual deployment success!"
+            echo "Actual deployment success!"

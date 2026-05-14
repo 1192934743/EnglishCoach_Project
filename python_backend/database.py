@@ -61,6 +61,18 @@ class Topic(Base):
     # 话题领域分类，支撑 Migration Lock（防横向沉迷）
     domain = Column(String, nullable=True)  # e.g. "餐饮", "出行", "购物"
 
+    # ── 质量达标字段（v1.3 新增）────────────────────────────────────────────
+    # 质量等级：A/B/C/D，用于自动化质量控制
+    quality_grade = Column(String, nullable=True)  # "A"/"B"/"C"/"D"
+    # 质量分数：0-100
+    quality_score = Column(Integer, nullable=True)
+    # 质量问题详情（JSON 列表）
+    quality_issues = Column(JSON, nullable=True)
+    # 生成尝试次数
+    generation_attempts = Column(Integer, default=1)
+    # 是否已发布（未达标话题标记为未发布）
+    is_published = Column(Boolean, default=True)
+
 
 class MicroScenario(Base):
     """
@@ -294,6 +306,13 @@ def ensure_schema_upgrades() -> None:
     - micro_scenarios.embedding: JSON，存储 768 维语义向量
     - scenario_transitions.edge_type: VARCHAR，区分边类型
     - scenario_transitions.transition_weight: FLOAT，处理双向迁移不对称性
+
+    v1.3 新增字段：
+    - topics.quality_grade: VARCHAR，质量等级 A/B/C/D
+    - topics.quality_score: INTEGER，质量分数 0-100
+    - topics.quality_issues: JSON，质量问题详情
+    - topics.generation_attempts: INTEGER，生成尝试次数
+    - topics.is_published: BOOLEAN，是否已发布
     """
     from sqlalchemy import text
 
@@ -314,6 +333,27 @@ def ensure_schema_upgrades() -> None:
         if "domain" not in colnames:
             conn.execute(text("ALTER TABLE topics ADD COLUMN domain VARCHAR(64)"))
             print("[Schema] Added topics.domain column")
+
+        # v1.3 新增字段：质量相关
+        if "quality_grade" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN quality_grade VARCHAR(8)"))
+            print("[Schema] Added topics.quality_grade column")
+
+        if "quality_score" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN quality_score INTEGER"))
+            print("[Schema] Added topics.quality_score column")
+
+        if "quality_issues" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN quality_issues JSON"))
+            print("[Schema] Added topics.quality_issues column")
+
+        if "generation_attempts" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN generation_attempts INTEGER DEFAULT 1"))
+            print("[Schema] Added topics.generation_attempts column")
+
+        if "is_published" not in colnames:
+            conn.execute(text("ALTER TABLE topics ADD COLUMN is_published BOOLEAN DEFAULT 1"))
+            print("[Schema] Added topics.is_published column")
 
         # 检查 micro_scenarios 表
         rows = conn.execute(text("PRAGMA table_info(micro_scenarios)")).fetchall()

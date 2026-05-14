@@ -38,7 +38,7 @@ except ImportError:
 # ⚠️  模型硬绑定常量 (禁止修改)
 # ─────────────────────────────────────────────────────────────────────────────
 EMBEDDING_MODEL = "models/gemini-embedding-001"   # 禁止热切换（正确模型名）
-EMBEDDING_DIMENSION = 3072                   # Gemini embedding-001 输出维度（3072维）
+EMBEDDING_DIMENSION = 768                    # Gemini embedding-001 输出维度（768维）
 EMBEDDING_TASK_TYPE = "RETRIEVAL_DOCUMENT"
 
 # ─────────────────────────────────────────────────────────────────────────────

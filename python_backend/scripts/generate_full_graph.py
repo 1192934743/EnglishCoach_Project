@@ -75,42 +75,22 @@ _backend_dir = os.path.dirname(_script_dir)
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
+from dotenv import load_dotenv
+load_dotenv(os.path.join(_backend_dir, "config.env"))
+
 from sqlalchemy.orm import Session
 
 from database import SessionLocal, Topic, MicroScenario, ScenarioConstraint, ScenarioTransition
-from infrastructure.embedding import SyncSemanticEmbedder
+from infrastructure.graph import DEPTH_DEFINITIONS, DEPTH_META
 from enums import EdgeType
-
-# ── 导入子模块的函数和常量 ─────────────────────────────────────────────────────
-# 注意：由于 graph_generator.py 使用 asyncio，这里需要导入其核心逻辑
-# 但为了保持独立性，我们直接复用其 DEPTH_META 和相关常量
-
-# 延迟导入避免循环依赖
-_GRAPH_GENERATOR_IMPORTED = False
-
-
-def _import_graph_generator():
-    """延迟导入 graph_generator 的依赖项"""
-    global _GRAPH_GENERATOR_IMPORTED
-    if _GRAPH_GENERATOR_IMPORTED:
-        return
-
-    import importlib.util
-    spec = importlib.util.spec_from_file_location(
-        "graph_generator_module",
-        os.path.join(_backend_dir, "scripts", "graph_generator.py")
-    )
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["graph_generator_module"] = module
-
-    # 手动设置需要的常量（避免执行整个模块的 main）
-    module.DEPTH_META = {
-        1: {"desc": "Foundation", "keyword": "core survival phrases", "constraint_range": (2, 3)},
-        2: {"desc": "Intermediate", "keyword": "politeness and detail modifiers", "constraint_range": (3, 4)},
-        3: {"desc": "Advanced", "keyword": "native expressions and complex sentences", "constraint_range": (4, 5)},
-    }
-
-    _GRAPH_GENERATOR_IMPORTED = True
+from scripts.graph_generator import (
+    generate_and_save,
+    TopicDTO,
+    build_scenario_prompt,
+    translate_prompt_summary,
+    retrieve_existing_scenarios,
+    get_other_depths_step_orders,
+)
 
 
 # ── 日志配置 ───────────────────────────────────────────────────────────────────
@@ -121,6 +101,127 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("FullGraphGenerator")
+
+# ── LLM 评审配置 ───────────────────────────────────────────────────────────────
+
+import google.generativeai as genai
+
+_api_key = os.getenv("GEMINI_API_KEY")
+if _api_key:
+    genai.configure(api_key=_api_key)
+    review_model = genai.GenerativeModel("gemini-2.5-flash")
+else:
+    review_model = None
+    logger.warning("[CONFIG] GEMINI_API_KEY not found, --llm-review will be disabled")
+
+
+def _build_llm_review_prompt(
+    prompt: str,
+    depth_config_content: str,
+    instruction_code: str,
+) -> str:
+    """
+    构建 LLM 评审 Prompt。
+
+    传递源头上下文，让 LLM 能精准指出在哪个文件哪一行修改。
+    """
+    return f"""你是一个专业的微场景 Prompt 工程评审员。
+
+## 你的任务
+分析以下微场景生成 Prompt，从"源头可优化性"角度给出评审意见。
+
+## 评审维度
+1. **指令清晰度**：Prompt 中的指令是否无歧义、可执行
+2. **约束一致性**：难度定义、场景数量、约束数量是否自洽
+3. **示例质量**：Depth 定义中的示例是否足够清晰
+4. **RAG 上下文有效性**：已有场景的格式是否便于 LLM 理解
+5. **输出格式完整性**：JSON Schema 是否包含所有必要字段
+
+## 源头配置文件内容（评审时参考）
+### DEPTH_DEFINITIONS (infrastructure/graph/depth_config.py):
+```
+{depth_config_content}
+```
+
+### 生成指令代码片段 (scripts/graph_generator.py ~line 148-157):
+```python
+{instruction_code}
+```
+
+## 当前 Prompt（待评审）
+```
+{prompt}
+```
+
+## 输出格式（严格按此格式输出）
+```
+【Prompt 摘要】
+- 话题: <话题名称>
+- 难度: Depth <N> (<描述>)
+- 已有场景数: <N> 个
+- 将生成: <N> 个场景，每个场景 <M>-<K> 个约束
+
+【问题列表】
+1. [<严重程度>] <问题描述>
+   → 建议: <优化建议>
+
+【源头优化建议】
+1. [depth_config.py:<行号>] <具体修改建议>
+2. [graph_generator.py:<行号>] <具体修改建议>
+```
+"""
+
+
+async def review_prompt_with_llm(prompt: str) -> str:
+    """
+    使用 LLM 评审 Prompt。
+
+    Args:
+        prompt: 待评审的英文 Prompt
+
+    Returns:
+        LLM 评审结果（中英文混合）
+    """
+    if review_model is None:
+        return "[LLM REVIEW] 跳过（未配置 GEMINI_API_KEY）"
+
+    try:
+        # 读取源头配置文件内容（用于给 LLM 参考）
+        depth_config_path = os.path.join(_backend_dir, "infrastructure", "graph", "depth_config.py")
+        instruction_code = '''context_str, instruction_str = build_rag_context(existing_scenarios)
+if not existing_scenarios:
+    return (
+        "(No existing scenarios, feel free to generate 3-5 parallel scenarios)",
+        "Please generate 3-5 parallel functional migration scenarios."
+    )
+context_parts = [...]
+instruction = (
+    "Please generate 2-3 new parallel scenarios.\\n"
+    "- Similar communicative function\\n"
+    "- No vocabulary overlap with existing scenarios"
+)'''
+
+        depth_config_content = ""
+        if os.path.exists(depth_config_path):
+            with open(depth_config_path, "r", encoding="utf-8") as f:
+                depth_config_content = f.read()
+
+        review_prompt = _build_llm_review_prompt(
+            prompt=prompt,
+            depth_config_content=depth_config_content[:2000],
+            instruction_code=instruction_code,
+        )
+
+        # 调用 LLM 评审（同步调用，用 to_thread 包装）
+        response = await asyncio.to_thread(
+            review_model.generate_content,
+            review_prompt,
+        )
+
+        return response.text.strip()
+
+    except Exception as e:
+        return f"[LLM REVIEW] 评审失败: {e}"
 
 # ── 限流器配置 ────────────────────────────────────────────────────────────────
 
@@ -272,6 +373,8 @@ class FullGraphGenerator:
         to_topic: Optional[int] = None,
         rate_limiter: Optional[RateLimiter] = None,
         progress: Optional[ProgressTracker] = None,
+        show_prompt: bool = False,
+        llm_review: bool = False,
     ):
         self.db = db
         self.dry_run = dry_run
@@ -282,6 +385,8 @@ class FullGraphGenerator:
         self.to_topic = to_topic
         self.rate_limiter = rate_limiter or RateLimiter()
         self.progress = progress or ProgressTracker()
+        self.show_prompt = show_prompt
+        self.llm_review = llm_review
         self._canceled = False
 
         # 注册 Ctrl+C 处理器
@@ -338,7 +443,9 @@ class FullGraphGenerator:
 
     async def generate_topic_scenarios(self, topic: Topic, depth: int) -> bool:
         """
-        为单个话题 × 难度生成场景。
+        为单个话题 × 难度生成场景（串行调用，内部使用公共接口）。
+
+        注意：推荐使用 run() 方法中的并发执行，性能更好。
 
         Returns:
             True=成功，False=失败
@@ -351,17 +458,24 @@ class FullGraphGenerator:
             return True
 
         if self.dry_run:
-            logger.info(f"[DRY RUN] Would generate: {task_name}")
+            # dry-run 模式：构建并展示 Prompt（不调用 API）
+            await self._dry_run_with_prompt(topic, depth)
             self.progress.mark_complete(task_name, success=True)
             return True
 
         try:
-            # 限流获取
             async with self.rate_limiter:
                 logger.info(f"[START] Generating: {task_name}")
 
-                # 调用生成逻辑（复用 graph_generator 的核心代码）
-                success = await self._call_generator(topic, depth)
+                # 转换为 TopicDTO 避免跨 Session 访问 ORM 对象
+                topic_dto = TopicDTO.from_orm(topic)
+                ids = await generate_and_save(
+                    topic=topic_dto,
+                    depth=depth,
+                    db=self.db,
+                    rebuild=self.rebuild,
+                )
+                success = len(ids) > 0
 
                 if success:
                     logger.info(f"[OK] Completed: {task_name}")
@@ -373,219 +487,55 @@ class FullGraphGenerator:
 
         except Exception as e:
             logger.error(f"[ERROR] Exception: {task_name} - {e}")
+            self.db.rollback()
             self.progress.mark_complete(task_name, success=False)
             return False
 
-    async def _call_generator(self, topic: Topic, depth: int) -> bool:
-        """调用实际的生成器（封装 graph_generator 的核心逻辑）"""
-        _import_graph_generator()
+    async def _dry_run_with_prompt(self, topic: Topic, depth: int):
+        """
+        dry-run 模式：构建并展示 Prompt（可选 LLM 评审）。
 
-        # 延迟导入 Gemini
-        from dotenv import load_dotenv
-        load_dotenv(os.path.join(_backend_dir, "config.env"))
+        在 dry-run 模式下：
+        1. 打印任务摘要（中文）
+        2. 打印完整英文 Prompt（--show-prompt）
+        3. 调用 LLM 评审（--llm-review）
+        """
+        topic_dto = TopicDTO.from_orm(topic)
+        existing = retrieve_existing_scenarios(self.db, topic.id, depth)
+        other_depths_info = get_other_depths_step_orders(self.db, topic.id, depth)
+        prompt = build_scenario_prompt(topic_dto, depth, existing, other_depths_info)
+        meta = DEPTH_META[depth]
 
-        import google.generativeai as genai
-
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            logger.error("未配置 GEMINI_API_KEY")
-            return False
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            "gemini-2.5-pro",
-            generation_config={"response_mime_type": "application/json"},
+        # 打印中文摘要
+        summary = translate_prompt_summary(
+            prompt=prompt,
+            topic_title=topic.title,
+            depth=depth,
+            existing_count=len(existing),
+            meta=meta,
         )
 
-        # 复用 graph_generator 的 DEPTH_DEFINITIONS 和 Prompt 模板
-        DEPTH_DEFINITIONS = """
-## Difficulty Level Definitions (Strictly Follow)
+        print("\n" + "=" * 70)
+        print(f"[DRY RUN] {topic.title} — Depth {depth}")
+        print("=" * 70)
+        print("【任务摘要】")
+        for line in summary.split('\n'):
+            print(f"  {line}")
 
-IMPORTANT: All depths within the same topic must maintain the SAME step_order. Only expression complexity increases, NOT the basic storyline!
+        # 打印完整 Prompt（--show-prompt）
+        if self.show_prompt:
+            print("\n【完整 Prompt（英文）】")
+            print("-" * 70)
+            print(prompt)
+            print("-" * 70)
 
-### Depth 1 - Foundation (Core Survival Phrases)
-- Goal: Complete the core communicative function with simplest vocabulary.
-- Vocabulary: High-frequency basic words, phrases preferred (e.g., I want, a coffee, how much).
-- Constraints: Generate only 2-3 most essential nouns or basic verb phrases.
-- Example: (Ordering Step) Constraints: ["I want", "coffee", "large"]
+        # LLM 评审（--llm-review）
+        if self.llm_review:
+            print("\n【LLM 评审中...】")
+            review_result = await review_prompt_with_llm(prompt)
+            print(review_result)
 
-### Depth 2 - Intermediate (Politeness & Detail Modifiers)
-- Goal: Add detail modifiers, variation options, and basic polite expressions on top of basic function.
-- Vocabulary: Advanced compound words, complete simple sentences (e.g., I would like, instead of, with oat milk).
-- Constraints: Generate 3-4 constraints, MUST include at least one polite expression or modifier.
-- Example: (Ordering Step) Constraints: ["I would like", "a latte", "with oat milk", "please"]
-
-### Depth 3 - Advanced (Native Expressions & Complex Sentences)
-- Goal: Use native idioms, indirect requests, or complex clauses commonly used by native speakers.
-- Vocabulary: Advanced vocabulary, subjunctive mood, complex sentences (e.g., I was wondering if, would it be possible to).
-- Constraints: Generate 4-5 constraints, MUST include advanced communicative patterns.
-- Example: (Ordering Step) Constraints: ["I was wondering if", "could possibly make it", "decaf", "extra shot"]
-"""
-
-        DEPTH_META = {
-            1: {"desc": "Foundation", "keyword": "core survival phrases", "constraint_range": (2, 3), "scenario_count": "3-5"},
-            2: {"desc": "Intermediate", "keyword": "politeness and detail modifiers", "constraint_range": (3, 4), "scenario_count": "2-4"},
-            3: {"desc": "Advanced", "keyword": "native expressions and complex sentences", "constraint_range": (4, 5), "scenario_count": "1-2"},
-        }
-
-        # 检索已存在场景（RAG）
-        existing = self.db.query(MicroScenario).filter(
-            MicroScenario.topic_id == topic.id,
-            MicroScenario.depth_level == depth,
-        ).all()
-
-        existing_context = ""
-        if existing:
-            existing_context = "=== Existing Scenarios (Generate new parallel scenarios, avoid vocabulary overlap) ===\n"
-            for i, sc in enumerate(existing, 1):
-                constraints = self.db.query(ScenarioConstraint).filter(
-                    ScenarioConstraint.micro_scenario_id == sc.id
-                ).all()
-                constraint_texts = [c.constraint_text for c in constraints]
-                existing_context += f"[Scenario {i}] {sc.scenario_name}\n  Intent: {sc.intent_desc}\n  Keywords: {', '.join(constraint_texts)}\n"
-
-        meta = DEPTH_META[depth]
-        vocab_list = ', '.join(topic.vocab_tags or []) or "N/A"
-        pattern_list = ', '.join(topic.sentence_patterns or []) or "N/A"
-
-        prompt = f"""[Task: Generate functional migration micro-scenarios for {topic.title}]
-
-## Topic Information
-- Topic: {topic.title}
-- Topic (Chinese): {getattr(topic, 'title_zh', 'N/A')}
-- User Role: {topic.role_name or 'N/A'}
-
-## Topic Vocabulary Reference
-- Vocab Tags: {vocab_list}
-- Sentence Patterns: {pattern_list}
-
-## Generation Guidance
-- Constraints should align with and expand upon the topic's vocab_tags
-- Prioritize vocabulary from the topic's sentence_patterns where semantically appropriate
-
-## Difficulty Level Definitions
-{DEPTH_DEFINITIONS}
-
-## Generation Target
-**This Generation: Depth {depth} ({meta['desc']})**
-Keyword: {meta['keyword']}
-
-## Existing Scenarios Reference (for avoiding duplicates)
-{existing_context or '(No existing scenarios, feel free to generate 3-5 parallel scenarios)'}
-
-## Generation Requirements
-- Generate {meta['scenario_count']} parallel scenarios
-- Similar communicative function
-- No vocabulary overlap with existing scenarios
-- Constraint count must be {meta['constraint_range'][0]}-{meta['constraint_range'][1]}
-
-## Output Format (JSON only)
-{{
-    "scenarios": [
-        {{
-            "scenario_code": "UNIQUE_CODE",
-            "scenario_name": "Scenario Name",
-            "intent_desc": "Teaching intent description",
-            "scene_desc": "Scene description",
-            "step_order": 1-3,
-            "flow_explanation": "Position of this scenario in the overall flow",
-            "is_entry_point": true/false,
-            "constraints": [
-                {{
-                    "constraint_text": "Target vocabulary/phrase",
-                    "constraint_type": "word or phrase or sentence",
-                    "weight": 1.0,
-                    "hint_cn": "Chinese hint for user"
-                }}
-            ]
-        }}
-    ]
-}}
-
-## Quality Checklist
-- [ ] Does the scenario match Depth {depth} definition?
-- [ ] Is vocabulary complexity appropriate?
-- [ ] Is step_order consistent with other depths?
-- [ ] Is constraint count within range?
-"""
-
-        try:
-            response = await asyncio.to_thread(model.generate_content, prompt)
-            data = json.loads(response.text)
-            scenarios_data = data.get("scenarios", [])
-
-            if not scenarios_data:
-                logger.warning("[WARN] LLM returned empty scenario list")
-                return False
-
-            # 清理旧数据（如果 rebuild）
-            if self.rebuild:
-                old_scenarios = self.db.query(MicroScenario).filter(
-                    MicroScenario.topic_id == topic.id,
-                    MicroScenario.depth_level == depth,
-                ).all()
-                if old_scenarios:
-                    old_ids = [s.id for s in old_scenarios]
-                    self.db.query(ScenarioConstraint).filter(
-                        ScenarioConstraint.micro_scenario_id.in_(old_ids)
-                    ).delete(synchronize_session=False)
-                    self.db.query(MicroScenario).filter(
-                        MicroScenario.topic_id == topic.id,
-                        MicroScenario.depth_level == depth,
-                    ).delete(synchronize_session=False)
-                    self.db.commit()
-                    logger.info(f"[CLEANUP] Cleared {len(old_scenarios)} old scenarios")
-
-            # 写入数据库
-            embedder = SyncSemanticEmbedder(cache_enabled=True)
-            for s_data in scenarios_data:
-                scenario = MicroScenario(
-                    topic_id=topic.id,
-                    scenario_code=s_data["scenario_code"],
-                    scenario_name=s_data["scenario_name"],
-                    intent_desc=s_data["intent_desc"],
-                    scene_desc=s_data["scene_desc"],
-                    depth_level=depth,
-                    step_order=s_data["step_order"],
-                    is_entry_point=s_data["is_entry_point"],
-                    max_turns=8,
-                    weight=1.0,
-                    embedding=None,
-                )
-                self.db.add(scenario)
-                self.db.commit()
-                self.db.refresh(scenario)
-
-                # 生成 embedding
-                text = f"{scenario.scenario_name} | Intent: {scenario.intent_desc} | Scene: {scenario.scene_desc}"
-                vector = embedder.embed(text)
-                scenario.embedding = vector
-                self.db.commit()
-
-                # 写入约束
-                constraints_data = s_data.get("constraints", [])
-                for c_data in constraints_data:
-                    constraint = ScenarioConstraint(
-                        micro_scenario_id=scenario.id,
-                        constraint_text=c_data["constraint_text"],
-                        constraint_type=c_data.get("constraint_type", "phrase"),
-                        depth_level=depth,
-                        weight=c_data.get("weight", 1.0),
-                        hint_cn=c_data.get("hint_cn", ""),
-                    )
-                    self.db.add(constraint)
-
-                self.db.commit()
-                logger.info(f"  [OK] {scenario.scenario_code} ({len(constraints_data)} constraints)")
-
-            return True
-
-        except json.JSONDecodeError as e:
-            logger.error(f"[ERROR] JSON parse failed: {e}")
-            return False
-        except Exception as e:
-            logger.error(f"[ERROR] Generation exception: {e}")
-            return False
+        print()
 
     def build_edges_for_topic(self, topic_id: int, depth: int, dry_run: bool = False) -> int:
         """为单个话题 × 难度构建边"""
@@ -716,25 +666,66 @@ Keyword: {meta['keyword']}
         logger.info("=" * 60)
 
         start_time = time.time()
-        success_count = 0
-        fail_count = 0
 
-        for topic, depth in tasks:
-            if self._canceled:
-                logger.warning("[USER INTERRUPT] Saving progress...")
-                break
+        if self.dry_run:
+            # dry-run 模式：串行执行（需要逐个打印 Prompt）
+            for topic, depth in tasks:
+                await self.generate_topic_scenarios(topic, depth)
+        else:
+            # 正常模式：并发执行
+            logger.info("[PHASE 1] Mode: concurrent")
+            semaphore = asyncio.Semaphore(self.rate_limiter.max_concurrent)
 
-            task_name = f"{topic.title} (Depth {depth})"
-            logger.info(f"\n[{self.progress.completed_tasks + 1}/{self.progress.total_tasks}] 处理：{task_name}")
+            async def bounded_generate(topic: Topic, depth: int) -> bool:
+                """带并发限制的生成任务"""
+                async with semaphore:
+                    await self.rate_limiter.acquire()
+                    task_name = f"{topic.title} (Depth {depth})"
+                    logger.info(f"[START] {task_name}")
 
-            success = await self.generate_topic_scenarios(topic, depth)
-            if success:
-                success_count += 1
-            else:
-                fail_count += 1
+                    with SessionLocal() as task_db:
+                        try:
+                            topic_dto = TopicDTO.from_orm(topic)
+                            ids = await generate_and_save(
+                                topic=topic_dto,
+                                depth=depth,
+                                db=task_db,
+                                rebuild=self.rebuild,
+                            )
+                            success = len(ids) > 0
+                            if success:
+                                logger.info(f"[OK] {task_name}")
+                            else:
+                                logger.error(f"[FAIL] {task_name}")
+                            self.progress.mark_complete(task_name, success=success)
+                            return success
+                        except Exception as e:
+                            logger.error(f"[ERROR] {task_name}: {e}")
+                            task_db.rollback()
+                            self.progress.mark_complete(task_name, success=False)
+                            return False
+                        finally:
+                            self.rate_limiter.release()  # 确保释放限流器
 
-        elapsed = time.time() - start_time
-        logger.info(f"[STATS] Node generation done: {success_count} success, {fail_count} failed, took {elapsed:.1f}s")
+            results = await asyncio.gather(
+                *[bounded_generate(t, d) for t, d in tasks],
+                return_exceptions=True,
+            )
+
+            # 处理异常结果
+            success_count = 0
+            fail_count = 0
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    logger.error(f"[ERROR] Task {i} failed with exception: {result}")
+                    fail_count += 1
+                elif result is True:
+                    success_count += 1
+                else:
+                    fail_count += 1
+
+            elapsed = time.time() - start_time
+            logger.info(f"[STATS] Node generation done: {success_count} success, {fail_count} failed, took {elapsed:.1f}s")
 
         # 4. 边构建阶段
         if not self.skip_edges:
@@ -777,6 +768,18 @@ async def main():
 
   # 预览模式（不实际调用 API）
   python scripts/generate_full_graph.py --all --dry-run
+
+  # 预览 + 打印中文摘要（不打印 Prompt）
+  python scripts/generate_full_graph.py --all --dry-run
+
+  # 预览 + 打印完整英文 Prompt
+  python scripts/generate_full_graph.py --all --dry-run --show-prompt
+
+  # 预览 + LLM 评审 Prompt
+  python scripts/generate_full_graph.py --all --dry-run --llm-review
+
+  # 预览 + 打印 Prompt + LLM 评审（完整预览模式）
+  python scripts/generate_full_graph.py --all --dry-run --show-prompt --llm-review
 
   # 强制重建（先删除旧数据）
   python scripts/generate_full_graph.py --all --rebuild
@@ -841,12 +844,25 @@ async def main():
         action="store_true",
         help="输出详细日志",
     )
+    parser.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="dry-run 时打印完整英文 Prompt",
+    )
+    parser.add_argument(
+        "--llm-review",
+        action="store_true",
+        help="dry-run 时调用 LLM 评审 Prompt（需要 GEMINI_API_KEY）",
+    )
 
     args = parser.parse_args()
 
     # 验证参数
     if not args.all and (args.from_topic is None or args.to_topic is None):
         parser.error("请使用 --all 或同时指定 --from-topic 和 --to-topic")
+
+    if args.llm_review and not os.getenv("GEMINI_API_KEY"):
+        parser.error("--llm-review 需要配置 GEMINI_API_KEY 环境变量")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
@@ -871,6 +887,8 @@ async def main():
             to_topic=args.to_topic,
             rate_limiter=rate_limiter,
             progress=progress,
+            show_prompt=args.show_prompt,
+            llm_review=args.llm_review,
         )
         await generator.run()
     finally:

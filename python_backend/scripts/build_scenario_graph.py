@@ -57,7 +57,16 @@ from database import (
     Topic,
 )
 from infrastructure.embedding import ScenarioVectorIndex, SyncSemanticEmbedder, cosine_similarity
+from infrastructure.graph import graph_config
 from enums import EdgeType
+
+# 从配置模块导入阈值
+VERTICAL_SIM_THRESHOLD = graph_config.VERTICAL_SIM_THRESHOLD
+HORIZONTAL_SIM_MIN = graph_config.HORIZONTAL_SIM_MIN
+HORIZONTAL_SIM_MAX = graph_config.HORIZONTAL_SIM_MAX
+MAX_VERTICAL_EDGES_PER_NODE = graph_config.MAX_VERTICAL_EDGES_PER_NODE
+CROSS_TOPIC_SIM_THRESHOLD = graph_config.CROSS_TOPIC_SIM_THRESHOLD
+MAX_CROSS_TOPIC_EDGES_PER_NODE = graph_config.MAX_CROSS_TOPIC_EDGES_PER_NODE
 
 logging.basicConfig(
     level=logging.INFO,
@@ -66,15 +75,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("EnglishCoach")
 
-# ── 构建参数 ──────────────────────────────────────────────────────────────────
-
-# ⚠️  阈值需要根据实际数据标定（初始值参考）
-VERTICAL_SIM_THRESHOLD: float = 0.65   # 垂直连线最低相似度（防串线）
-HORIZONTAL_SIM_MIN: float = 0.85      # 横向迁移最低相似度
-HORIZONTAL_SIM_MAX: float = 0.92       # 横向迁移最高相似度（避免过相似）
-MAX_VERTICAL_EDGES_PER_NODE: int = 2   # 每个节点最多垂直出边数
-CROSS_TOPIC_SIM_THRESHOLD: float = 0.85  # 跨话题相似度阈值
-MAX_CROSS_TOPIC_EDGES_PER_NODE: int = 3   # 每个入口节点最多跨话题边数
+# ── 构建参数（已迁移到 infrastructure.graph.graph_config）──────────────────────
 
 
 # ── 辅助函数 ─────────────────────────────────────────────────────────────────
@@ -232,13 +233,13 @@ def print_graph_health_report(
     print("-" * 60)
 
     if sink_nodes or source_nodes:
-        print("  ⚠️  异常节点:")
+        print("  [WARN] 异常节点:")
         for sn in sink_nodes:
             print(f"     - [孤立终点] {sn.scenario_code}: {sn.scenario_name}")
         for sn in source_nodes:
             print(f"     - [无头节点] {sn.scenario_code}: {sn.scenario_name}")
     else:
-        print("  ✅ 无异常节点")
+        print("  [OK] 无异常节点")
 
     print("=" * 60 + "\n")
 

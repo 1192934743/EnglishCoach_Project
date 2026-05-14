@@ -6,7 +6,7 @@ from fastapi.concurrency import run_in_threadpool
 
 # --- 引入配置与预热 ---
 from core.config import logger, CONFIG
-from infrastructure.llm.client import warm_llm_connection
+from infrastructure.llm.client import warm_llm_connection, client
 from infrastructure.tts import init_tts_factory, get_tts_factory
 
 # --- 引入拆分好的路由 ---

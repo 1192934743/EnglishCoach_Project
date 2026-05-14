@@ -16,3 +16,53 @@
 2026-04-17 09:17:44,856 [INFO] 🟢 正在尝试唤醒后端服务器...
 2026-04-17 09:17:47,606 [INFO] ⚔️ 混沌对抗测试进行中 (约需1-2分钟)...
 2026-04-17 09:19:11,790 [WARNING] 🛑 用户中断：已停止自动优化循环。
+2026-05-08 16:17:46,937 [INFO] 🌐 系统网络代理已自动配置为: http://127.0.0.1:7897
+2026-05-08 16:18:38,318 [INFO] 🌐 系统网络代理已自动配置为: http://127.0.0.1:7897
+2026-05-08 16:18:38,336 [INFO] ============================================================
+2026-05-08 16:18:38,336 [INFO] 🧬 场景规则洗护器启动！目标话题: 21 — Starbucks Ordering
+2026-05-08 16:18:38,337 [INFO] 🎯 目标满意度: >= 90 | 🛡️ 连续稳定轮数: 3
+2026-05-08 16:18:38,337 [INFO] ============================================================
+2026-05-08 16:18:38,339 [INFO] 📋 初始专属规则: ['Confirm drink type before asking about size.', 'Always confirm the full order before processing payment.', 'If the customer seems confused, offer a simple suggestion.']
+2026-05-08 16:18:38,340 [INFO] ----------------------------------------
+2026-05-08 16:18:38,340 [INFO] ▶️ 第 1 代验证 [话题: 21](当前连续达标: 0/3)
+2026-05-08 16:18:38,340 [INFO] 🟢 正在唤醒后端服务器...
+2026-05-08 16:18:38,360 [INFO] ⚔️ 话题对抗测试进行中（约需1-2分钟）...
+2026-05-08 16:19:55,302 [INFO] 📊 本轮裁决得分: 45
+2026-05-08 16:19:55,303 [WARNING] ❌ 分数未达标，触发 AI 护栏规则生成...
+2026-05-08 16:19:55,304 [INFO] 🧠 [场景进化] 正在分析话题 21 'Starbucks Ordering' 的局限并生成护栏...
+2026-05-08 16:20:18,384 [INFO] ✅ 话题 21 规则生成成功（文本回退），得到 3 条专属规则
+2026-05-08 16:20:18,396 [INFO] 💾 AI 已完成护栏更新（第 1 代）并写入数据库，准备下一轮验证。
+2026-05-08 16:20:21,411 [INFO] ----------------------------------------
+2026-05-08 16:20:21,411 [INFO] ▶️ 第 2 代验证 [话题: 21](当前连续达标: 0/3)
+2026-05-08 16:20:21,412 [INFO] 🟢 正在唤醒后端服务器...
+2026-05-08 16:20:21,416 [INFO] ⚔️ 话题对抗测试进行中（约需1-2分钟）...
+2026-05-08 16:20:25,021 [WARNING] ⚠️ 警告：瞬间 0 分！测试脚本可能已崩溃。
+2026-05-08 16:20:25,021 [ERROR] ❌ 详细崩溃日志 (Stderr):
+Traceback (most recent call last):
+  File "C:\dev\EnglishCoach_Project\python_backend\auto_test_suite.py", line 13, in <module>
+    client = AsyncOpenAI(api_key=os.getenv("DEEPSEEK_KEY"), base_url=os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com"))
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_client.py", line 617, in __init__
+    super().__init__(
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1501, in __init__
+    self._client = http_client or AsyncHttpxClientWrapper(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\openai\_base_client.py", line 1408, in __init__
+    super().__init__(**kwargs)
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1415, in __init__
+    else self._init_proxy_transport(
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_client.py", line 1464, in _init_proxy_transport
+    return AsyncHTTPTransport(
+           ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_transports\default.py", line 297, in __init__
+    ssl_context = create_ssl_context(verify=verify, cert=cert, trust_env=trust_env)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\site-packages\httpx\_config.py", line 40, in create_ssl_context
+    ctx = ssl.create_default_context(cafile=certifi.where())
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\11929\AppData\Local\Programs\Python\Python312\Lib\ssl.py", line 707, in create_default_context
+    context.load_verify_locations(cafile, capath, cadata)
+KeyboardInterrupt
+2026-05-08 16:20:25,021 [INFO] ⏳ 休眠 5 秒后重试...
+2026-05-08 16:20:25,023 [WARNING] 🛑 用户中断：已停止规则洗护循环。
