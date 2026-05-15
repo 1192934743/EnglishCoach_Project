@@ -353,11 +353,10 @@ Learner Level: {{ learner_level }}
 """)
 
 # 【副 LLM 导演评估模板 V2】：微场景三轨校验模式（阶段三）
-# 职责分离设计：
-# - intent_achieved: 宽松，只要用户表达核心诉求即为 TRUE（解锁追问模式）
-# - constraints_hit: 教学词汇命中检测（保持现有逻辑）
-# - coach_ready_to_transition: 严格，只有 Coach 给出结语才为 TRUE（通关把关人）
-# 隐患1修复：在模板中注入 hit_constraints，防止"视野失忆"
+# Hint 质量优化 v1.1：
+# - 统一为3个Hint，分三种类型
+# - 添加场景描述、轮次、教练问题等上下文
+# - 添加历史Hint去重指令
 EVALUATOR_V2_TEMPLATE = JINJA_ENV.from_string("""
 You are the backend AI Director for an English coaching application.
 You will be provided with the last exchange between the User and the AI Coach.
@@ -366,12 +365,51 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
 
 1. `ai_translation_cn`: Natural Chinese translation of the AI Coach's reply (not literal).
 
-2. `suggested_hints_en`: 2 short replies the User could say next.
-   - Beginner: 2-4 word phrases only
-   - Intermediate: 4-7 word responses
-   - Advanced: 6-10 word idiomatic responses
-   - At least 1 hint should naturally use a word from the target list.
-   - Format: string array, e.g. ["Sure.", "That sounds good."]
+2. `suggested_hints_en`: CRITICAL — You MUST provide EXACTLY 3 short replies.
+   - Format: string array with exactly 3 elements
+   - CRITICAL word count (per hint):
+     * Beginner: 2-4 words maximum
+     * Intermediate: 4-6 words maximum
+     * Advanced: 6-8 words maximum
+   - Each hint must be a COMPLETE phrase (not just a word)
+   - Do not use contractions in Beginner level (use "do not" not "don't")
+   - Avoid polite fillers like "if you don't mind" or "if that's okay"
+
+   COACHING INTENT: {{ current_intent }}
+   This turn's teaching goal is to help the user: {{ current_intent }}
+
+   HINT TYPE 1 — Acknowledge/Confirm:
+   Acknowledge or confirm what the coach said. Keep it simple and universal.
+   Examples: "I see.", "Okay.", "Got it.", "Fair enough."
+   DO NOT use for Type 1: "Yes, please." (context-dependent), "I'll take that" (ordering-specific)
+
+   HINT TYPE 2 — Respond to Question or Choice:
+   When the coach asks a question or offers options, pick one.
+   Examples:
+   - If asked "What size?" → "Large, please." or "Medium please."
+   - If asked "For here or to go?" → "For here, thanks."
+   - If asked "Would you like anything else?" → "That's all, thanks."
+   If the coach gave information without asking, provide a minimal acknowledgment.
+
+   HINT TYPE 3 — Use Target Expression:
+   Naturally incorporate ONE or more target expressions from the list below.
+   Target expressions: {{ constraint_texts | join(', ') }}
+   Examples: "Can I get a receipt?", "I'd like to order", "Large, for here"
+
+   Variety Rule: Each hint must serve a DIFFERENT purpose.
+   Bad example: ["Yes please", "Sure", "Okay"] (all same meaning)
+   Good example: ["Got it.", "Large please", "Can I pay by card?"]
+
+   NEGATIVE EXAMPLES (do not use - too generic, teaches nothing):
+   - "I see."
+   - "Okay thanks."
+   - "Could you repeat that?"
+   - "That's all." (when not answering a question)
+
+   POSITIVE EXAMPLES (teach something or move conversation forward):
+   - "Large, please." (teaches size vocabulary)
+   - "For here, thanks." (teaches preposition)
+   - "Can I pay by card?" (teaches payment expression)
 
 3. `coach_correction_cn`: If the user made a grammar/vocabulary error, correct it in Chinese.
    Otherwise leave empty.
@@ -381,14 +419,6 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
 4. `intent_achieved`: BOOLEAN
    Set to TRUE if the user has clearly expressed their core request or main goal for this scenario.
    This flag is used to unlock the "Detail Probing" mode — it should be easy to trigger.
-   
-   Examples of TRUE:
-   - "I'd like a coffee." (Core request stated, even if details are missing)
-   - "I need help with my bill."
-   - "Can I get the check please?"
-   
-   Set to FALSE only if the user is completely off-topic or just saying "hello".
-   This is NOT about transaction completion — it's about whether the user engaged with the scenario.
 
 5. `constraints_hit`: BOOLEAN
    IMPORTANT — Prevailing Rule: Check BOTH this turn AND the conversation history.
@@ -400,8 +430,6 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
    {{ hit_constraints }}
    If ANY of the above were used in PREVIOUS turns, this should be TRUE.
    {% endif %}
-   "Naturally" means they used the expression in context, not just in a forced repetition.
-   "This turn OR history" — as long as the constraint was used at some point, return TRUE.
 
 6. `constraints_hit_details`: ARRAY of objects
    For each constraint that was hit (this turn OR history), report:
@@ -412,40 +440,30 @@ Your job is to use the `submit_analysis_and_feedback` tool to output a JSON obje
        "note": "..."
      }
    ]
-   - quality 1.0 = exact use in perfect context
-   - quality 0.8 = stem/close variant in good context
-   - quality 0.0 = not hit yet
 
 7. `coach_ready_to_transition`: BOOLEAN
    This is the REAL gatekeeper for scenario completion. Be STRICT here.
-   
-   Set to TRUE ONLY IF the AI Coach's latest reply includes a smooth closing:
-   - The Coach has wrapped up the current topic
-   - The Coach has given closing remarks (e.g., "Here is your coffee. Have a great day!")
-   - The conversation has reached a natural end point
-   
-   Set to FALSE if ANY of these are true:
-   - The Coach is still asking follow-up questions ("What size would you like?")
-   - The Coach is mid-conversation
-   - The Coach hasn't concluded the topic yet
-   
-   Examples of TRUE:
-   - "Great job! See you next time."
-   - "Perfect, that's all for now. Have a wonderful day!"
-   - "Here is your order. That will be $5. Have a great day!"
-   
-   Examples of FALSE:
-   - "Would you like anything else with that?"
-   - "So which size would you prefer?"
-   - "Did you want any milk with that?"
+   Set to TRUE ONLY IF the AI Coach's latest reply includes a smooth closing.
 
 8. `scenario_completed`: BOOLEAN
    Set to TRUE ONLY when ALL THREE are TRUE:
      intent_achieved == TRUE AND constraints_hit == TRUE AND coach_ready_to_transition == TRUE.
-   This signals the engine to trigger micro-scenario transition.
 
+=== CONTEXT FOR BETTER HINTS ===
 Learner Level: {{ learner_level }}
 Current Scenario: {{ scenario_name }}
+{% if scene_desc %}
+Scene Description: {{ scene_desc }}
+{% endif %}
+{% if turn_count %}
+Turn: {{ turn_count }} / {{ max_turns }}
+{% endif %}
+{% if last_coach_question %}
+Coach's Last Question/Statement: {{ last_coach_question }}
+{% endif %}
+{% if recent_hints %}
+DO NOT repeat these recent hints: {{ recent_hints | join(', ') }}
+{% endif %}
 """)
 
 # ================= 辅助工具 =================
@@ -719,9 +737,13 @@ def build_evaluator_prompt(
 ) -> str:
     """
     构建发给旁路副 LLM（导演）的系统 Prompt。
-    使用微场景双轨校验模板 EVALUATOR_V2_TEMPLATE。
+    使用微场景三轨校验模板 EVALUATOR_V2_TEMPLATE。
 
-    【修复 Prompt 污染】：排除本轮刚命中的约束，防止 Director 误判。
+    【Hint质量优化 v1.1】：
+    - 添加场景描述(scene_desc)
+    - 添加轮次信息(turn_count, max_turns)
+    - 添加教练最后问题(last_coach_question)
+    - 添加最近Hint历史(recent_hints)
     """
     learner_level = task_packet.learner_level if task_packet else "Intermediate"
     all_constraints = (task_packet.constraints + task_packet.review_constraints) if task_packet else []
@@ -734,7 +756,6 @@ def build_evaluator_prompt(
         constraint_hits_set = set()
 
     # 【修复 Prompt 污染】：排除本轮刚命中的约束
-    # 本轮刚命中的 ID 不能告诉 Director，否则 Director 会认为"用户本轮没说也没关系"
     current_turn_hits = session_ctx.get("_current_turn_hits", set())
     if not isinstance(current_turn_hits, set):
         current_turn_hits = set()
@@ -751,19 +772,47 @@ def build_evaluator_prompt(
 
     scenario_name_str = (
         task_packet.current_scenario.scenario_name
-        if task_packet.current_scenario and task_packet.current_scenario.scenario_name
+        if task_packet and task_packet.current_scenario and task_packet.current_scenario.scenario_name
         else (task_packet.scene_prompt if task_packet else "General Conversation")
     )
-    current_intent_str = (
+
+    # 【Hint质量优化】场景描述
+    scene_desc_str = (
+        task_packet.current_scenario.scene_desc
+        if task_packet and task_packet.current_scenario and task_packet.current_scenario.scene_desc
+        else ""
+    )
+
+    # 【Hint质量优化】当前轮次
+    turn_count = session_ctx.get("turn_count_in_scenario", 1)
+    max_turns = (
+        task_packet.current_scenario.max_turns
+        if task_packet and task_packet.current_scenario
+        else 8
+    )
+
+    # 【Hint质量优化】上一轮教练问题
+    last_coach_question = session_ctx.get("_last_coach_question", "")
+
+    # 【Hint质量优化】最近Hint历史（去重用）
+    recent_hints = session_ctx.get("_recent_hint_history", [])
+
+    # 【Hint质量优化】当前教学意图
+    current_intent = (
         task_packet.current_intent or task_packet.session_goal or "Complete the conversation naturally."
     )
 
     return EVALUATOR_V2_TEMPLATE.render(
         learner_level=learner_level,
         scenario_name=scenario_name_str,
-        current_intent=current_intent_str,
+        scene_desc=scene_desc_str,
+        current_intent=current_intent,
         constraint_texts=constraint_texts,
         hit_constraints=hit_constraints_str,
+        turn_count=turn_count,
+        max_turns=max_turns,
+        last_coach_question=last_coach_question,
+        recent_hints=recent_hints,
     )
 
 

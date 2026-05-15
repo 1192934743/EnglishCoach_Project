@@ -46,6 +46,35 @@ router = APIRouter()
 # session_transcript 最大长度，防止内存无限增长
 MAX_TRANSCRIPT_LENGTH = 50
 
+# 【Hint质量优化 v1.1】场景回退Hint字典
+SCENARIO_FALLBACK_HINTS = {
+    # 点餐场景
+    "ordering": ["Large, please.", "For here, thanks.", "That's all, thanks."],
+    # 付款场景
+    "payment": ["Credit card, please.", "That's all.", "Can I get the receipt?"],
+    # 投诉/道歉场景
+    "complaint": ["I understand.", "That's fine.", "No problem."],
+    # 问候场景
+    "greeting": ["Nice to meet you.", "I'm doing well.", "How about you?"],
+    # 通用场景
+    "default": ["Sure.", "That works.", "Got it."],
+}
+
+def _detect_scenario_type(scenario_name: str) -> str:
+    """根据场景名称检测场景类型"""
+    if not scenario_name:
+        return "default"
+    name_lower = scenario_name.lower()
+    if any(k in name_lower for k in ["order", "menu", "food", "coffee", "burger", "meal"]):
+        return "ordering"
+    if any(k in name_lower for k in ["pay", "bill", "card", "cash", "check"]):
+        return "payment"
+    if any(k in name_lower for k in ["sorry", "apolog", "complaint", "problem", "issue"]):
+        return "complaint"
+    if any(k in name_lower for k in ["greet", "hello", "meet", "nice to"]):
+        return "greeting"
+    return "default"
+
 
 def cleanup_scenario_signals(session_ctx: dict) -> None:
     """
@@ -80,30 +109,75 @@ async def safe_send_ws(websocket: WebSocket, ws_lock: asyncio.Lock, payload: dic
 
 async def _run_background_evaluator(
     user_text: str, ai_text: str, session_ctx: dict, task_packet,
-    websocket: WebSocket, ws_lock: asyncio.Lock, lat: dict
+    websocket: WebSocket, ws_lock: asyncio.Lock, lat: dict,
+    session_transcript: list  # 【Hint质量优化】新增参数
 ):
     """
     旁路导演运行：利用副 LLM 分析对话，生成 JSON 辅导数据，并裁定状态机推进。
     这将在主语音流发送时并发执行，完全不阻塞主音频下发。
+
+    【Hint质量优化 v1.1】：
+    - 添加session_transcript参数以获取对话历史
+    - 提取教练最后的问题/陈述
+    - 添加对话历史上下文
+    - 优化回退策略（场景相关Hint）
+    - 提高max_tokens到600
     """
+    import re as regex_module
+
     _latency_log(lat, "11_evaluator_llm_start")
+
+    # 【Hint质量优化】Step 1: 先提取教练最后的问题/陈述
+    questions = regex_module.findall(r'[^.!?]*\?[^.!?]*[.!?]?', ai_text)
+    if questions:
+        session_ctx["_last_coach_question"] = questions[-1].strip()
+    else:
+        # Fallback: 提取最后一句完整陈述
+        sentences = regex_module.findall(r'[^.!?]+[.!?]', ai_text)
+        if sentences:
+            session_ctx["_last_coach_question"] = sentences[-1].strip()
+        else:
+            # 最后的fallback: 使用AI回复片段
+            session_ctx["_last_coach_question"] = ai_text[:100].strip() if ai_text else ""
+
+    # Step 2: 构建 Prompt（此时 _last_coach_question 已准备好）
     sys_prompt = build_evaluator_prompt(session_ctx, task_packet)
+
+    # 【Hint质量优化】Step 3: 构建带历史上下文的用户消息
+    history_lines = []
+    # 最近3轮对话（6条消息：user + assistant 交替）
+    for msg in session_transcript[-6:]:
+        role = "User" if msg.get("role") == "user" else "Coach"
+        text = msg.get('text', '') or msg.get('content', '')
+        if text:
+            history_lines.append(f"{role}: {text}")
+
+    if history_lines:
+        user_message = f"""Recent conversation:
+{chr(10).join(history_lines)}
+
+Current turn:
+User said: {user_text}
+Coach replied: {ai_text}"""
+    else:
+        user_message = f"""User said: {user_text}
+Coach replied: {ai_text}"""
+
     eval_messages = [
         {"role": "system", "content": sys_prompt},
-        {"role": "user", "content": f"User said: {user_text}\\nCoach replied: {ai_text}"}
+        {"role": "user", "content": user_message}
     ]
 
+    # Step 4: 调用 LLM
     feedback_data = None
     try:
-        # 强制要求副 LLM 输出工具 JSON，保证 99.9% 稳定性
-        # 使用 stream=False，直接获取完整响应
         response = await llm_router.chat(
             messages=eval_messages,
-            model=None,  # 副 LLM 始终走自动容灾，不受开发者模式影响
+            model=None,
             tools=EVALUATOR_TOOLS,
             tool_choice={"type": "function", "function": {"name": "submit_analysis_and_feedback"}},
-            max_tokens=400,
-            stream=False,  # 副 LLM 不需要流式
+            max_tokens=600,  # 【Hint质量优化】从400提高到600
+            stream=False,
         )
         msg = response.choices[0].message
         if msg.tool_calls:
@@ -112,19 +186,29 @@ async def _run_background_evaluator(
     except Exception as e:
         logger.error(f"副 LLM (Evaluator) 调用失败或解析异常: {e}")
 
-    # 兜底降级处理 (Fallback)
+    # 【Hint质量优化】Step 5: 回退策略（场景相关Hint）
     if not feedback_data:
         logger.warning("⚠️ 副 LLM 提取 JSON 失败，触发优雅兜底策略。")
+        scenario_name = (
+            task_packet.current_scenario.scenario_name
+            if task_packet and task_packet.current_scenario
+            else ""
+        )
+        scenario_type = _detect_scenario_type(scenario_name)
+        fallback_hints = SCENARIO_FALLBACK_HINTS.get(
+            scenario_type,
+            SCENARIO_FALLBACK_HINTS["default"]
+        )
         feedback_data = {
             "ai_translation_cn": "（AI教练这段话太投入，小助教没来得及翻译~）",
-            "suggested_hints_en": ["Could you repeat that?", "I see.", "Okay, thanks."],
+            "suggested_hints_en": fallback_hints,
             "coach_correction_cn": "",
             "should_advance_phase": False,
-            # Phase 2 new fields (all false to avoid false positives)
             "intent_achieved": False,
             "constraints_hit": False,
             "constraints_hit_details": [],
             "scenario_completed": False,
+            "coach_ready_to_transition": False,
         }
 
     # 兼容处理：若旧模型未返回新字段，补填默认值
@@ -132,7 +216,7 @@ async def _run_background_evaluator(
     feedback_data.setdefault("constraints_hit", False)
     feedback_data.setdefault("constraints_hit_details", [])
     feedback_data.setdefault("scenario_completed", False)
-    feedback_data.setdefault("coach_ready_to_transition", False)  # 阶段三新增
+    feedback_data.setdefault("coach_ready_to_transition", False)
 
     # 提取状态机信号，写入上下文，供用户下一轮发言(L1 判定)时触发流转
     should_adv = feedback_data.get("should_advance_phase", False)
@@ -141,7 +225,6 @@ async def _run_background_evaluator(
         logger.info("[Director] 副模型导演批准：本阶段目标达成，准备进入下一阶段！")
 
     # Phase 2/3：三轨校验信号注入 session_ctx
-    # 阶段三新增：保存完整信号到 _last_director_signal，供 build_prompts 的 Detail Probing 使用
     session_ctx["_last_director_signal"] = {
         "scenario_completed": feedback_data.get("scenario_completed", False),
         "constraints_hit": feedback_data.get("constraints_hit", False),
@@ -153,7 +236,7 @@ async def _run_background_evaluator(
         session_ctx["director_scenario_completed"] = True
         session_ctx["director_constraints_hit"] = feedback_data.get("constraints_hit", False)
         session_ctx["director_intent_achieved"] = feedback_data.get("intent_achieved", False)
-        session_ctx["director_coach_ready"] = feedback_data.get("coach_ready_to_transition", False)  # 阶段三新增
+        session_ctx["director_coach_ready"] = feedback_data.get("coach_ready_to_transition", False)
         logger.info(
             f"[Director] 三轨信号已写入: scenario_completed=True "
             f"(constraints={feedback_data.get('constraints_hit')}, "
@@ -161,12 +244,19 @@ async def _run_background_evaluator(
             f"coach_ready={feedback_data.get('coach_ready_to_transition')})"
         )
 
+    # 【Hint质量优化】Step 6: 记录Hints到历史（用于下一轮去重）
+    if feedback_data and feedback_data.get("suggested_hints_en"):
+        current_hints = feedback_data["suggested_hints_en"]
+        recent_history = session_ctx.get("_recent_hint_history", [])
+        recent_history.extend(current_hints)
+        # 保留最近15个Hint（约5轮对话）
+        session_ctx["_recent_hint_history"] = recent_history[-15:]
+
     # 最终装盘推给前端 (替换掉骨架屏)
     feedback_data["user_text"] = user_text
     feedback_data["ai_text"] = ai_text
     _latency_log(lat, "12_evaluator_json_ready")
     await safe_send_ws(websocket, ws_lock, {"event": "teaching_data", "data": feedback_data})
-    pass
 
 
 @router.websocket("/ws/coach")
@@ -978,8 +1068,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     if TEACHING_CONFIG.get("enable_translation", True):
                         asyncio.create_task(
                             _run_background_evaluator(
-                                user_text, clean_full_reply, session_ctx, 
-                                current_task_packet, websocket, ws_lock, lat
+                                user_text, clean_full_reply, session_ctx,
+                                current_task_packet, websocket, ws_lock, lat,
+                                session_transcript  # 【Hint质量优化】新增参数
                             )
                         )
 

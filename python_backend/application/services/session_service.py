@@ -23,7 +23,9 @@ EVALUATOR_TOOLS = [
                     "suggested_hints_en": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "2 or 3 short English responses the User could say next."
+                        "minItems": 3,
+                        "maxItems": 3,
+                        "description": "Exactly 3 short English responses the User could say next. Each hint should be 2-8 words depending on learner level."
                     },
                     "coach_correction_cn": {
                         "type": "string",

@@ -1,0 +1,20 @@
+# tests/requirements.txt - EnglishCoach 端到端测试依赖
+
+# 核心测试框架
+pytest>=7.0.0
+
+# 异步测试支持
+pytest-asyncio>=0.21.0
+
+# 测试超时控制
+pytest-timeout>=2.1.0
+
+# 测试覆盖率
+pytest-cov>=4.0.0
+
+# 系统监控（用于性能测试）
+psutil>=5.9.0
+
+# 可选：增强测试报告
+pytest-html>=3.2.0
+pytest-xdist>=3.3.0  # 并行测试
