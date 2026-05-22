@@ -6,6 +6,7 @@ import '../../../core/network/server_debug_config.dart';
 import '../../../core/network/user_manager.dart';
 import '../../../core/network/websocket_client.dart';
 import '../../../core/providers/settings_provider.dart';
+import '../../../core/theme/app_colors.dart';
 import '../../../core/config/dev_panel_config.dart';
 import '../../chat/providers/chat_provider.dart';
 import '../../onboarding/onboarding_screen.dart';
@@ -27,7 +28,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     final double baseSize = settings.fontSize;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F6F9),
+      backgroundColor: AppColors.background,
       body: SafeArea(
         child: ListView(
           padding: const EdgeInsets.all(20),
@@ -95,7 +96,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             margin: const EdgeInsets.only(bottom: 10),
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: AppColors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -103,7 +104,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.record_voice_over_rounded, color: Colors.blueAccent, size: 24),
+                    Icon(Icons.record_voice_over_rounded, color: AppColors.primary, size: 24),
                     const SizedBox(width: 12),
                     Text(
                       tr(ref, "TTS Voice Engine", "TTS 语音引擎"),
@@ -118,7 +119,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     "Choose the voice synthesis engine for AI replies.",
                     "选择 AI 语音合成的引擎",
                   ),
-                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: AppColors.textSecondary),
                 ),
                 const SizedBox(height: 12),
                 DropdownButton<String>(
@@ -129,7 +130,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                       value: 'azure',
                       child: Row(
                         children: [
-                          const Icon(Icons.cloud_rounded, size: 18, color: Colors.blue),
+                          Icon(Icons.cloud_rounded, size: 18, color: AppColors.primary),
                           const SizedBox(width: 8),
                           Text(tr(ref, 'Azure Voice (Default)', 'Azure 语音 (默认)')),
                         ],
@@ -139,7 +140,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                       value: 'volcengine',
                       child: Row(
                         children: [
-                          const Icon(Icons.local_fire_department_rounded, size: 18, color: Colors.orange),
+                          Icon(Icons.local_fire_department_rounded, size: 18, color: AppColors.warning),
                           const SizedBox(width: 8),
                           Text(tr(ref, 'Volcengine Voice', '火山引擎语音')),
                         ],
@@ -168,7 +169,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             margin: const EdgeInsets.only(bottom: 10),
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: AppColors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -176,7 +177,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
               children: [
                 Row(
                   children: [
-                    const Icon(Icons.person_outline_rounded, color: Colors.purple, size: 24),
+                    Icon(Icons.person_outline_rounded, color: AppColors.accent, size: 24),
                     const SizedBox(width: 12),
                     Text(
                       tr(ref, "Coach Voice", "教练音色"),
@@ -191,7 +192,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     "Choose the voice for your AI conversation coach.",
                     "选择 AI 教练的声音",
                   ),
-                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: AppColors.textSecondary),
                 ),
                 const SizedBox(height: 12),
                 Builder(
@@ -258,7 +259,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                       "${settings.vadTimeout} ms",
                       style: TextStyle(
                         fontWeight: FontWeight.bold,
-                        color: Colors.blueAccent,
+                        color: AppColors.primary,
                         fontSize: baseSize,
                       ),
                     ),
@@ -269,7 +270,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   min: 300,
                   max: 2000,
                   divisions: 17,
-                  activeColor: Colors.blueAccent,
+                  activeColor: AppColors.primary,
                   onChanged: (val) => notifier.setVadTimeout(val.toInt()),
                 ),
                 Text(
@@ -280,7 +281,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   ),
                   style: TextStyle(
                     fontSize: baseSize * 0.8,
-                    color: Colors.grey,
+                    color: AppColors.textSecondary,
                   ),
                 ),
               ],
@@ -292,7 +293,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: AppColors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -316,14 +317,14 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                   min: 10.0,
                   max: 24.0,
                   divisions: 7,
-                  activeColor: Colors.blueAccent,
+                  activeColor: AppColors.primary,
                   onChanged: (val) => notifier.setFontSize(val),
                 ),
                 Text(
                   tr(ref, "Sample text preview", "这是字体大小的预览效果"),
                   style: TextStyle(
                     fontSize: settings.fontSize,
-                    color: Colors.black54,
+                    color: AppColors.textSecondary,
                   ),
                 ),
               ],
@@ -371,23 +372,22 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
           // Redo onboarding button
           Container(
             margin: const EdgeInsets.only(bottom: 10),
-            decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+            decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(16)),
             child: ListTile(
-              leading: const Icon(Icons.restart_alt_rounded, color: Colors.deepPurple),
+              leading: Icon(Icons.restart_alt_rounded, color: AppColors.accent),
               title: Text(
                 tr(ref, "Redo Learning Setup", "重新进行学习偏好设置"),
                 style: TextStyle(fontWeight: FontWeight.bold, fontSize: baseSize),
               ),
               subtitle: Text(
                 tr(ref, "Retake the onboarding to update your preferences.", "重新完成初始化设置，更新你的学习参数"),
-                style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                style: TextStyle(fontSize: baseSize * 0.75, color: AppColors.textSecondary),
               ),
-              trailing: const Icon(Icons.chevron_right, color: Colors.grey),
+              trailing: Icon(Icons.chevron_right, color: AppColors.textTertiary),
               onTap: () async {
                 final prefs = await SharedPreferences.getInstance();
                 await prefs.remove('onboarding_done');
                 if (!context.mounted) return;
-                // Navigate to OnboardingScreen as a full-screen modal
                 await Navigator.of(context).push(
                   MaterialPageRoute<void>(
                     fullscreenDialog: true,
@@ -403,7 +403,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             margin: const EdgeInsets.only(bottom: 10),
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
             decoration: BoxDecoration(
-              color: Colors.white,
+              color: AppColors.surface,
               borderRadius: BorderRadius.circular(16),
             ),
             child: Column(
@@ -420,7 +420,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
                     "Adjust how challenging and how fast-paced the coach feels.",
                     "调节教练的难度与节奏感。",
                   ),
-                  style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+                  style: TextStyle(fontSize: baseSize * 0.75, color: AppColors.textSecondary),
                 ),
                 SizedBox(height: baseSize * 0.5),
                 DropdownButton<String>(
@@ -527,7 +527,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
       title,
       style: TextStyle(
         fontWeight: FontWeight.bold,
-        color: Colors.grey,
+        color: AppColors.textSecondary,
         fontSize: baseSize * 0.85,
       ),
     ),
@@ -548,7 +548,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.surface,
         borderRadius: BorderRadius.circular(16),
       ),
       child: Column(
@@ -586,7 +586,7 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
             activeColor: color,
             onChanged: onChanged,
           ),
-          Text(subtitle, style: TextStyle(fontSize: baseSize * 0.8, color: Colors.grey)),
+          Text(subtitle, style: TextStyle(fontSize: baseSize * 0.8, color: AppColors.textSecondary)),
         ],
       ),
     );
@@ -603,21 +603,21 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
     return Container(
       margin: const EdgeInsets.only(bottom: 10),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: AppColors.surface,
         borderRadius: BorderRadius.circular(16),
       ),
       child: SwitchListTile(
-        secondary: Icon(icon, color: Colors.blueAccent, size: baseSize + 4),
+        secondary: Icon(icon, color: AppColors.primary, size: baseSize + 4),
         title: Text(
           title,
           style: TextStyle(fontWeight: FontWeight.bold, fontSize: baseSize),
         ),
         subtitle: Text(
           subtitle,
-          style: TextStyle(fontSize: baseSize * 0.75, color: Colors.grey),
+          style: TextStyle(fontSize: baseSize * 0.75, color: AppColors.textSecondary),
         ),
         value: value,
-        activeColor: Colors.blueAccent,
+        activeTrackColor: AppColors.primary.withValues(alpha: 0.5),
         onChanged: onChanged,
       ),
     );
@@ -681,14 +681,14 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
         _buildSectionTitle('开发者模式', 14),
         Container(
           decoration: BoxDecoration(
-            color: Colors.white,
+            color: AppColors.surface,
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: Colors.orange.shade200, width: 1.5),
+            border: Border.all(color: AppColors.warning.withValues(alpha: 0.3), width: 1.5),
           ),
           child: Column(
             children: [
               SwitchListTile(
-                secondary: Icon(Icons.bug_report_rounded, color: Colors.orange.shade700),
+                secondary: Icon(Icons.bug_report_rounded, color: AppColors.warning),
                 title: const Text(
                   '开发者模式',
                   style: TextStyle(fontWeight: FontWeight.bold),
@@ -698,7 +698,7 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
                   style: TextStyle(fontSize: 12),
                 ),
                 value: _devModeEnabled,
-                activeColor: Colors.orange,
+                activeTrackColor: AppColors.warning.withValues(alpha: 0.5),
                 onChanged: _saveDevMode,
               ),
               if (_devModeEnabled) ...[
@@ -713,7 +713,7 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
                         style: TextStyle(
                           fontWeight: FontWeight.w600,
                           fontSize: 13,
-                          color: Colors.grey,
+                          color: AppColors.textSecondary,
                         ),
                       ),
                       const SizedBox(height: 12),
@@ -755,20 +755,20 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
                       Container(
                         padding: const EdgeInsets.all(12),
                         decoration: BoxDecoration(
-                          color: Colors.orange.shade50,
+                          color: AppColors.warning.withValues(alpha: 0.1),
                           borderRadius: BorderRadius.circular(8),
-                          border: Border.all(color: Colors.orange.shade200),
+                          border: Border.all(color: AppColors.warning.withValues(alpha: 0.3)),
                         ),
                         child: Row(
                           children: [
-                            Icon(Icons.info_outline, size: 16, color: Colors.orange.shade700),
+                            Icon(Icons.info_outline, size: 16, color: AppColors.warning),
                             const SizedBox(width: 8),
                             Expanded(
                               child: Text(
                                 '开发者模式不走容灾，直接调用指定模型',
                                 style: TextStyle(
                                   fontSize: 11,
-                                  color: Colors.orange.shade900,
+                                  color: AppColors.warning,
                                 ),
                               ),
                             ),
@@ -792,7 +792,7 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
       title,
       style: TextStyle(
         fontWeight: FontWeight.bold,
-        color: Colors.orange.shade700,
+        color: AppColors.warning,
         fontSize: baseSize,
       ),
     ),
@@ -882,7 +882,7 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
     if (!_initialized) {
       return Container(
         padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(16)),
+        decoration: BoxDecoration(color: AppColors.surface, borderRadius: BorderRadius.circular(16)),
         child: const Center(child: CircularProgressIndicator()),
       );
     }
@@ -890,16 +890,16 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: Colors.grey.shade50,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: Colors.grey.shade200),
+        color: AppColors.surfaceVariant,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: AppColors.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             children: [
-              const Icon(Icons.dns_rounded, color: Colors.green, size: 22),
+              Icon(Icons.dns_rounded, color: AppColors.success, size: 22),
               const SizedBox(width: 10),
               Expanded(
                 child: Text(
@@ -910,12 +910,12 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                 decoration: BoxDecoration(
-                  color: Colors.green.withValues(alpha: 0.1),
+                  color: AppColors.success.withValues(alpha: 0.1),
                   borderRadius: BorderRadius.circular(8),
                 ),
                 child: Text(
                   _currentPreset == ServerPreset.custom ? 'Custom' : _currentPreset.name,
-                  style: const TextStyle(color: Colors.green, fontWeight: FontWeight.bold, fontSize: 12),
+                  style: TextStyle(color: AppColors.success, fontWeight: FontWeight.bold, fontSize: 12),
                 ),
               ),
             ],
@@ -941,28 +941,28 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
                 margin: const EdgeInsets.only(bottom: 8),
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 decoration: BoxDecoration(
-                  color: isSelected ? Colors.blue.withValues(alpha: 0.08) : Colors.grey.withValues(alpha: 0.05),
+                  color: isSelected ? AppColors.primary.withValues(alpha: 0.08) : AppColors.surfaceVariant,
                   borderRadius: BorderRadius.circular(10),
                   border: Border.all(
-                    color: isSelected ? Colors.blue : Colors.grey.shade300,
+                    color: isSelected ? AppColors.primary : AppColors.border,
                     width: isSelected ? 1.5 : 1,
                   ),
                 ),
                 child: Row(
                   children: [
-                    Icon(icon, size: 18, color: isSelected ? Colors.blue : Colors.grey),
+                    Icon(icon, size: 18, color: isSelected ? AppColors.primary : AppColors.textTertiary),
                     const SizedBox(width: 10),
                     Expanded(
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Text(label, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: isSelected ? Colors.blue : Colors.black87)),
-                          Text(address, style: TextStyle(fontSize: 11, color: Colors.grey.shade600)),
+                          Text(label, style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: isSelected ? AppColors.primary : AppColors.textPrimary)),
+                          Text(address, style: TextStyle(fontSize: 11, color: AppColors.textSecondary)),
                         ],
                       ),
                     ),
                     if (isSelected)
-                      const Icon(Icons.check_circle, color: Colors.blue, size: 18),
+                      Icon(Icons.check_circle, color: AppColors.primary, size: 18),
                   ],
                 ),
               ),
@@ -974,10 +974,10 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
             margin: const EdgeInsets.only(bottom: 8),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
             decoration: BoxDecoration(
-              color: _currentPreset == ServerPreset.custom ? Colors.blue.withValues(alpha: 0.08) : Colors.grey.withValues(alpha: 0.05),
+              color: _currentPreset == ServerPreset.custom ? AppColors.primary.withValues(alpha: 0.08) : AppColors.surfaceVariant,
               borderRadius: BorderRadius.circular(10),
               border: Border.all(
-                color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.grey.shade300,
+                color: _currentPreset == ServerPreset.custom ? AppColors.primary : AppColors.border,
                 width: _currentPreset == ServerPreset.custom ? 1.5 : 1,
               ),
             ),
@@ -988,16 +988,16 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
                   onTap: () => _onPresetChanged(ServerPreset.custom),
                   child: Row(
                     children: [
-                      Icon(Icons.edit_rounded, size: 18, color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.grey),
+                      Icon(Icons.edit_rounded, size: 18, color: _currentPreset == ServerPreset.custom ? AppColors.primary : AppColors.textTertiary),
                       const SizedBox(width: 10),
                       Expanded(
                         child: Text(
                           tr(ref, 'Custom', '自定义'),
-                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: _currentPreset == ServerPreset.custom ? Colors.blue : Colors.black87),
+                          style: TextStyle(fontWeight: FontWeight.w600, fontSize: 13, color: _currentPreset == ServerPreset.custom ? AppColors.primary : AppColors.textPrimary),
                         ),
                       ),
                       if (_currentPreset == ServerPreset.custom)
-                        const Icon(Icons.check_circle, color: Colors.blue, size: 18),
+                        Icon(Icons.check_circle, color: AppColors.primary, size: 18),
                     ],
                   ),
                 ),
@@ -1040,7 +1040,7 @@ class _ServerSelectorState extends ConsumerState<_ServerSelector> {
                       ElevatedButton(
                         onPressed: _onCustomApply,
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.blue,
+                          backgroundColor: AppColors.primary,
                           foregroundColor: Colors.white,
                           padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                           minimumSize: Size.zero,

@@ -6,7 +6,9 @@ import 'dart:ui' as ui;
 import '../providers/chat_provider.dart';
 import '../widgets/scenario_goal_card.dart';
 import '../../../core/providers/settings_provider.dart';
-import '../../topics/models/topic_item.dart';  // ← 【阶段四新增】TopicItem 模型
+import '../../../core/theme/app_colors.dart';  // New color system
+import '../../../core/theme/app_theme.dart';
+import '../../topics/models/topic_item.dart';  // TopicItem model
 import 'session_report_sheet.dart';
 
 // ── Topic-change bottom sheet ─────────────────────────────────────────────
@@ -326,7 +328,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final showEmptyState = chatState.chatHistory.isEmpty && !hasActiveTurn;
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F6F9),
+      backgroundColor: AppColors.background,
       appBar: AppBar(
         title: Text(
           chatTopicDisplayTitle(
@@ -338,21 +340,21 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           ),
           style: const TextStyle(
             fontWeight: FontWeight.bold,
-            color: Colors.black87,
+            color: AppColors.textPrimary,
           ),
           overflow: TextOverflow.ellipsis,
         ),
-        backgroundColor: Colors.white,
-        elevation: 1,
+        backgroundColor: AppColors.surface,
+        elevation: 0,
         centerTitle: true,
         actions: [
           IconButton(
-            icon: const Icon(Icons.add_comment_outlined, color: Colors.black87),
+            icon: const Icon(Icons.add_comment_outlined, color: AppColors.textPrimary),
             tooltip: tr(ref, 'Change practice topic', '切换练习话题'),
             onPressed: () => _showTopicRequestSheet(context, ref),
           ),
           PopupMenuButton<int>(
-            icon: const Icon(Icons.psychology_alt, color: Colors.black87),
+            icon: const Icon(Icons.psychology_alt, color: AppColors.textPrimary),
             tooltip: tr(ref, 'Coach politeness', '教练礼貌程度'),
             onSelected: (level) => notifier.updatePoliteness(level),
             itemBuilder: (context) => [
@@ -373,7 +375,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           IconButton(
             icon: Icon(
               Icons.swap_horiz_rounded,
-              color: chatState.isFlipped ? Colors.pinkAccent : Colors.black87,
+              color: chatState.isFlipped ? AppColors.accent : AppColors.textPrimary,
             ),
             tooltip: tr(ref, 'Swap roles', '切换角色'),
             onPressed: () => notifier.swapRole(),
@@ -383,7 +385,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               _showHistory
                   ? Icons.speaker_notes_off_rounded
                   : Icons.history_rounded,
-              color: Colors.black87,
+              color: AppColors.textPrimary,
             ),
             onPressed: () => setState(() => _showHistory = !_showHistory),
           ),
@@ -463,7 +465,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             ),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withOpacity(0.04),
+                                color: Colors.black.withValues(alpha: 0.04),
                                 blurRadius: 15,
                                 offset: const Offset(0, -5),
                               ),
@@ -536,15 +538,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         padding: const EdgeInsets.symmetric(horizontal: 24),
                         decoration: BoxDecoration(
                           color: isListening
-                              ? Colors.pink[300]
+                              ? AppColors.accent
                               : (isSpeaking
-                                    ? Colors.purpleAccent
-                                    : Colors.blueAccent),
+                                    ? AppColors.primaryLight
+                                    : AppColors.primary),
                           borderRadius: BorderRadius.circular(21),
                           boxShadow: [
                             BoxShadow(
-                              color: (isListening ? Colors.pink : Colors.blue)
-                                  .withOpacity(0.2),
+                              color: (isListening ? AppColors.accent : AppColors.primary)
+                                  .withValues(alpha: 0.25),
                               blurRadius: 10,
                               offset: const Offset(0, 4),
                             ),
@@ -609,26 +611,29 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           ValueListenableBuilder<String>(
             valueListenable: notifier.activeUserTextNotifier,
             builder: (context, userText, child) {
-              if (userText.isEmpty && !isListening)
+              if (userText.isEmpty && !isListening) {
                 return const SizedBox.shrink();
+              }
               return Align(
                 alignment: Alignment.centerRight,
                 child: Container(
-                  margin: const EdgeInsets.only(left: 40, bottom: 12),
-                  padding: const EdgeInsets.all(16),
-                  decoration: const BoxDecoration(
-                    color: Color(0xFFF0F4F8),
-                    borderRadius: BorderRadius.only(
+                  margin: const EdgeInsets.only(left: 48, bottom: 12),
+                  padding: const EdgeInsets.all(14),
+                  decoration: BoxDecoration(
+                    color: AppColors.userBubbleBg,
+                    borderRadius: const BorderRadius.only(
                       topLeft: Radius.circular(20),
                       topRight: Radius.circular(20),
                       bottomLeft: Radius.circular(20),
+                      bottomRight: Radius.circular(4),
                     ),
+                    boxShadow: AppTheme.bubbleShadow,
                   ),
                   child: Text(
                     userText.isEmpty ? "..." : userText,
                     style: TextStyle(
                       fontSize: settings.fontSize,
-                      color: userText.isEmpty ? Colors.black38 : Colors.black87,
+                      color: userText.isEmpty ? AppColors.textTertiary : AppColors.textPrimary,
                     ),
                   ),
                 ),
@@ -643,19 +648,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               child: Container(
                 margin: const EdgeInsets.only(right: 30),
                 decoration: BoxDecoration(
-                  color: Colors.white,
+                  color: AppColors.aiBubbleBg,
                   borderRadius: const BorderRadius.only(
-                    topLeft: Radius.circular(20),
+                    topLeft: Radius.circular(4),
                     topRight: Radius.circular(20),
                     bottomRight: Radius.circular(20),
+                    bottomLeft: Radius.circular(20),
                   ),
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.04),
-                      blurRadius: 10,
-                      offset: const Offset(0, 4),
-                    ),
-                  ],
+                  boxShadow: AppTheme.cardShadow,
                 ),
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
@@ -669,10 +669,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                             return _AIChatBubble(
                               text: aiText,
                               fontSize: settings.fontSize,
-                              onSentenceTap: (_) {}, // 流式输出时禁用点击复读，防止打断
+                              onSentenceTap: (_) {},
                             );
                           }
-                          // AI 还没发声时的思考态
                           return AnimatedBuilder(
                             animation: _glowAnimation,
                             builder: (context, _) => Opacity(
@@ -685,15 +684,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     height: 16,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      color: Colors.blueAccent,
+                                      color: AppColors.primary,
                                     ),
                                   ),
                                   const SizedBox(width: 8),
                                   Text(
                                     tr(ref, 'Thinking...', '思考中...'),
-                                    style: TextStyle(
-                                      color: Colors.blueAccent,
-                                      fontSize: settings.fontSize,
+                                    style: const TextStyle(
+                                      color: AppColors.primary,
+                                      fontSize: 14,
                                     ),
                                   ),
                                 ],
@@ -718,9 +717,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
   Widget _buildSkeletonTeachingData(WidgetRef ref, SettingsState settings) {
     return Container(
       decoration: BoxDecoration(
-        color: const Color(0xFFFAFAFA),
+        color: AppColors.surfaceVariant,
         borderRadius: const BorderRadius.only(bottomRight: Radius.circular(20)),
-        border: Border(top: BorderSide(color: Colors.grey.shade100)),
+        border: Border(top: BorderSide(color: AppColors.border)),
       ),
       child: AnimatedBuilder(
         animation: _glowAnimation,
@@ -737,12 +736,12 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                       horizontal: 16,
                       vertical: 12,
                     ),
-                    decoration: const BoxDecoration(color: Color(0xFFF0F8FF)),
+                    decoration: const BoxDecoration(color: AppColors.translationBg),
                     child: Container(
                       height: settings.fontSize,
                       width: 180,
                       decoration: BoxDecoration(
-                        color: Colors.blue.withOpacity(0.15),
+                        color: AppColors.primary.withValues(alpha: 0.15),
                         borderRadius: BorderRadius.circular(4),
                       ),
                     ),
@@ -757,7 +756,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           children: [
                             Icon(
                               Icons.lightbulb_rounded,
-                              color: Colors.green.shade300,
+                              color: AppColors.success.withValues(alpha: 0.7),
                               size: 16,
                             ),
                             const SizedBox(width: 6),
@@ -766,7 +765,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                               style: const TextStyle(
                                 fontSize: 12,
                                 fontWeight: FontWeight.bold,
-                                color: Colors.black45,
+                                color: AppColors.textSecondary,
                               ),
                             ),
                           ],
@@ -776,7 +775,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           height: settings.fontSize * 1.2,
                           width: double.infinity,
                           decoration: BoxDecoration(
-                            color: Colors.green.withOpacity(0.06),
+                            color: AppColors.hintBg,
                             borderRadius: BorderRadius.circular(8),
                           ),
                         ),
@@ -785,7 +784,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                           height: settings.fontSize * 1.2,
                           width: MediaQuery.of(context).size.width * 0.5,
                           decoration: BoxDecoration(
-                            color: Colors.green.withOpacity(0.06),
+                            color: AppColors.hintBg,
                             borderRadius: BorderRadius.circular(8),
                           ),
                         ),
@@ -804,9 +803,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
     final p = progress.clamp(0.0, 100.0);
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border(bottom: BorderSide(color: Colors.grey.shade200)),
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(bottom: BorderSide(color: AppColors.border)),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -819,7 +818,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 style: const TextStyle(
                   fontSize: 13,
                   fontWeight: FontWeight.w600,
-                  color: Colors.black54,
+                  color: AppColors.textSecondary,
                 ),
               ),
               Text(
@@ -827,7 +826,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 style: const TextStyle(
                   fontSize: 14,
                   fontWeight: FontWeight.bold,
-                  color: Color(0xFF4CAF50),
+                  color: AppColors.success,
                 ),
               ),
             ],
@@ -840,7 +839,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               height: 8,
               width: double.infinity,
               alignment: Alignment.centerLeft,
-              decoration: BoxDecoration(color: Colors.grey.shade200),
+              decoration: const BoxDecoration(color: AppColors.surfaceVariant),
               child: AnimatedBuilder(
                 animation: _glowAnimation,
                 builder: (context, child) {
@@ -849,19 +848,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     child: Container(
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(10),
-                        gradient: LinearGradient(
+                        gradient: const LinearGradient(
                           colors: [
-                            const Color(0xFF66BB6A),
-                            Colors.greenAccent.withValues(
-                              alpha: 0.8 + (_glowAnimation.value * 0.2),
-                            ),
-                            const Color(0xFF4CAF50),
+                            AppColors.success,
+                            AppColors.successLight,
+                            AppColors.success,
                           ],
-                          stops: const [0.0, 0.5, 1.0],
+                          stops: [0.0, 0.5, 1.0],
                         ),
                         boxShadow: [
                           BoxShadow(
-                            color: Colors.greenAccent.withValues(
+                            color: AppColors.success.withValues(
                               alpha: 0.4 * _glowAnimation.value,
                             ),
                             blurRadius: 6 * _glowAnimation.value,
@@ -960,8 +957,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         ),
                         child: ColorFiltered(
                           colorFilter: ColorFilter.mode(
-                            (isLis ? Colors.pinkAccent : Colors.cyanAccent)
-                                .withOpacity(0.7),
+                            (isLis ? AppColors.accent : AppColors.primary)
+                                .withValues(alpha: 0.7),
                             BlendMode.srcATop,
                           ),
                           child: _buildLottieImage(isSpe),
@@ -987,8 +984,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   fontSize: fs + 2,
                   fontWeight: FontWeight.bold,
                   color: isLis
-                      ? Colors.pinkAccent
-                      : (isSpe ? Colors.blueAccent : Colors.grey),
+                      ? AppColors.accent
+                      : (isSpe ? AppColors.primary : AppColors.textTertiary),
                 ),
               ),
               const SizedBox(height: 6),
@@ -996,7 +993,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                 roleName,
                 style: TextStyle(
                   fontSize: fs - 1,
-                  color: isFlipped ? Colors.pinkAccent : Colors.grey.shade500,
+                  color: isFlipped ? AppColors.accent : AppColors.textTertiary,
                   letterSpacing: 1.2,
                 ),
               ),
@@ -1015,17 +1012,17 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
           end: Alignment.bottomCenter,
           colors: [
             Colors.transparent,
-            Colors.pinkAccent.withOpacity(_glowAnimation.value),
-            Colors.deepPurpleAccent.withOpacity(_glowAnimation.value),
-            Colors.cyanAccent.withOpacity(_glowAnimation.value),
+            AppColors.accent.withValues(alpha: _glowAnimation.value),
+            AppColors.primary.withValues(alpha: _glowAnimation.value),
+            AppColors.primaryLight.withValues(alpha: _glowAnimation.value),
             Colors.transparent,
           ],
           stops: const [0.0, 0.2, 0.5, 0.8, 1.0],
         ),
         boxShadow: [
           BoxShadow(
-            color: Colors.deepPurpleAccent.withOpacity(
-              _glowAnimation.value * 0.6,
+            color: AppColors.primary.withValues(
+              alpha: _glowAnimation.value * 0.6,
             ),
             blurRadius: 18,
             spreadRadius: 2,
@@ -1060,29 +1057,34 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // User Bubble
           Align(
             alignment: Alignment.centerRight,
             child: Container(
-              margin: const EdgeInsets.only(left: 40, bottom: 12),
-              padding: const EdgeInsets.all(16),
-              decoration: const BoxDecoration(
-                color: Color(0xFFF0F4F8),
-                borderRadius: BorderRadius.only(
+              margin: const EdgeInsets.only(left: 48, bottom: 12),
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: AppColors.userBubbleBg,
+                borderRadius: const BorderRadius.only(
                   topLeft: Radius.circular(20),
                   topRight: Radius.circular(20),
                   bottomLeft: Radius.circular(20),
+                  bottomRight: Radius.circular(4),
                 ),
+                boxShadow: AppTheme.bubbleShadow,
               ),
               child: Text(
                 turn.userText,
                 style: TextStyle(
                   fontSize: settings.fontSize,
-                  color: Colors.black87,
+                  color: AppColors.textPrimary,
+                  height: 1.4,
                 ),
               ),
             ),
           ),
 
+          // Correction Badge
           if (hasCorrection)
             Align(
               alignment: Alignment.centerRight,
@@ -1093,9 +1095,9 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                   vertical: 6,
                 ),
                 decoration: BoxDecoration(
-                  color: Colors.orange.shade50,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: Colors.orange.shade200),
+                  color: AppColors.correctionBg,
+                  borderRadius: BorderRadius.circular(AppTheme.radiusMd),
+                  border: Border.all(color: AppColors.warning.withValues(alpha: 0.3)),
                 ),
                 child: Row(
                   mainAxisSize: MainAxisSize.min,
@@ -1103,7 +1105,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     Icon(
                       Icons.auto_fix_high,
                       size: 14,
-                      color: Colors.orange.shade700,
+                      color: AppColors.warning,
                     ),
                     const SizedBox(width: 6),
                     Flexible(
@@ -1111,7 +1113,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                         d['coach_correction_cn'],
                         style: TextStyle(
                           fontSize: settings.fontSize * 0.85,
-                          color: Colors.orange.shade900,
+                          color: AppColors.textPrimary,
                         ),
                       ),
                     ),
@@ -1120,24 +1122,20 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
               ),
             ),
 
+          // AI Bubble
           Align(
             alignment: Alignment.centerLeft,
             child: Container(
               margin: const EdgeInsets.only(right: 30),
               decoration: BoxDecoration(
-                color: Colors.white,
+                color: AppColors.aiBubbleBg,
                 borderRadius: const BorderRadius.only(
-                  topLeft: Radius.circular(20),
+                  topLeft: Radius.circular(4),
                   topRight: Radius.circular(20),
                   bottomRight: Radius.circular(20),
+                  bottomLeft: Radius.circular(20),
                 ),
-                boxShadow: [
-                  BoxShadow(
-                    color: Colors.black.withOpacity(0.04),
-                    blurRadius: 10,
-                    offset: const Offset(0, 4),
-                  ),
-                ],
+                boxShadow: AppTheme.cardShadow,
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -1151,15 +1149,16 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                     ),
                   ),
 
+                  // Teaching Data (Translation + Hints)
                   if (hasTranslation || hasHints)
                     Container(
                       decoration: BoxDecoration(
-                        color: const Color(0xFFFAFAFA),
+                        color: AppColors.surfaceVariant,
                         borderRadius: const BorderRadius.only(
                           bottomRight: Radius.circular(20),
                         ),
                         border: Border(
-                          top: BorderSide(color: Colors.grey.shade100),
+                          top: BorderSide(color: AppColors.border),
                         ),
                       ),
                       child: Column(
@@ -1173,13 +1172,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                 vertical: 10,
                               ),
                               decoration: const BoxDecoration(
-                                color: Color(0xFFF0F8FF),
+                                color: AppColors.translationBg,
                               ),
                               child: Text(
                                 d['ai_translation_cn'],
                                 style: TextStyle(
                                   fontSize: settings.fontSize * 0.9,
-                                  color: Colors.blue.shade800,
+                                  color: AppColors.primary,
                                 ),
                               ),
                             ),
@@ -1194,7 +1193,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                     children: [
                                       Icon(
                                         Icons.lightbulb_rounded,
-                                        color: Colors.green.shade400,
+                                        color: AppColors.success,
                                         size: 16,
                                       ),
                                       const SizedBox(width: 6),
@@ -1203,7 +1202,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
                                         style: const TextStyle(
                                           fontSize: 12,
                                           fontWeight: FontWeight.bold,
-                                          color: Colors.black45,
+                                          color: AppColors.textSecondary,
                                         ),
                                       ),
                                     ],
@@ -1241,15 +1240,15 @@ class _ChatScreenState extends ConsumerState<ChatScreen>
         width: double.infinity,
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         decoration: BoxDecoration(
-          color: const Color(0xFFF1F8E9),
-          borderRadius: BorderRadius.circular(10),
-          border: Border.all(color: Colors.green.shade100),
+          color: AppColors.hintBg,
+          borderRadius: BorderRadius.circular(AppTheme.radiusSm),
+          border: Border.all(color: AppColors.success.withValues(alpha: 0.2)),
         ),
         child: Text(
           hint,
           style: TextStyle(
             fontSize: fontSize * 0.95,
-            color: Colors.green.shade800,
+            color: AppColors.success,
             fontWeight: FontWeight.w500,
           ),
         ),
@@ -1269,12 +1268,12 @@ class _TopicGeneratingBanner extends ConsumerWidget {
       decoration: BoxDecoration(
         gradient: LinearGradient(
           colors: [
-            Colors.blueAccent.withValues(alpha: 0.12),
-            Colors.purpleAccent.withValues(alpha: 0.08),
+            AppColors.primary.withValues(alpha: 0.12),
+            AppColors.accent.withValues(alpha: 0.08),
           ],
         ),
         border: Border(
-          bottom: BorderSide(color: Colors.blueAccent.withValues(alpha: 0.2)),
+          bottom: BorderSide(color: AppColors.primary.withValues(alpha: 0.2)),
         ),
       ),
       child: Row(
@@ -1284,15 +1283,15 @@ class _TopicGeneratingBanner extends ConsumerWidget {
             height: 16,
             child: CircularProgressIndicator(
               strokeWidth: 2,
-              color: Colors.blueAccent,
+              color: AppColors.primary,
             ),
           ),
           const SizedBox(width: 10),
           Text(
             tr(ref, 'Generating your practice topic...', '正在生成练习场景…'),
-            style: TextStyle(
+            style: const TextStyle(
               fontSize: 12,
-              color: Colors.blueAccent.shade700,
+              color: AppColors.primary,
               fontWeight: FontWeight.w500,
             ),
           ),
@@ -1372,9 +1371,9 @@ class __AIChatBubbleState extends State<_AIChatBubble> {
           (i) => TextSpan(
             text: _sentences[i],
             recognizer: _recognizers[i],
-            style: TextStyle(
-              fontSize: widget.fontSize,
-              color: Colors.black87,
+            style: const TextStyle(
+              fontSize: 14,
+              color: AppColors.textPrimary,
               fontWeight: FontWeight.w500,
               height: 1.4,
             ),

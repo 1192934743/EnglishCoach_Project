@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'core/logging/app_logger.dart';
 import 'core/network/backend_config.dart';
 import 'core/providers/settings_provider.dart';  // settingsProvider, tr, mainTabIndexProvider, etc.
+import 'core/theme/app_theme.dart';  // New theme system
 import 'features/chat/presentation/chat_screen.dart';
 import 'features/chat/providers/chat_provider.dart';
 import 'features/settings/screens/settings_screen.dart';
@@ -34,7 +35,10 @@ class EnglishCoachApp extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.blue),
+      title: 'EnglishCoach',
+      theme: AppTheme.light,    // 使用新的浅色主题
+      darkTheme: AppTheme.dark,  // 使用新的深色主题
+      themeMode: ThemeMode.system,  // 跟随系统设置
       home: const _AppEntry(),
     );
   }
@@ -125,7 +129,7 @@ class _MainScreenState extends ConsumerState<MainScreen> {
                 ),
               ],
             ),
-            backgroundColor: Colors.blueAccent,
+            backgroundColor: const Color(0xFF1A1A2E),
             behavior: SnackBarBehavior.floating,
             duration: const Duration(seconds: 3),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
@@ -166,29 +170,27 @@ class _MainScreenState extends ConsumerState<MainScreen> {
       bottomNavigationBar: BottomNavigationBar(
         currentIndex: tabIndex,
         onTap: (i) => ref.read(mainTabIndexProvider.notifier).setTab(i),
-        selectedItemColor: Colors.blueAccent,
-        unselectedItemColor: Colors.grey,
         type: BottomNavigationBarType.fixed,
-        items: [
+        items: const [
           BottomNavigationBarItem(
-            icon: const Icon(Icons.chat_bubble_outline),
-            activeIcon: const Icon(Icons.chat_bubble),
-            label: tr(ref, 'Chat', '对练'),
+            icon: Icon(Icons.chat_bubble_outline_rounded),
+            activeIcon: Icon(Icons.chat_bubble_rounded),
+            label: '对练',
           ),
           BottomNavigationBarItem(
-            icon: const Icon(Icons.explore_outlined),
-            activeIcon: const Icon(Icons.explore),
-            label: tr(ref, 'Topics', '话题'),
+            icon: Icon(Icons.explore_outlined),
+            activeIcon: Icon(Icons.explore),
+            label: '话题',
           ),
           BottomNavigationBarItem(
-            icon: const Icon(Icons.bar_chart_outlined),
-            activeIcon: const Icon(Icons.bar_chart),
-            label: tr(ref, 'Progress', '进度'),
+            icon: Icon(Icons.bar_chart_outlined),
+            activeIcon: Icon(Icons.bar_chart),
+            label: '进度',
           ),
           BottomNavigationBarItem(
-            icon: const Icon(Icons.settings_outlined),
-            activeIcon: const Icon(Icons.settings),
-            label: tr(ref, 'Settings', '设置'),
+            icon: Icon(Icons.settings_outlined),
+            activeIcon: Icon(Icons.settings),
+            label: '设置',
           ),
         ],
       ),

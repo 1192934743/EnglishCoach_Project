@@ -8,6 +8,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/providers/settings_provider.dart';
 import '../../core/network/api_client.dart';
 import '../../core/network/user_manager.dart';
+import '../../core/theme/app_colors.dart';
 // ── Provider ──────────────────────────────────────────────────────────────
 final statsProvider = FutureProvider<Map<String, dynamic>>((ref) async {
   final userId = await UserManager.getOrCreateUuid();
@@ -23,7 +24,7 @@ class StatsScreen extends ConsumerWidget {
     final statsAsync = ref.watch(statsProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F6F9),
+      backgroundColor: AppColors.background,
       body: SafeArea(
         child: statsAsync.when(
           loading: () => const Center(child: CircularProgressIndicator()),
@@ -44,12 +45,12 @@ class StatsScreen extends ConsumerWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.wifi_off_rounded, size: 48, color: Colors.grey),
+            Icon(Icons.wifi_off_rounded, size: 48, color: AppColors.textTertiary),
             const SizedBox(height: 12),
             Text(
               '${tr(ref, 'Could not load stats.', '统计数据加载失败。')}\n$e',
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.grey),
+              style: TextStyle(color: AppColors.textSecondary),
             ),
             const SizedBox(height: 16),
             ElevatedButton(

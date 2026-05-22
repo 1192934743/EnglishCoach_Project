@@ -13,10 +13,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../core/providers/settings_provider.dart';
+import '../../core/theme/app_colors.dart';
 
-const _kBlue = Color(0xFF2196F3);
-const _kPurple = Color(0xFF7C3AED);
-const _kTeal = Color(0xFF0D9488);
+// Onboarding color palette - using AppColors for consistency
+class _OnboardingColors {
+  static const Color blue = AppColors.onboardingDaily;
+  static const Color teal = AppColors.onboardingTravel;
+  static const Color purple = AppColors.onboardingBusiness;
+  static const Color orange = AppColors.onboardingExam;
+  static const Color green = AppColors.success;
+}
 
 class OnboardingScreen extends ConsumerStatefulWidget {
   final VoidCallback onComplete;
@@ -35,95 +41,95 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   int? _levelIndex;
   int? _preferenceIndex;
 
-  // Goal → depth_preference mapping（文案随界面语言切换）
+  // Goal → depth_preference mapping（使用 Material Icons）
   List<_OnboardingOption> _goals(WidgetRef ref) => [
         _OnboardingOption(
-          emoji: '💬',
+          icon: Icons.chat_bubble_outline_rounded,
           title: tr(ref, 'Daily Conversation', '日常对话'),
           subtitle: tr(ref, 'Casual chats, travel, everyday life', '闲聊、出行、日常生活'),
-          color: _kBlue,
+          color: _OnboardingColors.blue,
         ),
         _OnboardingOption(
-          emoji: '✈️',
+          icon: Icons.flight_takeoff_rounded,
           title: tr(ref, 'Travel & Practical', '旅行与实用'),
           subtitle: tr(ref, 'Airports, hotels, shopping, restaurants', '机场、酒店、购物、餐厅等场景'),
-          color: const Color(0xFF0891B2),
+          color: _OnboardingColors.teal,
         ),
         _OnboardingOption(
-          emoji: '💼',
+          icon: Icons.work_outline_rounded,
           title: tr(ref, 'Work & Business', '职场与商务'),
           subtitle: tr(ref, 'Meetings, emails, professional settings', '会议、邮件、职场沟通'),
-          color: _kPurple,
+          color: _OnboardingColors.purple,
         ),
         _OnboardingOption(
-          emoji: '🎓',
+          icon: Icons.school_outlined,
           title: tr(ref, 'Exam Preparation', '考试备考'),
           subtitle: tr(ref, 'IELTS, TOEFL, academic English', '雅思、托福、学术英语等'),
-          color: const Color(0xFFD97706),
+          color: _OnboardingColors.orange,
         ),
       ];
 
   List<_OnboardingOption> _levels(WidgetRef ref) => [
         _OnboardingOption(
-          emoji: '🌱',
+          icon: Icons.eco_outlined,
           title: tr(ref, 'Just Starting', '零基础起步'),
           subtitle: tr(ref, 'I know very little English', '几乎不会说英语'),
-          color: const Color(0xFF16A34A),
+          color: _OnboardingColors.green,
         ),
         _OnboardingOption(
-          emoji: '📚',
+          icon: Icons.menu_book_outlined,
           title: tr(ref, 'Some Knowledge', '有一点基础'),
           subtitle: tr(
             ref,
             'I know basics but struggle with conversations',
             '懂一点单词语法，对话还不流利',
           ),
-          color: _kBlue,
+          color: _OnboardingColors.blue,
         ),
         _OnboardingOption(
-          emoji: '🗣️',
+          icon: Icons.record_voice_over_outlined,
           title: tr(ref, 'Can Communicate', '能简单交流'),
           subtitle: tr(ref, 'I can have simple conversations', '能进行简单日常对话'),
-          color: _kTeal,
+          color: _OnboardingColors.teal,
         ),
         _OnboardingOption(
-          emoji: '🚀',
+          icon: Icons.rocket_launch_outlined,
           title: tr(ref, 'Fairly Fluent', '比较流利'),
           subtitle: tr(
             ref,
             'I want to refine my fluency and accuracy',
             '希望进一步提升流利度与准确度',
           ),
-          color: _kPurple,
+          color: _OnboardingColors.purple,
         ),
       ];
 
   List<_OnboardingOption> _preferences(WidgetRef ref) => [
         _OnboardingOption(
-          emoji: '🔄',
+          icon: Icons.replay_rounded,
           title: tr(ref, 'Review & Master', '稳扎稳打'),
           subtitle: tr(
             ref,
             'Spend more time on each topic until fluent',
             '每个话题多练几遍，练熟再换',
           ),
-          color: _kTeal,
+          color: _OnboardingColors.teal,
         ),
         _OnboardingOption(
-          emoji: '⚖️',
+          icon: Icons.balance_rounded,
           title: tr(ref, 'Balanced Mix', '均衡搭配'),
           subtitle: tr(ref, 'Mix of review and new topics', '复习与新话题兼顾'),
-          color: _kBlue,
+          color: _OnboardingColors.blue,
         ),
         _OnboardingOption(
-          emoji: '🗺️',
+          icon: Icons.explore_rounded,
           title: tr(ref, 'Explore & Learn', '广泛探索'),
           subtitle: tr(
             ref,
             'Try many different topics and scenarios',
             '多尝试不同话题与场景',
           ),
-          color: _kPurple,
+          color: _OnboardingColors.purple,
         ),
       ];
 
@@ -196,7 +202,7 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF8F9FA),
+      backgroundColor: AppColors.background,
       body: SafeArea(
         child: Column(
           children: [
@@ -213,8 +219,8 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                       decoration: BoxDecoration(
                         borderRadius: BorderRadius.circular(2),
                         color: i <= _currentPage
-                            ? _kBlue
-                            : Colors.grey.shade200,
+                            ? AppColors.primary
+                            : AppColors.border,
                       ),
                     ),
                   ),
@@ -279,14 +285,14 @@ class _OnboardingScreenState extends ConsumerState<OnboardingScreen> {
                   AnimatedOpacity(
                     opacity: _canAdvance ? 1.0 : 0.4,
                     duration: const Duration(milliseconds: 200),
-                    child: SizedBox(
+                    child:                   SizedBox(
                       width: double.infinity,
                       height: 54,
                       child: ElevatedButton(
                         onPressed: _canAdvance ? _next : null,
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: _kBlue,
-                          disabledBackgroundColor: _kBlue,
+                          backgroundColor: AppColors.primary,
+                          disabledBackgroundColor: AppColors.primary,
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(16),
                           ),
@@ -358,14 +364,14 @@ class _OnboardingPage extends StatelessWidget {
               fontSize: 26,
               fontWeight: FontWeight.bold,
               height: 1.25,
-              color: Colors.black87,
+              color: AppColors.textPrimary,
             ),
           ),
           const SizedBox(height: 24),
           Expanded(
             child: ListView.separated(
               itemCount: options.length,
-              separatorBuilder: (_, __) => const SizedBox(height: 12),
+              separatorBuilder: (_, _) => const SizedBox(height: 12),
               itemBuilder: (context, i) {
                 final opt = options[i];
                 final selected = selectedIndex == i;
@@ -393,9 +399,16 @@ class _OnboardingPage extends StatelessWidget {
                             ]
                           : null,
                     ),
-                    child: Row(
+                      child: Row(
                       children: [
-                        Text(opt.emoji, style: const TextStyle(fontSize: 28)),
+                        Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: opt.color.withValues(alpha: 0.1),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Icon(opt.icon, color: opt.color, size: 24),
+                        ),
                         const SizedBox(width: 14),
                         Expanded(
                           child: Column(
@@ -406,7 +419,7 @@ class _OnboardingPage extends StatelessWidget {
                                 style: TextStyle(
                                   fontSize: 15,
                                   fontWeight: FontWeight.bold,
-                                  color: selected ? opt.color : Colors.black87,
+                                  color: selected ? opt.color : AppColors.textPrimary,
                                 ),
                               ),
                               const SizedBox(height: 3),
@@ -414,7 +427,7 @@ class _OnboardingPage extends StatelessWidget {
                                 opt.subtitle,
                                 style: TextStyle(
                                   fontSize: 12,
-                                  color: Colors.grey[600],
+                                  color: AppColors.textSecondary,
                                 ),
                               ),
                             ],
@@ -440,13 +453,13 @@ class _OnboardingPage extends StatelessWidget {
 }
 
 class _OnboardingOption {
-  final String emoji;
+  final IconData icon;
   final String title;
   final String subtitle;
   final Color color;
 
   const _OnboardingOption({
-    required this.emoji,
+    required this.icon,
     required this.title,
     required this.subtitle,
     required this.color,

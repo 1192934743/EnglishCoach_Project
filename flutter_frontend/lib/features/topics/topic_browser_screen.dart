@@ -9,9 +9,10 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../../core/network/api_client.dart';
 import '../../core/network/user_manager.dart';
 import '../../core/providers/settings_provider.dart';  // settingsProvider, tr, mainTabIndexProvider, etc.
+import '../../core/theme/app_colors.dart';
 import '../../core/widgets/mastery_band_widgets.dart';
 import '../chat/providers/chat_provider.dart';
-import 'models/topic_item.dart';  // ← 【阶段四新增】共享 TopicItem 模型
+import 'models/topic_item.dart';
 
 // ── Provider ──────────────────────────────────────────────────────────────
 final topicsProvider = FutureProvider<List<TopicItem>>((ref) async {
@@ -51,7 +52,7 @@ class _TopicBrowserScreenState extends ConsumerState<TopicBrowserScreen> {
     final topicsAsync = ref.watch(topicsProvider);
 
     return Scaffold(
-      backgroundColor: const Color(0xFFF4F6F9),
+      backgroundColor: AppColors.background,
       body: SafeArea(
         child: topicsAsync.when(
           loading: () => const Center(child: CircularProgressIndicator()),
@@ -66,12 +67,12 @@ class _TopicBrowserScreenState extends ConsumerState<TopicBrowserScreen> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.wifi_off_rounded, size: 48, color: Colors.grey),
+            Icon(Icons.wifi_off_rounded, size: 48, color: AppColors.textTertiary),
             const SizedBox(height: 12),
             Text(
               '${tr(ref, 'Could not load topics.', '话题列表加载失败。')}\n$e',
               textAlign: TextAlign.center,
-              style: const TextStyle(color: Colors.grey),
+              style: TextStyle(color: AppColors.textSecondary),
             ),
             const SizedBox(height: 16),
             ElevatedButton(
