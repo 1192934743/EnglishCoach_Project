@@ -624,6 +624,49 @@ class _SettingsScreenState extends ConsumerState<SettingsScreen> {
   }
 }
 
+// 跳过 TTS 开关 Widget（通过 key 查找配置）
+Widget _buildSkipTtsSwitch({
+  required BuildContext context,
+  required WidgetRef ref,
+  required bool skipTts,
+  required Function(bool) onChanged,
+}) {
+  // 通过 key 查找配置项
+  final skipTtsConfig = DevPanelConfig.panels.firstWhere(
+    (p) => p.key == 'skip_tts',
+    orElse: () => const DevPanelItem(
+      key: 'skip_tts',
+      label: '跳过 TTS',
+      subtitle: '跳过语音合成，节省 API 资源（开发调试用）',
+      type: DevPanelType.toggle,
+      defaultValue: false,
+      icon: Icons.volume_off_outlined,
+      iconColor: Colors.grey,
+    ),
+  );
+
+  return ListTile(
+    contentPadding: EdgeInsets.zero,
+    leading: Icon(
+      skipTtsConfig.icon,
+      color: skipTtsConfig.iconColor,
+    ),
+    title: Text(
+      skipTtsConfig.label,
+      style: const TextStyle(fontSize: 14),
+    ),
+    subtitle: Text(
+      skipTtsConfig.subtitle ?? '',
+      style: const TextStyle(fontSize: 11),
+    ),
+    trailing: Switch(
+      value: skipTts,
+      activeColor: AppColors.warning,
+      onChanged: onChanged,
+    ),
+  );
+}
+
 // ── 开发者模式面板 Widget ──────────────────────────────────────────────────────
 class _DevModePanel extends ConsumerStatefulWidget {
   final VoidCallback onServerChanged;
@@ -636,6 +679,7 @@ class _DevModePanel extends ConsumerStatefulWidget {
 class _DevModePanelState extends ConsumerState<_DevModePanel> {
   bool _devModeEnabled = false;
   String _selectedModel = 'deepseek-chat';
+  bool _skipTts = false;
   bool _initialized = false;
 
   @override
@@ -652,6 +696,7 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
         final savedModel = prefs.getString(DevPanelConfig.llmModelKey) ?? 'deepseek-chat';
         final availableModels = DevPanelConfig.panels[0].options ?? [];
         _selectedModel = availableModels.contains(savedModel) ? savedModel : (availableModels.isNotEmpty ? availableModels.first : 'deepseek-chat');
+        _skipTts = prefs.getBool('skip_tts') ?? false;
         _initialized = true;
       });
     }
@@ -667,6 +712,23 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(DevPanelConfig.llmModelKey, model);
     setState(() => _selectedModel = model);
+  }
+
+  Future<void> _saveSkipTts(bool value) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('skip_tts', value);
+    setState(() => _skipTts = value);
+    // 发送 WebSocket 命令通知后端
+    try {
+      final wsClient = ref.read(websocketProvider);
+      final userId = await UserManager.getOrCreateUuid();
+      wsClient.sendCommand("update_lms_settings", {
+        "user_id": userId,
+        "skip_tts": value,
+      });
+    } catch (e) {
+      debugPrint("Failed to send skip_tts to backend: $e");
+    }
   }
 
   @override
@@ -745,6 +807,13 @@ class _DevModePanelState extends ConsumerState<_DevModePanel> {
                             if (v != null) _saveModel(v);
                           },
                         ),
+                      ),
+                      // 跳过 TTS 开关
+                      _buildSkipTtsSwitch(
+                        context: context,
+                        ref: ref,
+                        skipTts: _skipTts,
+                        onChanged: _saveSkipTts,
                       ),
                       const SizedBox(height: 12),
                       // 服务器配置

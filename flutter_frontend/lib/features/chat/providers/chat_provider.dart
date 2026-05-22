@@ -246,6 +246,8 @@ class ChatNotifier extends Notifier<ChatState> {
       wsClient.sendCommand("ping", {"message": "warmup", "user_id": userId});
       await Future<void>.delayed(const Duration(milliseconds: 200));
       final settings = ref.read(settingsProvider);
+      final prefs = await SharedPreferences.getInstance();
+      final skipTts = prefs.getBool('skip_tts') ?? false;
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": settings.depthPreference,
@@ -253,6 +255,7 @@ class ChatNotifier extends Notifier<ChatState> {
         "learner_level": settings.learnerLevel,
         "tts_engine": settings.ttsEngine,
         "tts_voice": settings.ttsVoice,
+        "skip_tts": skipTts,
       });
     } catch (_) {}
   }
@@ -842,6 +845,8 @@ class ChatNotifier extends Notifier<ChatState> {
       final userId = await UserManager.getOrCreateUuid();
       wsClient.setUserId(userId);
       await wsClient.connect();
+      final prefs = await SharedPreferences.getInstance();
+      final skipTts = prefs.getBool('skip_tts') ?? false;
       wsClient.sendCommand("update_lms_settings", {
         "user_id": userId,
         "depth_preference": depthPreference,
@@ -849,6 +854,7 @@ class ChatNotifier extends Notifier<ChatState> {
         "learner_level": learnerLevel,
         "tts_engine": ttsEngine,
         "tts_voice": ttsVoice,
+        "skip_tts": skipTts,
       });
     } catch (_) {}
   }

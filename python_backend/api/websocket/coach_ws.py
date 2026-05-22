@@ -334,6 +334,10 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
         mastery_snapshot = await run_in_threadpool(
             _take_mastery_snapshot, current_user.id, current_task_packet
         )
+        # 初始化 skip_tts 设置（确保布尔类型）
+        _skip_tts_raw = current_user.settings.get("skip_tts", False)
+        session_ctx["skip_tts"] = bool(_skip_tts_raw) if isinstance(_skip_tts_raw, bool) else str(_skip_tts_raw).lower() in ("true", "1", "yes")
+        logger.info(f"[Settings] skip_tts={session_ctx['skip_tts']}")
     else:
         from database import SessionLocal as _DB
         _db = _DB()
@@ -471,13 +475,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                         learner_level = data.get("learner_level")
                         tts_engine = data.get("tts_engine")
                         tts_voice = data.get("tts_voice")
+                        skip_tts = data.get("skip_tts")
                         # 更新数据库
-                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine, tts_voice)
+                        await run_in_threadpool(_update_lms_settings, current_user.id, depth, appetite, learner_level, tts_engine, tts_voice, skip_tts)
                         # 更新内存中的 current_user.settings（无需重新查询数据库）
                         if tts_engine is not None:
                             current_user.settings["tts_engine"] = str(tts_engine).strip()
                         if tts_voice is not None:
                             current_user.settings["tts_voice"] = str(tts_voice).strip()
+                        # 更新 skip_tts 设置（立即生效）
+                        if skip_tts is not None:
+                            current_user.settings["skip_tts"] = bool(skip_tts)
+                            session_ctx["skip_tts"] = bool(skip_tts)
+                            logger.info(f"[Settings] skip_tts={bool(skip_tts)}")
                         static_sys, dynamic_turn = build_prompts(current_user, is_flipped, session_ctx, current_task_packet)
                         chat_history[0]["content"] = static_sys
                     continue
@@ -567,6 +577,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     continue
 
                 if action == "request_tts":
+                    # skip_tts 为 True 时跳过 TTS 合成
+                    if session_ctx.get("skip_tts", False):
+                        logger.info("[TTS] Skipped: request_tts with skip_tts enabled")
+                        await safe_send_ws(websocket, ws_lock, {"event": "tts_skipped", "reason": "skip_tts enabled"})
+                        continue
                     text_to_speak = data.get("text", "")
                     if text_to_speak:
                         try:
@@ -653,7 +668,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                     "code": "WSS_FAILED",
                                     "message": str(e)
                                 })
-                                await _send_recovery_tts(websocket, ws_lock, current_user.settings if current_user else None)
+                                # skip_tts 为 True 时跳过 TTS 恢复提示
+                                if not session_ctx.get("skip_tts", False):
+                                    await _send_recovery_tts(websocket, ws_lock, current_user.settings if current_user else None)
                                 audio_buffer.clear()
                                 _latency_log(lat, "02_asr_done", user_chars=0, streaming_asr=False)
                                 continue
@@ -916,8 +933,13 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                     messages_to_send.append({"role": "system", "content": dynamic_turn})
 
                     # 3. 准备并发 TTS 任务
-                    # 【阶段四修正】AI 先手时也需要 TTS：做 TTS 的条件 = 非测试模式 或 AI先手
-                    if not is_test_mode or is_ai_first_strike:
+                    # skip_tts 为 True 时跳过 TTS API 调用
+                    _skip_tts = session_ctx.get("skip_tts", False)
+                    if _skip_tts:
+                        logger.info("[TTS] skip_tts enabled, skipping TTS queue creation")
+                        tts_queue = None
+                        consumer_task = None
+                    elif not is_test_mode or is_ai_first_strike:
                         tts_queue = asyncio.Queue()
                         async def tts_consumer(queue: asyncio.Queue):
                             try:
@@ -1073,6 +1095,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: Optional[str] = None
                                 session_transcript  # 【Hint质量优化】新增参数
                             )
                         )
+
+                    # skip_tts 为 True 时，手动发送 tts_finished 事件
+                    if session_ctx.get("skip_tts", False):
+                        await safe_send_ws(websocket, ws_lock, {"event": "tts_finished"})
+                        _latency_log(lat, "10_ws_tts_finished_event_sent")
 
     except WebSocketDisconnect:
         logger.info("👋 连接已断开 (WebSocketDisconnect)。")

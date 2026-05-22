@@ -40,5 +40,14 @@ class DevPanelConfig {
       icon: Icons.smart_toy_outlined,
       iconColor: Colors.purple,
     ),
+    DevPanelItem(
+      key: 'skip_tts',
+      label: '跳过 TTS',
+      subtitle: '跳过语音合成，节省 API 资源（开发调试用）',
+      type: DevPanelType.toggle,
+      defaultValue: false,
+      icon: Icons.volume_off_outlined,
+      iconColor: Colors.grey,
+    ),
   ];
 }
